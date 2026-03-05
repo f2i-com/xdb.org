@@ -1,0 +1,32 @@
+{
+  "name": "xdb-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "XDB - Local-First P2P Database for Tauri Applications",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:lib": "npm run build -w @xdb/react",
+    "build:demo": "npm run build -w xdb-demo",
+    "dev": "npm run dev -w xdb-demo",
+    "tauri:dev": "npm run tauri:dev -w xdb-demo",
+    "tauri:build": "npm run tauri:build -w xdb-demo",
+    "tauri:build:windows": "npm run tauri:build:windows -w xdb-demo",
+    "clean": "npm run clean --workspaces --if-present && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/f2i-com/xdb.org"
+  }
+}

@@ -1,0 +1,42 @@
+[package]
+name = "xdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local-first P2P database with CRDT sync for Tauri applications"
+keywords = ["database", "p2p", "crdt", "tauri", "local-first"]
+categories = ["database", "network-programming"]
+
+[features]
+default = ["tauri-commands"]
+tauri-commands = ["dep:tauri"]
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+rusqlite = { workspace = true }
+
+# CRDT
+yrs = { workspace = true }
+
+# P2P Networking
+libp2p = { workspace = true }
+futures = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Optional Tauri integration
+tauri = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
