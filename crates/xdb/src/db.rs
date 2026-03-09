@@ -50,6 +50,11 @@ impl XdbDatabase {
     pub fn open(path: PathBuf) -> DbResult<Self> {
         let conn = Connection::open(&path)?;
 
+        // Enable WAL mode for better concurrent read performance.
+        // WAL allows readers to proceed without blocking on writers,
+        // which is important when multiple worker threads share a single connection.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+
         // Initialize schema
         conn.execute_batch(
             r#"
