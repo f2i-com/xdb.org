@@ -120,10 +120,20 @@ impl XdbDatabase {
 
     /// Execute a closure within a SQLite transaction (BEGIN/COMMIT/ROLLBACK).
     /// Uses manual SQL statements to avoid borrow conflicts with rusqlite's Transaction type.
-    fn with_transaction<F, T>(&mut self, f: F) -> DbResult<T>
+    ///
+    /// Re-entrant: if already inside a transaction (e.g. called from within
+    /// another `with_transaction`), the inner call is a no-op — the outer
+    /// transaction handles BEGIN/COMMIT. This enables callers to batch
+    /// multiple individual operations (each of which internally calls
+    /// `with_transaction`) into a single disk flush.
+    pub fn with_transaction<F, T>(&mut self, f: F) -> DbResult<T>
     where
         F: FnOnce(&mut Self) -> DbResult<T>,
     {
+        if !self.conn.is_autocommit() {
+            // Already inside a transaction — skip nested BEGIN/COMMIT
+            return f(self);
+        }
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
             Ok(result) => {
