@@ -11,14 +11,11 @@ import type {
   Record,
   DbStats,
   NetworkStatus,
-  CreateRecordPayload,
-  UpdateRecordPayload,
   SyncEvent,
   PeerEvent,
   UseCollectionOptions,
   UseCollectionReturn,
   UseFindOptions,
-  QueryFilter,
 } from "../types";
 
 function compareUnknown(a: unknown, b: unknown): number {
@@ -30,7 +27,121 @@ function compareUnknown(a: unknown, b: unknown): number {
   }
   const aStr = String(a);
   const bStr = String(b);
+  if (aStr === bStr) return 0;
   return aStr < bStr ? -1 : 1;
+}
+
+function recordField<T>(record: Record<T>, field: string): unknown {
+  const data = record.data;
+  // A payload field wins over metadata with the same name for compatibility.
+  if (data !== null && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, field)) {
+    return (data as globalThis.Record<string, unknown>)[field];
+  }
+  return (record as unknown as globalThis.Record<string, unknown>)[field];
+}
+
+function normalizedAppId(appId?: string): string {
+  return appId?.trim().replace(/[^\p{Alphabetic}\p{Number}_-]/gu, '_') || '_default';
+}
+
+function validPollInterval(interval?: number): interval is number {
+  return typeof interval === 'number' && Number.isFinite(interval) && interval > 0;
+}
+
+/** Keep subscriptions stable across renders and dispose late registrations. */
+function useTauriEvent<T>(
+  name: string,
+  callback: (payload: T) => void,
+  enabled = true,
+  onError: (error: unknown) => void = console.error,
+) {
+  const handlers = useRef({ callback, onError });
+  useEffect(() => { handlers.current = { callback, onError }; });
+  useEffect(() => {
+    if (!enabled) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const fail = (error: unknown) => {
+      if (!disposed) handlers.current.onError(error);
+    };
+    // Tauri types this as void, but some bridge versions return a promise.
+    const dispose = (stop: () => void) => { void Promise.resolve().then(stop).catch(console.error); };
+    Promise.resolve().then(() => listen<T>(name, event => {
+      if (!disposed) handlers.current.callback(event.payload);
+    })).then(stop => {
+      if (disposed) dispose(stop);
+      else unlisten = stop;
+    }).catch(fail);
+    return () => {
+      disposed = true;
+      if (unlisten) dispose(unlisten);
+    };
+  }, [name, enabled]);
+}
+
+function useSnapshot<T>(command: string, pollInterval?: number, appId?: string) {
+  const [, render] = useState(0);
+  const scope = useMemo(() => ({
+    active: false, requestId: 0, data: null as T | null,
+    loading: true, error: null as string | null,
+  }), [command, appId]);
+  const refresh = useCallback(async () => {
+    if (!scope.active) return;
+    const requestId = ++scope.requestId;
+    scope.loading = true;
+    render(value => value + 1);
+    try {
+      const data = await invoke<T>(command, { appId });
+      if (scope.active && requestId === scope.requestId) {
+        scope.data = data;
+        scope.error = null;
+      }
+    } catch (error) {
+      if (scope.active && requestId === scope.requestId) scope.error = String(error);
+    } finally {
+      if (scope.active && requestId === scope.requestId) {
+        scope.loading = false;
+        render(value => value + 1);
+      }
+    }
+  }, [command, appId, scope]);
+  useEffect(() => {
+    scope.active = true;
+    void refresh();
+    return () => { scope.active = false; scope.requestId += 1; };
+  }, [scope, refresh]);
+  useEffect(() => {
+    if (!validPollInterval(pollInterval)) return;
+    const interval = setInterval(() => { if (!scope.loading) void refresh(); }, pollInterval);
+    return () => clearInterval(interval);
+  }, [pollInterval, refresh, scope]);
+  return { data: scope.data, loading: scope.loading, error: scope.error, refresh };
+}
+
+function useDatabaseTransfer(command: string, pathKey: string, appId?: string) {
+  const [, render] = useState(0);
+  const scope = useMemo(() => ({ active: false, pending: 0, error: null as string | null }), [command, appId]);
+  useEffect(() => {
+    scope.active = true;
+    return () => { scope.active = false; };
+  }, [scope]);
+  const run = useCallback(async (path: string): Promise<boolean> => {
+    if (!scope.active) return false;
+    scope.pending += 1;
+    scope.error = null;
+    render(value => value + 1);
+    try {
+      await invoke(command, { [pathKey]: path, appId });
+      return true;
+    } catch (error) {
+      if (scope.active) scope.error = String(error);
+      return false;
+    } finally {
+      scope.pending -= 1;
+      if (scope.active) render(value => value + 1);
+    }
+  }, [command, pathKey, appId, scope]);
+  return { run, pending: scope.pending > 0, error: scope.error };
 }
 
 /**
@@ -72,6 +183,7 @@ export function useCollection<T>(
   options: UseCollectionOptions = {}
 ): UseCollectionReturn<T> {
   const {
+    appId,
     autoRefresh = true,
     pollInterval,
     optimisticUpdates = false,
@@ -79,248 +191,165 @@ export function useCollection<T>(
     sortBy,
     sortOrder = 'asc',
   } = options;
-
-  const [records, setRecords] = useState<Record<T>[]>(
-    (initialData as Record<T>[]) ?? []
-  );
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [mutating, setMutating] = useState(false);
-  const mountedRef = useRef(true);
-  const requestIdRef = useRef(0);
-
-  // Sort function for records
-  const sortRecords = useCallback((data: Record<T>[]): Record<T>[] => {
-    if (!sortBy) return data;
-    return [...data].sort((a, b) => {
-      const aVal = (a.data as globalThis.Record<string, unknown>)[sortBy];
-      const bVal = (b.data as globalThis.Record<string, unknown>)[sortBy];
-      const cmp = compareUnknown(aVal, bVal);
-      return sortOrder === 'asc' ? cmp : -cmp;
-    });
-  }, [sortBy, sortOrder]);
+  const [, render] = useState(0);
+  // Each collection/app owns its request and mutation state. A delayed command
+  // from a previous workspace must never write into the current workspace.
+  const scope = useMemo(() => ({
+    active: false,
+    records: (initialData as Record<T>[]) ?? [],
+    loading: true,
+    error: null as string | null,
+    requestId: 0,
+    nextMutation: 0,
+    mutations: new Map<number, (records: Record<T>[]) => Record<T>[]>(),
+  }), [collectionName, appId]);
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
+  const publish = useCallback(() => {
+    if (scope.active && currentScope.current === scope) render(value => value + 1);
+  }, [scope]);
 
   const refresh = useCallback(async () => {
-    const requestId = ++requestIdRef.current;
-
+    if (!scope.active || currentScope.current !== scope) return;
+    const requestId = ++scope.requestId;
+    scope.loading = true;
+    publish();
     try {
-      setLoading(true);
       const data = await invoke<Record<T>[]>("get_collection", {
-        collection: collectionName,
+        collection: collectionName, appId,
       });
-      if (mountedRef.current && requestId === requestIdRef.current) {
-        setRecords(sortRecords(data));
-        setError(null);
+      if (scope.active && requestId === scope.requestId) {
+        scope.records = data;
+        scope.error = null;
       }
-    } catch (e) {
-      if (mountedRef.current && requestId === requestIdRef.current) {
-        setError(String(e));
-      }
+    } catch (error) {
+      if (scope.active && requestId === scope.requestId) scope.error = String(error);
     } finally {
-      if (mountedRef.current && requestId === requestIdRef.current) {
-        setLoading(false);
+      if (scope.active && requestId === scope.requestId) {
+        scope.loading = false;
+        publish();
       }
     }
-  }, [collectionName, sortRecords]);
+  }, [collectionName, appId, scope, publish]);
 
-  const create = useCallback(
-    async (data: T): Promise<Record<T> | null> => {
-      const tempId = `temp-${Date.now()}`;
-      let optimisticRecord: Record<T> | null = null;
-
-      try {
-        setMutating(true);
-
-        // Optimistic update
-        if (optimisticUpdates) {
-          optimisticRecord = {
-            id: tempId,
-            collection: collectionName,
-            data,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            deleted: false,
-          };
-          setRecords(prev => sortRecords([...prev, optimisticRecord!]));
-        }
-
-        const payload: CreateRecordPayload<T> = {
-          collection: collectionName,
-          data,
-        };
-        const record = await invoke<Record<T>>("create_record", { payload });
-
-        // Replace optimistic record with real one
-        if (optimisticUpdates) {
-          setRecords(prev => sortRecords(prev.map(r => r.id === tempId ? record : r)));
-        } else {
-          await refresh();
-        }
-
-        return record;
-      } catch (e) {
-        // Revert optimistic update on error
-        if (optimisticUpdates && optimisticRecord) {
-          setRecords(prev => prev.filter(r => r.id !== tempId));
-        }
-        setError(String(e));
-        return null;
-      } finally {
-        setMutating(false);
+  const mutate = useCallback(async <R>(
+    command: string,
+    args: globalThis.Record<string, unknown>,
+    optimistic: (records: Record<T>[], mutationId: number) => Record<T>[],
+    commit: (records: Record<T>[], result: R) => Record<T>[],
+  ): Promise<R | null> => {
+    if (!scope.active || currentScope.current !== scope) return null;
+    const mutationId = ++scope.nextMutation;
+    // Optimistic changes are overlays, not snapshots to roll back. A refresh or
+    // failed concurrent edit cannot discard another edit still in progress.
+    scope.mutations.set(mutationId, records => optimisticUpdates
+      ? optimistic(records, mutationId) : records);
+    scope.error = null;
+    publish();
+    try {
+      const result = await invoke<R>(command, { ...args, appId });
+      if (scope.active && currentScope.current === scope) {
+        scope.records = commit(scope.records, result);
+        scope.mutations.delete(mutationId);
+        publish();
+        await refresh();
       }
-    },
-    [collectionName, refresh, optimisticUpdates, sortRecords]
-  );
-
-  const update = useCallback(
-    async (id: string, data: T): Promise<Record<T> | null> => {
-      let previousRecord: Record<T> | undefined;
-
-      try {
-        setMutating(true);
-
-        // Optimistic update
-        if (optimisticUpdates) {
-          setRecords(prev => {
-            const idx = prev.findIndex(r => r.id === id);
-            if (idx !== -1) {
-              previousRecord = prev[idx];
-              const updated = [...prev];
-              updated[idx] = {
-                ...prev[idx],
-                data,
-                updated_at: new Date().toISOString(),
-              };
-              return sortRecords(updated);
-            }
-            return prev;
-          });
-        }
-
-        const payload: UpdateRecordPayload<T> = { id, data };
-        const record = await invoke<Record<T>>("update_record", { payload });
-
-        if (!optimisticUpdates) {
-          await refresh();
-        }
-
-        return record;
-      } catch (e) {
-        // Revert optimistic update on error
-        if (optimisticUpdates && previousRecord) {
-          setRecords(prev => sortRecords(prev.map(r => r.id === id ? previousRecord! : r)));
-        }
-        setError(String(e));
-        return null;
-      } finally {
-        setMutating(false);
+      return result;
+    } catch (error) {
+      if (scope.active && currentScope.current === scope) {
+        scope.mutations.delete(mutationId);
+        scope.error = String(error);
+        publish();
       }
-    },
-    [refresh, optimisticUpdates, sortRecords]
-  );
+      return null;
+    } finally {
+      scope.mutations.delete(mutationId);
+      publish();
+    }
+  }, [scope, appId, optimisticUpdates, publish, refresh]);
 
-  const remove = useCallback(
-    async (id: string): Promise<boolean> => {
-      let removedRecord: Record<T> | undefined;
+  const create = useCallback((data: T): Promise<Record<T> | null> => {
+    const timestamp = new Date().toISOString();
+    return mutate<Record<T>>("create_record", { payload: { collection: collectionName, data } },
+      (records, mutationId) => [...records, {
+        id: `temp-${mutationId}`, collection: collectionName, data,
+        created_at: timestamp, updated_at: timestamp, deleted: false,
+      }],
+      (records, record) => [...records.filter(item => item.id !== record.id), record]);
+  }, [collectionName, mutate]);
 
-      try {
-        setMutating(true);
+  const update = useCallback((id: string, data: T): Promise<Record<T> | null> => {
+    const timestamp = new Date().toISOString();
+    return mutate<Record<T>>("update_record", { payload: { id, data } },
+      records => records.map(record => record.id === id
+        ? { ...record, data, updated_at: timestamp } : record),
+      (records, record) => [...records.filter(item => item.id !== id), record]);
+  }, [mutate]);
 
-        // Optimistic update
-        if (optimisticUpdates) {
-          setRecords(prev => {
-            removedRecord = prev.find(r => r.id === id);
-            return prev.filter(r => r.id !== id);
-          });
-        }
-
-        await invoke("delete_record", { id });
-
-        if (!optimisticUpdates) {
-          await refresh();
-        }
-
-        return true;
-      } catch (e) {
-        // Revert optimistic update on error
-        if (optimisticUpdates && removedRecord) {
-          setRecords(prev => sortRecords([...prev, removedRecord!]));
-        }
-        setError(String(e));
-        return false;
-      } finally {
-        setMutating(false);
-      }
-    },
-    [refresh, optimisticUpdates, sortRecords]
-  );
+  const remove = useCallback(async (id: string): Promise<boolean> => {
+    const result = await mutate<boolean>("delete_record", { id },
+      records => records.filter(record => record.id !== id),
+      (records, deleted) => deleted ? records.filter(record => record.id !== id) : records);
+    return result === true;
+  }, [mutate]);
 
   const requestSync = useCallback(async (): Promise<boolean> => {
     try {
-      await invoke("request_sync", { collection: collectionName });
+      await invoke("request_sync", { collection: collectionName, appId });
       return true;
-    } catch (e) {
-      setError(String(e));
+    } catch (error) {
+      if (scope.active && currentScope.current === scope) {
+        scope.error = String(error);
+        publish();
+      }
       return false;
     }
-  }, [collectionName]);
+  }, [collectionName, appId, scope, publish]);
 
-  // Clear error helper
   const clearError = useCallback(() => {
-    setError(null);
-  }, []);
+    scope.error = null;
+    publish();
+  }, [scope, publish]);
 
-  // Get by ID helper
-  const getById = useCallback((id: string): Record<T> | undefined => {
-    return records.find(r => r.id === id);
-  }, [records]);
-
-  // Initial load
   useEffect(() => {
-    mountedRef.current = true;
-    refresh();
-
+    scope.active = true;
+    void refresh();
     return () => {
-      mountedRef.current = false;
-      requestIdRef.current += 1;
+      scope.active = false;
+      scope.requestId += 1;
     };
-  }, [refresh]);
+  }, [scope, refresh]);
 
-  // Listen for sync events
+  const subscriptionError = useCallback((error: unknown) => {
+    scope.error = String(error);
+    publish();
+  }, [scope, publish]);
+  useTauriEvent<SyncEvent>("xdb-sync-event", event => {
+    if (event.collection === collectionName && normalizedAppId(appId) === normalizedAppId(event.app_id)) {
+      void refresh();
+    }
+  }, autoRefresh, subscriptionError);
+  useTauriEvent<{ collection?: string; app_id?: string }>("xdb-data-event", event => {
+    if ((!event.collection || event.collection === collectionName)
+      && normalizedAppId(appId) === normalizedAppId(event.app_id)) void refresh();
+  }, autoRefresh, subscriptionError);
   useEffect(() => {
-    if (!autoRefresh) return;
-
-    const unlistenSync = listen<SyncEvent>("xdb-sync-event", (event) => {
-      if (event.payload.collection === collectionName) {
-        refresh();
-      }
-    });
-
-    return () => {
-      unlistenSync.then((f) => f());
-    };
-  }, [collectionName, refresh, autoRefresh]);
-
-  // Optional polling
-  useEffect(() => {
-    if (!pollInterval) return;
-
-    const interval = setInterval(refresh, pollInterval);
+    if (!validPollInterval(pollInterval)) return;
+    const interval = setInterval(() => { if (!scope.loading) void refresh(); }, pollInterval);
     return () => clearInterval(interval);
-  }, [refresh, pollInterval]);
+  }, [refresh, pollInterval, scope]);
 
+  let records = scope.records;
+  for (const optimistic of scope.mutations.values()) records = optimistic(records);
+  if (sortBy) records = [...records].sort((a, b) => {
+    const order = compareUnknown(recordField(a, sortBy), recordField(b, sortBy));
+    return sortOrder === 'asc' ? order : -order;
+  });
+  const getById = useCallback((id: string) => records.find(record => record.id === id), [records]);
   return {
-    records,
-    loading,
-    error,
-    mutating,
-    refresh,
-    create,
-    update,
-    remove,
-    requestSync,
-    clearError,
-    getById,
+    records, loading: scope.loading, error: scope.error,
+    mutating: scope.mutations.size > 0,
+    refresh, create, update, remove, requestSync, clearError, getById,
   };
 }
 
@@ -329,7 +358,7 @@ export function useCollection<T>(
  *
  * @param collectionName - The name of the collection to search
  * @param options - Query options (filters, sort, pagination)
- * @returns Filtered records
+ * @returns Filtered records and the matching total before pagination
  *
  * @example
  * ```tsx
@@ -352,18 +381,18 @@ export function useFind<T>(
   collectionName: string,
   options: UseFindOptions = {}
 ) {
-  const { filters = [], sortBy, sortOrder = 'asc', limit, offset = 0 } = options;
+  const { appId, filters = [], sortBy, sortOrder = 'asc', limit, offset = 0 } = options;
 
-  const { records: allRecords, loading, error, refresh } = useCollection<T>(collectionName);
+  const { records: allRecords, loading, error, refresh } = useCollection<T>(collectionName, { appId });
 
   // Apply filters, sort, and pagination client-side
-  const records = useMemo(() => {
+  const { records, total } = useMemo(() => {
     let result = [...allRecords];
 
     // Apply filters
     for (const filter of filters) {
       result = result.filter(record => {
-        const value = (record.data as globalThis.Record<string, unknown>)[filter.field];
+        const value = recordField(record, filter.field);
         switch (filter.operator) {
           case 'eq':
             return value === filter.value;
@@ -378,11 +407,11 @@ export function useFind<T>(
           case 'lte':
             return (value as number) <= (filter.value as number);
           case 'contains':
-            return String(value).toLowerCase().includes(String(filter.value).toLowerCase());
+            return value != null && String(value).toLowerCase().includes(String(filter.value).toLowerCase());
           case 'startsWith':
-            return String(value).toLowerCase().startsWith(String(filter.value).toLowerCase());
+            return value != null && String(value).toLowerCase().startsWith(String(filter.value).toLowerCase());
           case 'endsWith':
-            return String(value).toLowerCase().endsWith(String(filter.value).toLowerCase());
+            return value != null && String(value).toLowerCase().endsWith(String(filter.value).toLowerCase());
           default:
             return true;
         }
@@ -392,13 +421,14 @@ export function useFind<T>(
     // Apply sort
     if (sortBy) {
       result.sort((a, b) => {
-        const aVal = (a.data as globalThis.Record<string, unknown>)[sortBy];
-        const bVal = (b.data as globalThis.Record<string, unknown>)[sortBy];
+        const aVal = recordField(a, sortBy);
+        const bVal = recordField(b, sortBy);
         const cmp = compareUnknown(aVal, bVal);
         return sortOrder === 'asc' ? cmp : -cmp;
       });
     }
 
+    const total = result.length;
     // Apply pagination
     if (limit !== undefined) {
       result = result.slice(offset, offset + limit);
@@ -406,12 +436,12 @@ export function useFind<T>(
       result = result.slice(offset);
     }
 
-    return result;
+    return { records: result, total };
   }, [allRecords, filters, sortBy, sortOrder, limit, offset]);
 
   return {
     records,
-    total: allRecords.length,
+    total,
     loading,
     error,
     refresh,
@@ -441,28 +471,15 @@ export function useFind<T>(
  * }
  * ```
  */
-export function useDbStats(pollInterval = 5000) {
-  const [stats, setStats] = useState<DbStats | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const refresh = useCallback(async () => {
-    try {
-      const data = await invoke<DbStats>("get_db_stats");
-      setStats(data);
-    } catch (e) {
-      console.error("Failed to get db stats:", e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, pollInterval);
-    return () => clearInterval(interval);
-  }, [refresh, pollInterval]);
-
-  return { stats, loading, refresh };
+export function useDbStats(pollInterval = 5000, appId?: string) {
+  const { data: stats, loading, error, refresh } = useSnapshot<DbStats>("get_db_stats", pollInterval, appId);
+  useTauriEvent<{ app_id?: string }>("xdb-data-event", event => {
+    if (normalizedAppId(event.app_id) === normalizedAppId(appId)) void refresh();
+  });
+  useTauriEvent<SyncEvent>("xdb-sync-event", event => {
+    if (normalizedAppId(event.app_id) === normalizedAppId(appId)) void refresh();
+  });
+  return { stats, loading, error, refresh };
 }
 
 /**
@@ -489,38 +506,9 @@ export function useDbStats(pollInterval = 5000) {
  * ```
  */
 export function useNetworkStatus(pollInterval = 2000) {
-  const [status, setStatus] = useState<NetworkStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const refresh = useCallback(async () => {
-    try {
-      const data = await invoke<NetworkStatus>("get_network_status");
-      setStatus(data);
-    } catch (e) {
-      console.error("Failed to get network status:", e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, pollInterval);
-    return () => clearInterval(interval);
-  }, [refresh, pollInterval]);
-
-  // Listen for peer events
-  useEffect(() => {
-    const unlisten = listen<PeerEvent>("xdb-peer-event", () => {
-      refresh();
-    });
-
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, [refresh]);
-
-  return { status, loading, refresh };
+  const { data: status, loading, error, refresh } = useSnapshot<NetworkStatus>("get_network_status", pollInterval);
+  useTauriEvent<PeerEvent>("xdb-peer-event", () => { void refresh(); });
+  return { status, loading, error, refresh };
 }
 
 /**
@@ -536,14 +524,9 @@ export function useNetworkStatus(pollInterval = 2000) {
  * }
  * ```
  */
-export function useDbPath() {
-  const [path, setPath] = useState<string>("");
-
-  useEffect(() => {
-    invoke<string>("get_db_path").then(setPath).catch(console.error);
-  }, []);
-
-  return path;
+export function useDbPath(appId?: string) {
+  const { data } = useSnapshot<string>("get_db_path", undefined, appId);
+  return data ?? "";
 }
 
 /**
@@ -569,23 +552,9 @@ export function useDbPath() {
  * }
  * ```
  */
-export function useDbExport() {
-  const [exporting, setExporting] = useState(false);
-
-  const exportDb = useCallback(async (path: string): Promise<boolean> => {
-    try {
-      setExporting(true);
-      await invoke("export_database", { path });
-      return true;
-    } catch (e) {
-      console.error("Failed to export database:", e);
-      return false;
-    } finally {
-      setExporting(false);
-    }
-  }, []);
-
-  return { exportDb, exporting };
+export function useDbExport(appId?: string) {
+  const { run: exportDb, pending: exporting, error } = useDatabaseTransfer("export_database", "path", appId);
+  return { exportDb, exporting, error };
 }
 
 /**
@@ -611,23 +580,9 @@ export function useDbExport() {
  * }
  * ```
  */
-export function useDbImport() {
-  const [importing, setImporting] = useState(false);
-
-  const importDb = useCallback(async (sourcePath: string): Promise<boolean> => {
-    try {
-      setImporting(true);
-      await invoke("import_database", { sourcePath });
-      return true;
-    } catch (e) {
-      console.error("Failed to import database:", e);
-      return false;
-    } finally {
-      setImporting(false);
-    }
-  }, []);
-
-  return { importDb, importing };
+export function useDbImport(appId?: string) {
+  const { run: importDb, pending: importing, error } = useDatabaseTransfer("import_database", "sourcePath", appId);
+  return { importDb, importing, error };
 }
 
 /**
@@ -647,15 +602,7 @@ export function useDbImport() {
  * ```
  */
 export function useSyncEvents(callback: (event: SyncEvent) => void) {
-  useEffect(() => {
-    const unlisten = listen<SyncEvent>("xdb-sync-event", (event) => {
-      callback(event.payload);
-    });
-
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, [callback]);
+  useTauriEvent("xdb-sync-event", callback);
 }
 
 /**
@@ -675,13 +622,5 @@ export function useSyncEvents(callback: (event: SyncEvent) => void) {
  * ```
  */
 export function usePeerEvents(callback: (event: PeerEvent) => void) {
-  useEffect(() => {
-    const unlisten = listen<PeerEvent>("xdb-peer-event", (event) => {
-      callback(event.payload);
-    });
-
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, [callback]);
+  useTauriEvent("xdb-peer-event", callback);
 }

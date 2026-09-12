@@ -77,11 +77,14 @@ Thumbs.db
 # Database files
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 *.db.backup
+*.db.backup-*
 
 # Test outputs
 coverage

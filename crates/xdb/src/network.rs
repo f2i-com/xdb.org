@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const SYNC_TOPIC: &str = "xdb-sync";
 const PROTOCOL_VERSION: &str = "/xdb/1.0.0";
@@ -76,6 +76,57 @@ pub enum NetworkEvent {
     PeerDisconnected(String),
 }
 
+// GossipSub validates the signature against `message.source`. The propagation
+// source is only the last relay, which can differ from the original author.
+fn message_matches_author(message: &NetworkMessage, author: &PeerId) -> bool {
+    let author = author.to_string();
+    match message {
+        NetworkMessage::SyncUpdate { sender_id, .. } => sender_id == &author,
+        NetworkMessage::SyncRequest { requester_id, .. } => requester_id == &author,
+        NetworkMessage::SyncResponse { responder_id, .. } => responder_id == &author,
+        NetworkMessage::PeerAnnounce { peer_id, .. } => peer_id == &author,
+    }
+}
+
+fn publish_message(
+    behaviour: &mut gossipsub::Behaviour,
+    topic: &IdentTopic,
+    message: &NetworkMessage,
+) {
+    match serde_json::to_vec(message) {
+        Ok(data) => match behaviour.publish(topic.clone(), data) {
+            Ok(_) => {}
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                // Local writes have already been persisted. An offline node
+                // cannot deliver this update; this is not a database failure.
+                debug!("No subscribed peers available to receive XDB update");
+            }
+            Err(e) => error!("Failed to publish message: {}", e),
+        },
+        Err(e) => error!("Failed to serialize network message: {}", e),
+    }
+}
+
+fn connection_event(
+    peers: &mut HashSet<PeerId>,
+    peer_id: PeerId,
+    connection_count: u32,
+    address: Option<String>,
+) -> Option<NetworkEvent> {
+    if connection_count == 0 {
+        peers
+            .remove(&peer_id)
+            .then(|| NetworkEvent::PeerDisconnected(peer_id.to_string()))
+    } else if peers.insert(peer_id) {
+        Some(NetworkEvent::PeerConnected(PeerInfo {
+            peer_id: peer_id.to_string(),
+            addresses: address.into_iter().collect(),
+        }))
+    } else {
+        None
+    }
+}
+
 impl NetworkNode {
     pub async fn new(
         db: SharedDb,
@@ -106,10 +157,7 @@ impl NetworkNode {
         .map_err(|e| format!("Gossipsub behaviour error: {}", e))?;
 
         // Create mDNS behaviour
-        let mdns = mdns::tokio::Behaviour::new(
-            mdns::Config::default(),
-            local_peer_id,
-        )?;
+        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
 
         // Create identify behaviour
         let identify = identify::Behaviour::new(identify::Config::new(
@@ -187,107 +235,92 @@ impl NetworkNode {
                             for (peer_id, addr) in peers {
                                 info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                connected_peers.lock().await.insert(peer_id);
-                                let _ = event_tx.send(NetworkEvent::PeerConnected(PeerInfo {
-                                    peer_id: peer_id.to_string(),
-                                    addresses: vec![addr.to_string()],
-                                }));
                             }
                         }
                         SwarmEvent::Behaviour(XdbBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                             for (peer_id, _addr) in peers {
                                 info!("Peer expired: {}", peer_id);
-                                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                connected_peers.lock().await.remove(&peer_id);
-                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id.to_string()));
+                                // One address expiring does not mean the peer
+                                // disappeared, nor does it close live connections.
+                                if !swarm.behaviour().mdns.discovered_nodes().any(|id| id == &peer_id) {
+                                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(XdbBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                            propagation_source,
+                            propagation_source: _,
                             message_id: _,
                             message,
                         })) => {
                             match serde_json::from_slice::<NetworkMessage>(&message.data) {
                                 Ok(msg) => {
-                                    // Handle sync messages
+                                    let Some(author) = message.source else {
+                                        warn!("Dropping XDB message without a signed author");
+                                        continue;
+                                    };
+                                    if author == local_peer_id {
+                                        continue;
+                                    }
+                                    if !message_matches_author(&msg, &author) {
+                                        warn!("Dropping XDB message whose claimed sender differs from its signed author");
+                                        continue;
+                                    }
+                                    // Only notify subscribers after an update was applied.
                                     match &msg {
-                                        NetworkMessage::SyncUpdate { collection, update, sender_id } => {
-                                            if propagation_source != local_peer_id {
-                                                if sender_id != &propagation_source.to_string() {
-                                                    warn!(
-                                                        "Dropping spoofed SyncUpdate: sender_id {} != source {}",
-                                                        sender_id,
-                                                        propagation_source
-                                                    );
-                                                    continue;
+                                        NetworkMessage::SyncUpdate { collection, update, .. } => {
+                                            info!("Received sync update for collection: {}", collection);
+                                            match db.lock() {
+                                                Ok(mut db_lock) => {
+                                                    if let Err(e) = db_lock.apply_remote_update(collection, update) {
+                                                        error!("Failed to apply remote update: {}", e);
+                                                        continue;
+                                                    }
                                                 }
-                                                info!("Received sync update for collection: {}", collection);
-                                                match db.lock() {
-                                                    Ok(mut db_lock) => {
-                                                        if let Err(e) = db_lock.apply_remote_update(collection, update) {
-                                                            error!("Failed to apply remote update: {}", e);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("DB lock poisoned, dropping sync update for {}: {}", collection, e);
-                                                    }
+                                                Err(e) => {
+                                                    error!("DB lock poisoned, dropping sync update for {}: {}", collection, e);
+                                                    continue;
                                                 }
                                             }
                                         }
                                         NetworkMessage::SyncRequest { collection, state_vector, requester_id } => {
-                                            if propagation_source != local_peer_id {
-                                                if requester_id != &propagation_source.to_string() {
-                                                    warn!(
-                                                        "Dropping spoofed SyncRequest: requester_id {} != source {}",
-                                                        requester_id,
-                                                        propagation_source
-                                                    );
-                                                    continue;
-                                                }
-                                                info!("Received sync request for collection: {}", collection);
-                                                match db.lock() {
-                                                    Ok(mut db_lock) => {
-                                                        if let Ok(update) = db_lock.get_updates_since(collection, state_vector) {
-                                                            let response = NetworkMessage::SyncResponse {
-                                                                collection: collection.clone(),
-                                                                update,
-                                                                requester_id: requester_id.clone(),
-                                                                responder_id: local_peer_id.to_string(),
-                                                            };
-                                                            if let Ok(data) = serde_json::to_vec(&response) {
-                                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
-                                                            }
-                                                        }
+                                            info!("Received sync request for collection: {}", collection);
+                                            match db.lock() {
+                                                Ok(mut db_lock) => match db_lock.get_updates_since(collection, state_vector) {
+                                                    Ok(update) => {
+                                                        let response = NetworkMessage::SyncResponse {
+                                                            collection: collection.clone(),
+                                                            update,
+                                                            requester_id: requester_id.clone(),
+                                                            responder_id: local_peer_id.to_string(),
+                                                        };
+                                                        publish_message(&mut swarm.behaviour_mut().gossipsub, &topic, &response);
                                                     }
                                                     Err(e) => {
-                                                        error!("DB lock poisoned, dropping sync request for {}: {}", collection, e);
+                                                        warn!("Failed to prepare sync response for {}: {}", collection, e);
+                                                        continue;
                                                     }
+                                                },
+                                                Err(e) => {
+                                                    error!("DB lock poisoned, dropping sync request for {}: {}", collection, e);
+                                                    continue;
                                                 }
                                             }
                                         }
-                                        NetworkMessage::SyncResponse { collection, update, requester_id, responder_id } => {
-                                            if propagation_source != local_peer_id {
-                                                if responder_id != &propagation_source.to_string() {
-                                                    warn!(
-                                                        "Dropping spoofed SyncResponse: responder_id {} != source {}",
-                                                        responder_id,
-                                                        propagation_source
-                                                    );
-                                                    continue;
-                                                }
-                                                if requester_id != &local_peer_id.to_string() {
-                                                    continue;
-                                                }
-                                                info!("Received sync response for collection: {}", collection);
-                                                match db.lock() {
-                                                    Ok(mut db_lock) => {
-                                                        if let Err(e) = db_lock.apply_remote_update(collection, update) {
-                                                            error!("Failed to apply sync response: {}", e);
-                                                        }
+                                        NetworkMessage::SyncResponse { collection, update, requester_id, .. } => {
+                                            if requester_id != &local_peer_id.to_string() {
+                                                continue;
+                                            }
+                                            info!("Received sync response for collection: {}", collection);
+                                            match db.lock() {
+                                                Ok(mut db_lock) => {
+                                                    if let Err(e) = db_lock.apply_remote_update(collection, update) {
+                                                        error!("Failed to apply sync response: {}", e);
+                                                        continue;
                                                     }
-                                                    Err(e) => {
-                                                        error!("DB lock poisoned, dropping sync response for {}: {}", collection, e);
-                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("DB lock poisoned, dropping sync response for {}: {}", collection, e);
+                                                    continue;
                                                 }
                                             }
                                         }
@@ -303,29 +336,41 @@ impl NetworkNode {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!("Listening on: {}", address);
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("Connection established with: {}", peer_id);
-                            connected_peers.lock().await.insert(peer_id);
+                            let event = connection_event(
+                                &mut *connected_peers.lock().await,
+                                peer_id,
+                                num_established.get(),
+                                Some(endpoint.get_remote_address().to_string()),
+                            );
+                            if let Some(event) = event {
+                                let _ = event_tx.send(event);
+                            }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("Connection closed with: {}", peer_id);
-                            connected_peers.lock().await.remove(&peer_id);
+                            let event = connection_event(
+                                &mut *connected_peers.lock().await,
+                                peer_id,
+                                num_established,
+                                None,
+                            );
+                            if let Some(event) = event {
+                                let _ = event_tx.send(event);
+                            }
                         }
                         _ => {}
                     }
                 }
 
                 // Handle commands
-                Some(command) = command_rx.recv() => {
+                command = command_rx.recv() => {
                     match command {
-                        NetworkCommand::Publish { message } => {
-                            if let Ok(data) = serde_json::to_vec(&message) {
-                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                                    error!("Failed to publish message: {}", e);
-                                }
-                            }
+                        Some(NetworkCommand::Publish { message }) => {
+                            publish_message(&mut swarm.behaviour_mut().gossipsub, &topic, &message);
                         }
-                        NetworkCommand::Shutdown => {
+                        Some(NetworkCommand::Shutdown) | None => {
                             info!("Network node shutting down");
                             break;
                         }
@@ -333,10 +378,15 @@ impl NetworkNode {
                 }
             }
         }
+        connected_peers.lock().await.clear();
     }
 
     pub fn local_peer_id(&self) -> String {
         self.local_peer_id.to_string()
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.command_tx.is_closed()
     }
 
     pub async fn publish(&self, message: NetworkMessage) -> Result<(), String> {
@@ -355,7 +405,11 @@ impl NetworkNode {
         .await
     }
 
-    pub async fn request_sync(&self, collection: &str, state_vector: Vec<u8>) -> Result<(), String> {
+    pub async fn request_sync(
+        &self,
+        collection: &str,
+        state_vector: Vec<u8>,
+    ) -> Result<(), String> {
         self.publish(NetworkMessage::SyncRequest {
             collection: collection.to_string(),
             state_vector,
@@ -385,4 +439,72 @@ pub type SharedNetwork = Arc<Mutex<Option<NetworkNode>>>;
 
 pub fn create_shared_network() -> SharedNetwork {
     Arc::new(Mutex::new(None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_remains_connected_until_its_last_connection_closes() {
+        let peer = PeerId::random();
+        let mut peers = HashSet::new();
+        let event = connection_event(&mut peers, peer, 1, Some("/memory/1".into()));
+        assert!(matches!(event, Some(NetworkEvent::PeerConnected(_))));
+        assert!(connection_event(&mut peers, peer, 2, Some("/memory/2".into())).is_none());
+        assert!(connection_event(&mut peers, peer, 1, None).is_none());
+        assert!(peers.contains(&peer));
+        assert!(matches!(
+            connection_event(&mut peers, peer, 0, None),
+            Some(NetworkEvent::PeerDisconnected(_))
+        ));
+        assert!(peers.is_empty());
+        assert!(connection_event(&mut peers, peer, 0, None).is_none());
+    }
+
+    #[test]
+    fn sync_messages_match_the_original_signed_author() {
+        let author = PeerId::random();
+        let relay = PeerId::random();
+        let messages = [
+            NetworkMessage::SyncUpdate {
+                collection: "notes".into(),
+                update: vec![],
+                sender_id: author.to_string(),
+            },
+            NetworkMessage::SyncRequest {
+                collection: "notes".into(),
+                state_vector: vec![],
+                requester_id: author.to_string(),
+            },
+            NetworkMessage::SyncResponse {
+                collection: "notes".into(),
+                update: vec![],
+                requester_id: relay.to_string(),
+                responder_id: author.to_string(),
+            },
+            NetworkMessage::PeerAnnounce {
+                peer_id: author.to_string(),
+                collections: vec![],
+            },
+        ];
+        for message in messages {
+            assert!(message_matches_author(&message, &author));
+            assert!(!message_matches_author(&message, &relay));
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_network_task_reports_stopped_and_rejects_new_work() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let node = NetworkNode {
+            local_peer_id: PeerId::random(),
+            command_tx,
+            connected_peers: Arc::new(Mutex::new(HashSet::new())),
+        };
+        assert!(node.is_running());
+        drop(command_rx);
+        assert!(!node.is_running());
+        assert!(node.broadcast_update("notes", vec![]).await.is_err());
+    }
 }

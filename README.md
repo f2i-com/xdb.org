@@ -1,380 +1,258 @@
-# XDB - Local-First P2P Database
+# XDB
 
-A modular, local-first, peer-to-peer database library for Tauri applications with automatic synchronization via CRDTs.
+**Local SQLite storage for Softn's native runtime and Rust server, with a React + Tauri integration and optional peer synchronization.**
 
-## Features
+XDB stores JSON records in named collections. Applications can work offline, group writes into transactions, and export or restore a SQLite database. The Rust library also maintains Yrs documents for its native peer protocol.
 
-- **Local-First:** All data stored locally in SQLite - works offline
-- **P2P Sync:** Automatic peer discovery via mDNS and real-time sync via GossipSub
-- **CRDT Conflict Resolution:** Concurrent edits automatically merged using Yrs (Y-CRDT)
-- **Modular Design:** Use as a Rust crate (`xdb`) and/or React npm package (`@xdb/react`)
-- **Tauri Integration:** Ready-to-use commands and event handlers
-- **Cross-Platform:** Build for Linux, Windows, and macOS
+[Where XDB is used](#where-xdb-is-used) · [Run the demo](#run-the-demo) · [Rust](#use-the-rust-library) · [React + Tauri](#use-react--tauri) · [Manual checks](#manual-checks)
 
-## Project Structure
+## Where XDB is used
 
-```
-xdb-org/
-├── crates/
-│   └── xdb/                      # Rust library crate
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs            # Public API & exports
-│           ├── db.rs             # SQLite + CRDT logic
-│           ├── network.rs        # libp2p P2P networking
-│           └── tauri.rs          # Tauri command handlers
-│
-├── packages/
-│   └── xdb-react/                # npm package (@xdb/react)
-│       ├── package.json
-│       ├── tsup.config.ts        # Build configuration
-│       └── src/
-│           ├── index.ts          # Main exports
-│           ├── hooks/index.ts    # React hooks
-│           └── types/index.ts    # TypeScript definitions
-│
-├── apps/
-│   └── demo/                     # Demo Tauri application
-│       ├── package.json
-│       ├── src/                  # React frontend
-│       │   ├── App.tsx           # Demo UI components
-│       │   └── App.css           # Styles
-│       └── src-tauri/            # Tauri backend (uses xdb crate)
-│           ├── Cargo.toml
-│           └── src/
-│               └── lib.rs        # App entry point
-│
-├── Cargo.toml                    # Cargo workspace root
-├── package.json                  # npm workspace root
-└── rust-toolchain.toml           # Rust nightly configuration
-```
+XDB is still a live dependency. Its Rust crate and the browser API with the same name have different responsibilities:
 
-## Demo Application
+| Consumer | What it uses |
+| --- | --- |
+| [Softn desktop runtime](https://github.com/f2i-com/softn.com/tree/main/apps/softn-loader) | This repository's `xdb` crate. Tauri commands persist each app's records in SQLite. |
+| [Softn Rust server](https://github.com/f2i-com/softn.com/tree/main/apps/softn-rust) | This repository's `xdb` crate without Tauri commands. It backs the server's collection API, `.logic` database bridge and synchronized records. |
+| [Softn browser runtime, Studio and Builder](https://github.com/f2i-com/softn.com/blob/main/packages/%40softn/core/src/runtime/xdb.ts) | Softn's own TypeScript XDB service. Browser apps use local storage; editors keep preview data separate from the running app. That service invokes this crate's commands when hosted in the native runtime. |
+| [FormLogic](https://github.com/f2i-com/formlogic.com) and [Aokie's front desk](https://github.com/f2i-com/softn.com/tree/main/examples/aokie-workspace) | Softn provides the editable app interface. Connected business records go through FormLogic's backend API and its own SQLite storage. Aokie's native call, transcript and message storage uses its own `rusqlite` layer. |
+| [OAIY](https://github.com/f2i-com/oaiy.com) and [ZIPP](https://github.com/f2i-com/zipp.org) | No direct dependency on this crate or `@xdb/react`. ZIPP executes app logic; Softn supplies the database bridge. |
+| [XDB demo](apps/demo) | Both the Rust crate and the `@xdb/react` hooks from this repository. |
 
-The demo app showcases XDB functionality with three collections:
+The Softn browser service is maintained in the Softn repository, so improvements to it do not necessarily produce commits here. `@xdb/react` is a separate convenience package for React + Tauri applications; Softn uses its own adapter.
 
-- **Notes** - Colored sticky notes with title, content, and color picker
-- **Tasks** - Priority-based todo list with completion tracking (low/medium/high)
-- **Contacts** - Contact management with name, email, and phone
+See the [September 2026 review](docs/audit-2026-09-12.md) for the fixes, verification results and remaining design work.
 
-Features demonstrated:
-- Real-time CRUD operations
-- P2P sync status display
-- Connected peers list
-- Database statistics (record count, size)
-- Database export/import (backup & restore)
+### Three synchronization paths
 
-## Prerequisites
+- **Native XDB peer sync (experimental):** libp2p, mDNS discovery, GossipSub messages and Yrs documents. The current wire protocol supports the default database only.
+- **Softn browser peer sync:** Softn's separate Yjs + WebRTC implementation, joined explicitly by app and room.
+- **Softn server sync:** Softn's WebSocket client and Rust server. FormLogic's hosted actions use a separate authenticated backend bridge.
 
-- **Node.js** 18+ (with npm)
-- **Rust** nightly (automatically configured via `rust-toolchain.toml`)
+These are separate transports. Running a Softn browser app does not start this repository's libp2p network or make it a native XDB peer.
 
-### Platform-specific dependencies
+Native writes remain saved locally while offline, but outgoing deltas are not queued for later delivery. After peers reconnect, explicitly request synchronization for the collections that need reconciling. Peer discovery alone does not replay the offline writes.
 
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-```
+## Data model
 
-**Windows (for native builds):**
-- Visual Studio Build Tools with C++ workload, or
-- MinGW-w64
+A record contains `id`, `collection`, `data`, `created_at`, `updated_at` and `deleted`. IDs are UUIDs for newly created records. Collections are created as records are written.
 
-**Windows cross-compilation from Linux:**
-```bash
-# Install MinGW-w64
-sudo apt install mingw-w64
+- `update_record` shallow-merges object fields; a non-object payload replaces `data`.
+- `delete_record` writes a tombstone. `get_collection` hides deleted records; the lower-level `get_record` can return a tombstone.
+- `clear_collection` is a local hard reset, not a replicated set of tombstones. Import also replaces local state without distributing a complete reset. Existing peers can reintroduce records on subsequent synchronization.
+- `with_transaction` groups SQLite and CRDT changes. Publish returned deltas only after the containing transaction succeeds.
+- Nested transactions use savepoints. A failed operation rolls back its SQLite writes and cached CRDT state, including when the caller catches an inner error.
+- Each CRDT map entry contains one serialized record. Concurrent changes to **different records** can merge; concurrent edits to the **same record** resolve to one whole record. This is not field-by-field collaborative editing.
+- A `.xdb` file inside a Softn bundle is a JSON schema/seed document. It is not a SQLite database file, and it is not an XDB database backup.
 
-# Add Rust target
-rustup target add x86_64-pc-windows-gnu
-```
+Exports use SQLite snapshots and include recent committed WAL writes. Imports validate database structure, record JSON and saved CRDT documents before replacing existing data. Database size reports the logical SQLite snapshot size, including pages still in the WAL.
 
-## Installation
+## Run the demo
 
-```bash
-# Clone the repository
+The demo includes notes, tasks and contacts, with CRUD controls, peer status, statistics and database export/import.
+
+### Requirements
+
+- Node.js **22.12 or later** and npm. The checked-in Vite dependency also accepts Node 20.19, but Node 18 cannot run it.
+- Rust through `rustup`. This checkout selects the toolchain in [rust-toolchain.toml](rust-toolchain.toml).
+- Your platform's Tauri build prerequisites. Windows native builds use the MSVC C++ toolchain and WebView2; Linux and macOS need their corresponding native development dependencies.
+
+```sh
 git clone https://github.com/f2i-com/xdb.org.git
-cd xdb-org
-
-# Install npm dependencies
-npm install
-
-# Build the React package
+cd xdb.org
+npm ci
 npm run build:lib
-```
-
-## Running the Demo
-
-### Development mode
-```bash
 npm run tauri:dev
 ```
 
-### Production builds
+The demo uses port **1420**. Stop another development server using that port before starting it. `npm run dev` opens only the frontend; database commands require the Tauri host.
 
-**Build for current platform:**
-```bash
+```sh
+# Compile the React package and demo frontend
+npm run build
+
+# Build the desktop application
 npm run tauri:build
 ```
 
-**Build for Windows (cross-compile from Linux):**
-```bash
-npm run tauri:build:windows
-```
+The checked-in demo bundle configuration targets Windows MSI/NSIS installers. Native bundles are written under `target/release/bundle/`. For another platform, configure the demo's Tauri bundle targets for that platform. The `tauri:build:windows` script selects the Windows GNU target; it is not a complete cross-compilation environment.
 
-Build outputs:
-- **Linux:** `target/release/bundle/`
-- **Windows:** `target/x86_64-pc-windows-gnu/release/bundle/nsis/`
+## Use the Rust library
 
-## Using XDB in Your Project
-
-### 1. Add the Rust Crate
-
-In your Tauri app's `Cargo.toml`:
+For a server or another host that does not need Tauri commands:
 
 ```toml
 [dependencies]
-xdb = { path = "../path/to/crates/xdb" }
-# or when published: xdb = "1.0"
+xdb = { path = "../xdb.org/crates/xdb", default-features = false }
+serde_json = "1"
 ```
 
-In your `lib.rs`:
-
 ```rust
-use tauri::{Manager, RunEvent};
-use xdb::SharedNetwork;
+use std::path::PathBuf;
+use xdb::{create_shared_db, DbResult};
 
-pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            // Initialize XDB (database + P2P network)
-            xdb::tauri::setup_xdb(app)?;
-            Ok(())
-        })
-        // Register XDB commands
-        .invoke_handler(tauri::generate_handler![
-            xdb::tauri::create_record,
-            xdb::tauri::update_record,
-            xdb::tauri::delete_record,
-            xdb::tauri::get_record,
-            xdb::tauri::get_collection,
-            xdb::tauri::get_collections,
-            xdb::tauri::get_db_stats,
-            xdb::tauri::get_network_status,
-            xdb::tauri::request_sync,
-            xdb::tauri::export_database,
-            xdb::tauri::import_database,
-            xdb::tauri::get_db_path,
-        ])
-        .build(tauri::generate_context!())
-        .expect("error building app")
-        .run(|app_handle, event| {
-            if let RunEvent::Exit = event {
-                // Graceful shutdown
-                let network = app_handle.state::<SharedNetwork>();
-                tauri::async_runtime::block_on(async {
-                    xdb::tauri::shutdown_xdb(&network).await;
-                });
-            }
-        });
+fn save_notes() -> DbResult<()> {
+    let shared = create_shared_db(PathBuf::from("notes.sqlite"))?;
+    let mut db = shared.lock().expect("database lock poisoned");
+
+    db.with_transaction(|db| {
+        db.create_record("notes", serde_json::json!({ "title": "First note" }))?;
+        db.create_record("notes", serde_json::json!({ "title": "Second note" }))?;
+        Ok(())
+    })?;
+
+    let notes = db.get_collection("notes")?;
+    println!("{} saved notes", notes.len());
+    Ok(())
 }
 ```
 
-### 2. Add the React Package
+Opening `XdbDatabase` or calling `create_shared_db` does not start networking. `default-features = false` disables the Tauri integration; networking types remain available for hosts that explicitly create a network node.
 
-```bash
-npm install @xdb/react
+Core methods include:
+
+| Method | Purpose |
+| --- | --- |
+| `create_record`, `update_record`, `delete_record`, `upsert_record` | Write a record and return its CRDT update. |
+| `get_record`, `get_collection`, `get_collections` | Read persisted records and collection names. |
+| `with_transaction` | Run a group of operations in one transaction. |
+| `get_full_state`, `get_state_vector`, `get_updates_since`, `apply_remote_update` | Integrate a host's synchronization transport. |
+| `export_to_file`, `replace_from_file` | Export and restore SQLite storage. |
+| `clear_collection`, `get_stats` | Clear a collection or inspect database statistics. |
+
+## Use React + Tauri
+
+The [demo's native entry point](apps/demo/src-tauri/src/lib.rs) shows initialization, command registration and graceful network shutdown. Use the crate's default features for a Tauri host:
+
+```toml
+[dependencies]
+xdb = { path = "../xdb.org/crates/xdb" }
 ```
 
-In your React components:
+Call `xdb::tauri::setup_xdb(app)` during Tauri setup and register the commands your UI uses with `tauri::generate_handler!`. Build this repository's React package before adding it to a sibling application:
+
+```sh
+# In the XDB checkout
+npm run build:lib
+
+# In your React + Tauri application
+npm install ../xdb.org/packages/xdb-react
+```
 
 ```tsx
-import {
-  useCollection,
-  useNetworkStatus,
-  useDbStats,
-  useDbPath,
-  useSyncEvents,
-  usePeerEvents,
-} from "@xdb/react";
+import { useCollection } from "@xdb/react";
 
 interface Note {
   title: string;
-  content: string;
 }
 
-function NotesApp() {
-  const { records, loading, create, update, remove, requestSync } = useCollection<Note>("notes");
-  const { status } = useNetworkStatus();
-  const { stats } = useDbStats();
+export function Notes() {
+  const { records, loading, error, mutating, create, remove } =
+    useCollection<Note>("notes", { appId: "my-notes-app" });
 
-  // Listen for sync events
-  useSyncEvents((event) => {
-    console.log(`Collection ${event.collection} synced`);
-  });
-
-  // Listen for peer events
-  usePeerEvents((event) => {
-    console.log(`Peer ${event.peer_id} ${event.type}`);
-  });
-
-  const handleCreate = async () => {
-    await create({ title: "New Note", content: "Hello World!" });
-  };
-
-  if (loading) return <div>Loading...</div>;
+  if (loading) return <p>Opening notes…</p>;
 
   return (
-    <div>
-      <p>Status: {status?.is_running ? "Online" : "Offline"}</p>
-      <p>Connected Peers: {status?.connected_peers.length ?? 0}</p>
-      <p>Total Records: {stats?.record_count ?? 0}</p>
-
-      {records.map((record) => (
-        <div key={record.id}>
-          <h3>{record.data.title}</h3>
-          <p>{record.data.content}</p>
-          <button onClick={() => update(record.id, { ...record.data, title: "Updated" })}>
-            Update
-          </button>
-          <button onClick={() => remove(record.id)}>Delete</button>
+    <section>
+      <h1>Notes</h1>
+      {error && <p role="alert">{error}</p>}
+      <button disabled={mutating} onClick={() => create({ title: "New note" })}>
+        Add note
+      </button>
+      {records.map(note => (
+        <div key={note.id}>
+          <span>{note.data.title}</span>
+          <button disabled={mutating} onClick={() => remove(note.id)}>Delete</button>
         </div>
       ))}
-
-      <button onClick={handleCreate}>Add Note</button>
-      <button onClick={requestSync}>Sync Now</button>
-    </div>
+    </section>
   );
 }
 ```
 
-## API Reference
+### App scope and storage
 
-### React Hooks
+Pass the same stable `appId` to every database hook for an app. Tauri `invoke` calls use `appId` in their arguments, while Rust commands call the parameter `app_id`.
 
-| Hook | Description |
-|------|-------------|
-| `useCollection<T>(name, options?)` | Manage a collection with CRUD operations |
-| `useDbStats(pollInterval?)` | Get database statistics (records, collections, size) |
-| `useNetworkStatus(pollInterval?)` | Get P2P network status and connected peers |
-| `useDbPath()` | Get the database file path |
-| `useDbExport()` | Export database to a file |
-| `useDbImport()` | Import database from a file |
-| `useSyncEvents(callback)` | Listen for sync events |
-| `usePeerEvents(callback)` | Listen for peer connect/disconnect events |
+With `setup_xdb`, the default database is `<app data>/apps/_default/data.sqlite`. Named apps use `<app data>/apps/<sanitized app ID>/data.sqlite`. Empty or omitted IDs select `_default`. The host should choose stable identifiers; sanitized names are a storage namespace, not user authentication.
 
-#### useCollection Options
+`setup_xdb_with_path` uses the supplied path for the default database. Named app databases are stored beneath its parent directory in `apps/<sanitized app ID>/data.sqlite`.
 
-```typescript
-interface UseCollectionOptions {
-  autoRefresh?: boolean;  // Auto-refresh on sync events (default: true)
-  pollInterval?: number;  // Background polling interval in ms (default: none)
-}
-```
+Only the default database participates in native peer sync. Named app writes stay local, and `request_sync` reports that native sync is unavailable for that scope. App-scoped replication needs a transport with explicit app identity; Softn's browser and server implementations live in the Softn repository.
 
-### Tauri Commands
+`setup_xdb` starts the native default peer network automatically. Use the Rust database API directly when a host needs storage without that network. The existing `xdb-sync` protocol discovers peers on the local network; it does not provide account login or per-user permissions.
 
-| Command | Description |
-|---------|-------------|
-| `create_record` | Create a new record in a collection |
-| `update_record` | Update an existing record |
-| `delete_record` | Soft delete a record |
-| `get_record` | Get a single record by ID |
-| `get_collection` | Get all records in a collection |
-| `get_collections` | List all collection names |
-| `get_db_stats` | Get database statistics |
-| `get_network_status` | Get P2P network status |
-| `request_sync` | Request sync from peers |
-| `export_database` | Export database to file |
-| `import_database` | Import database from file |
-| `get_db_path` | Get database file path |
+### Hooks
+
+| Hook | Purpose |
+| --- | --- |
+| `useCollection<T>(name, options?)` | Records, loading/error state, CRUD, refresh and sync request. |
+| `useFind<T>(name, options?)` | Filter, sort and paginate a collection locally. |
+| `useDbStats(pollInterval?, appId?)` | Record/collection counts and database size. |
+| `useDbPath(appId?)` | Resolved database path. |
+| `useDbExport(appId?)`, `useDbImport(appId?)` | Backup and restore controls. Import replaces the selected database. |
+| `useNetworkStatus(pollInterval?)` | Default network status and connected peers. |
+| `useSyncEvents(callback)`, `usePeerEvents(callback)` | Native network notifications. |
+
+`useCollection` accepts `appId`, `autoRefresh`, `pollInterval`, `optimisticUpdates`, `initialData`, `sortBy` and `sortOrder`. `useFind` accepts `appId`, filters, sort and pagination options. See the [TypeScript definitions](packages/xdb-react/src/types/index.ts) for exact types.
+
+The hooks invoke native commands; they do not include a standalone browser database fallback.
+
+Nonpositive or nonfinite polling intervals disable background polling. `useFind` reports the count after filtering and before pagination. Statistics, network status and import/export hooks expose errors so the interface can explain a failed operation.
+
+### Native commands
+
+Database commands accept optional `appId`:
+
+- CRUD: `create_record`, `update_record`, `delete_record`, `upsert_record`.
+- Reads: `get_record`, `get_collection`, `get_collections`, `get_db_stats`, `get_db_path`.
+- Maintenance: `clear_collection`, `export_database`, `import_database`.
+- Synchronization: `request_sync` (default scope only).
+
+`get_network_status` reports the shared default network. `get_db_base_dir` reports the directory containing app databases. Register additional commands explicitly if your application uses more than the demo does.
 
 ### Events
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `xdb-sync-event` | `{ type, collection }` | Fired when sync data is received from peers |
-| `xdb-peer-event` | `{ type, peer_id, addresses? }` | Fired when peers connect or disconnect |
-| `db-imported` | `()` | Fired after database import completes |
+| Event | Payload and scope |
+| --- | --- |
+| `xdb-data-event` | Local change: `{ type, app_id, collection? }`. Types are `create`, `update`, `delete`, `upsert`, `clear` and `import`; import omits the collection to refresh the whole selected database. |
+| `xdb-sync-event` | Peer update: `{ type, collection }`. The current native protocol uses the default database only. |
+| `xdb-peer-event` | Peer connection status: `{ type, peer_id, addresses? }`. |
+| `db-imported` | Restore completion: `{ app_id }`. |
 
-## Tech Stack
+Event `app_id` values are canonical sanitized IDs, with `_default` for the default database. `useCollection` filters local events by that scope and refreshes on relevant changes when `autoRefresh` is enabled.
 
-| Component | Library | Version | Description |
-|-----------|---------|---------|-------------|
-| App Framework | `tauri` | 2.x | Cross-platform desktop apps |
-| P2P Networking | `libp2p` | 0.55 | TCP, mDNS discovery, GossipSub messaging |
-| Async Runtime | `tokio` | 1.x | Async runtime for Rust |
-| Storage Engine | `rusqlite` | 0.31 | SQLite with bundled support |
-| Conflict Resolution | `yrs` | 0.21 | Y-CRDT implementation for Rust |
-| Serialization | `serde` | 1.x | Data serialization |
-| Frontend | `react` | 19.x | UI framework |
+## Manual checks
 
-## Architecture
+Run from this repository's root:
 
-### Data Flow
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   React UI  │────▶│  Tauri IPC  │────▶│  XDB Core   │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                               │
-                    ┌──────────────────────────┼──────────────────────────┐
-                    │                          ▼                          │
-                    │  ┌─────────────┐   ┌─────────────┐   ┌───────────┐  │
-                    │  │   SQLite    │◀─▶│   Y-CRDT    │◀─▶│  libp2p   │  │
-                    │  │  (Storage)  │   │  (Merging)  │   │  (Sync)   │  │
-                    │  └─────────────┘   └─────────────┘   └───────────┘  │
-                    │                                            │        │
-                    │                      XDB Core              │        │
-                    └────────────────────────────────────────────┼────────┘
-                                                                 │
-                                                                 ▼
-                                                        ┌─────────────────┐
-                                                        │   Other Peers   │
-                                                        │  (via GossipSub)│
-                                                        └─────────────────┘
+```sh
+cargo test --locked -p xdb --no-default-features
+cargo test --locked -p xdb
+npm run typecheck -w @xdb/react
+npm test -w @xdb/react
+npm run build
 ```
 
-### Write Path
-1. User action triggers React hook (`create`, `update`, `remove`)
-2. Tauri IPC invokes Rust command
-3. XDB saves record to SQLite
-4. XDB updates CRDT document (Yrs)
-5. CRDT delta published via GossipSub to all connected peers
-6. Peers receive delta, merge into their local CRDT, update SQLite
+Rust checks cover database behavior and, with default features enabled, Tauri integration helpers. The second command needs platform-native Tauri build dependencies. Build checks alone do not verify discovery or live synchronization between two machines.
 
-### Sync Path
-1. libp2p receives message on `xdb-sync` topic
-2. CRDT delta decoded and applied to local Yrs document
-3. Merged state written to SQLite
-4. `xdb-sync-event` emitted to frontend via Tauri
-5. React hooks automatically refresh affected collections
+For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing, use two demo instances on a trusted local network and verify create/update/delete propagation in the default database.
 
-### Peer Discovery
-- **mDNS:** Automatic discovery of peers on local network
-- **GossipSub:** Pub/sub messaging for sync updates
-- **Identify:** Protocol for peer identification
+Softn native builds use this crate as a sibling path dependency. Their [dependency checkout script](https://github.com/f2i-com/softn.com/blob/main/.github/scripts/checkout-xdb.sh) pins a specific XDB revision; adopting changes in release builds requires updating that pin as well as the checkout.
 
-## Scripts Reference
+## Repository layout
 
-| Script | Description |
-|--------|-------------|
-| `npm install` | Install all workspace dependencies |
-| `npm run build` | Build all packages |
-| `npm run build:lib` | Build @xdb/react package only |
-| `npm run build:demo` | Build demo frontend only |
-| `npm run dev` | Run demo in development mode |
-| `npm run tauri:dev` | Run Tauri demo with hot reload |
-| `npm run tauri:build` | Build for current platform |
-| `npm run tauri:build:windows` | Cross-compile for Windows (x86_64-pc-windows-gnu) |
-
-## Notes
-
-- **Rust Nightly Required:** The project uses Rust nightly due to dependency requirements. This is configured automatically via `rust-toolchain.toml`.
-- **Network Discovery:** Peers are discovered via mDNS on the local network. Ensure your firewall allows mDNS traffic (UDP port 5353).
-- **Port:** The P2P network listens on a random available TCP port.
-- **Database Location:** The SQLite database is stored in the app's data directory (platform-specific).
+```text
+crates/xdb/src/
+  db.rs          SQLite storage, transactions and Yrs documents
+  network.rs     Native libp2p discovery and synchronization
+  tauri.rs       App database manager, commands and UI events
+packages/xdb-react/src/
+  hooks/         React hooks for the native commands
+  types/         Shared TypeScript payloads and options
+apps/demo/       React + Tauri demonstration application
+```
 
 ## License
 
-MIT
+[MIT](LICENSE).

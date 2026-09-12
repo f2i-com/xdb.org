@@ -75,6 +75,8 @@ export interface SyncEvent {
   type: "sync_update" | "sync_response";
   /** Collection that was synced */
   collection: string;
+  /** App scope, when provided; legacy events belong to the default database. */
+  app_id?: string;
 }
 
 /**
@@ -93,15 +95,17 @@ export interface PeerEvent {
  * Options for the useCollection hook
  */
 export interface UseCollectionOptions {
+  /** App database to use. Omit for the default database. */
+  appId?: string;
   /** Whether to automatically refresh on sync events (default: true) */
   autoRefresh?: boolean;
-  /** Polling interval in ms for background refresh (default: none) */
+  /** Positive polling interval in ms; zero/negative/non-finite values disable polling. */
   pollInterval?: number;
   /** Enable optimistic updates for create/update/delete (default: false) */
   optimisticUpdates?: boolean;
   /** Initial data to use before first fetch */
   initialData?: unknown[];
-  /** Sort records by a specific field */
+  /** Sort by a payload field, or record metadata such as created_at. */
   sortBy?: string;
   /** Sort direction (default: 'asc') */
   sortOrder?: 'asc' | 'desc';
@@ -151,6 +155,8 @@ export interface QueryFilter {
  * Options for useFind hook
  */
 export interface UseFindOptions {
+  /** App database to search. Omit for the default database. */
+  appId?: string;
   /** Filter conditions */
   filters?: QueryFilter[];
   /** Sort field */

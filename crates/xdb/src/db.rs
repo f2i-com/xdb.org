@@ -1,7 +1,10 @@
 //! XDB Database Module
 //! Handles SQLite persistence and Yrs (CRDT) synchronization logic
 
-use rusqlite::{params, Connection};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    params, Connection, DatabaseName, OpenFlags, OptionalExtension,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +27,8 @@ pub enum DbError {
     NotFound(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid database operation: {0}")]
+    InvalidOperation(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -45,6 +50,21 @@ pub struct XdbDatabase {
     db_path: PathBuf,
 }
 
+fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
+    let raw_data: String = row.get(2)?;
+    let data = serde_json::from_str(&raw_data).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(Record {
+        id: row.get(0)?,
+        collection: row.get(1)?,
+        data,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        deleted: row.get::<_, i32>(5)? != 0,
+    })
+}
+
 impl XdbDatabase {
     /// Create or open an XDB database at the given path
     pub fn open(path: PathBuf) -> DbResult<Self> {
@@ -52,7 +72,7 @@ impl XdbDatabase {
 
         // Enable WAL mode for better concurrent read performance.
         // WAL allows readers to proceed without blocking on writers,
-        // which is important when multiple worker threads share a single connection.
+        // when other connections read the same database.
         conn.pragma_update(None, "journal_mode", "WAL")?;
 
         // Initialize schema
@@ -101,50 +121,120 @@ impl XdbDatabase {
     /// Reload the database from disk (e.g. after an import replaced the file).
     /// Reopens the SQLite connection and clears all cached CRDT docs.
     pub fn reload(&mut self) -> DbResult<()> {
-        self.conn = Connection::open(&self.db_path)?;
-        self.docs.clear();
+        self.require_autocommit("reload")?;
+        *self = Self::open(self.db_path.clone())?;
         Ok(())
     }
 
-    /// Replace current database file contents from another SQLite file.
-    /// Drops the current connection first so file replacement is safe on Windows.
+    /// Restore a validated XDB snapshot, including committed WAL contents.
+    /// SQLite's backup API keeps the current connection usable if restore fails.
     pub fn replace_from_file(&mut self, source_path: &PathBuf) -> DbResult<()> {
-        let old_conn = std::mem::replace(&mut self.conn, Connection::open_in_memory()?);
-        drop(old_conn);
-
-        std::fs::copy(source_path, &self.db_path)?;
-        self.conn = Connection::open(&self.db_path)?;
+        self.require_autocommit("import")?;
+        self.require_distinct_path(source_path)?;
+        let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Hold one read snapshot through validation and restore.
+        source.execute_batch("BEGIN")?;
+        let integrity: String = source.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(DbError::InvalidOperation(format!(
+                "Invalid SQLite snapshot: {integrity}"
+            )));
+        }
+        source.prepare(
+            "SELECT id, collection, data, created_at, updated_at, deleted FROM records LIMIT 0",
+        )?;
+        source.prepare("SELECT collection, state_vector, doc_state FROM crdt_state LIMIT 0")?;
+        source.prepare(
+            "SELECT id, peer_id, collection, timestamp, update_data FROM sync_log LIMIT 0",
+        )?;
+        let mut records = source
+            .prepare("SELECT id, collection, data, created_at, updated_at, deleted FROM records")?;
+        for record in records.query_map([], record_from_row)? {
+            record?;
+        }
+        let mut states =
+            source.prepare("SELECT collection, state_vector, doc_state FROM crdt_state")?;
+        let snapshots = states.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for snapshot in snapshots {
+            let (collection, state_vector, doc_state) = snapshot?;
+            yrs::StateVector::decode_v1(&state_vector).map_err(|e| DbError::Crdt(e.to_string()))?;
+            let update = Update::decode_v1(&doc_state).map_err(|e| DbError::Crdt(e.to_string()))?;
+            let doc = Doc::new();
+            doc.transact_mut()
+                .apply_update(update)
+                .map_err(|e| DbError::Crdt(e.to_string()))?;
+            Self::records_from_doc(&collection, &doc)?;
+        }
+        {
+            let backup = Backup::new(&source, &mut self.conn)?;
+            if backup.step(-1)? != StepResult::Done {
+                return Err(DbError::InvalidOperation(
+                    "Database is busy; try importing again".into(),
+                ));
+            }
+        }
         self.docs.clear();
         Ok(())
     }
 
-    /// Execute a closure within a SQLite transaction (BEGIN/COMMIT/ROLLBACK).
-    /// Uses manual SQL statements to avoid borrow conflicts with rusqlite's Transaction type.
-    ///
-    /// Re-entrant: if already inside a transaction (e.g. called from within
-    /// another `with_transaction`), the inner call is a no-op — the outer
-    /// transaction handles BEGIN/COMMIT. This enables callers to batch
-    /// multiple individual operations (each of which internally calls
-    /// `with_transaction`) into a single disk flush.
+    /// Execute a closure atomically, rolling back both SQLite and cached CRDT state.
+    /// Nested calls use savepoints: a caught inner error rolls back only that call,
+    /// while successful batched operations still share one outer disk commit.
     pub fn with_transaction<F, T>(&mut self, f: F) -> DbResult<T>
     where
         F: FnOnce(&mut Self) -> DbResult<T>,
     {
-        if !self.conn.is_autocommit() {
-            // Already inside a transaction — skip nested BEGIN/COMMIT
-            return f(self);
-        }
-        self.conn.execute_batch("BEGIN")?;
-        match f(self) {
-            Ok(result) => {
-                self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch("SAVEPOINT xdb_transaction")?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(Ok(result)) => {
+                if let Err(error) = self.conn.execute_batch("RELEASE SAVEPOINT xdb_transaction") {
+                    self.rollback_savepoint();
+                    return Err(error.into());
+                }
                 Ok(result)
             }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
+            Ok(Err(error)) => {
+                self.rollback_savepoint();
+                Err(error)
+            }
+            Err(panic) => {
+                self.rollback_savepoint();
+                std::panic::resume_unwind(panic)
             }
         }
+    }
+
+    fn rollback_savepoint(&mut self) {
+        let _ = self.conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT xdb_transaction; RELEASE SAVEPOINT xdb_transaction",
+        );
+        // Yrs transactions commit eagerly. Reload from the rolled-back SQLite
+        // state on next access instead of retaining writes that never committed.
+        self.docs.clear();
+    }
+
+    fn require_autocommit(&self, operation: &str) -> DbResult<()> {
+        if !self.conn.is_autocommit() {
+            return Err(DbError::InvalidOperation(format!(
+                "Cannot {operation} inside a transaction"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_distinct_path(&self, path: &PathBuf) -> DbResult<()> {
+        if path.exists() && std::fs::canonicalize(path)? == std::fs::canonicalize(&self.db_path)? {
+            return Err(DbError::InvalidOperation(
+                "Source and destination must be different database files".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Get or create a Yrs Doc for a collection
@@ -160,14 +250,15 @@ impl XdbDatabase {
                     params![collection],
                     |row| row.get(0),
                 )
-                .ok();
+                .optional()?;
 
             if let Some(state_bytes) = state {
-                if let Ok(update) = Update::decode_v1(&state_bytes) {
-                    let mut txn = doc.transact_mut();
-                    txn.apply_update(update)
-                        .map_err(|e| DbError::Crdt(e.to_string()))?;
-                }
+                let update = Update::decode_v1(&state_bytes).map_err(|e| {
+                    DbError::Crdt(format!("Invalid saved CRDT state for {collection}: {e}"))
+                })?;
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update)
+                    .map_err(|e| DbError::Crdt(e.to_string()))?;
             }
 
             self.docs.insert(collection.to_string(), doc);
@@ -325,28 +416,16 @@ impl XdbDatabase {
     fn delete_record_inner(&mut self, id: &str) -> DbResult<Vec<u8>> {
         let now = chrono::Utc::now().to_rfc3339();
 
-        let collection: String = self
-            .conn
-            .query_row(
-                "SELECT collection FROM records WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(|_| DbError::NotFound(id.to_string()))?;
+        let mut record = self.get_record(id)?;
+        let collection = record.collection.clone();
 
         self.conn.execute(
             "UPDATE records SET deleted = 1, updated_at = ?1 WHERE id = ?2",
             params![&now, id],
         )?;
 
-        let record = Record {
-            id: id.to_string(),
-            collection: collection.clone(),
-            data: serde_json::Value::Null,
-            created_at: String::new(),
-            updated_at: now,
-            deleted: true,
-        };
+        record.updated_at = now;
+        record.deleted = true;
         let record_json = serde_json::to_string(&record)?;
 
         // Update CRDT and get update bytes
@@ -410,22 +489,10 @@ impl XdbDatabase {
             .query_row(
                 "SELECT id, collection, data, created_at, updated_at, deleted FROM records WHERE id = ?1",
                 params![id],
-                |row| {
-                    let raw_data = row.get::<_, String>(2)?;
-                    Ok(Record {
-                        id: row.get(0)?,
-                        collection: row.get(1)?,
-                        data: serde_json::from_str(&raw_data).unwrap_or_else(|e| {
-                            tracing::warn!("Invalid JSON in record data (get_record): {}", e);
-                            serde_json::Value::Null
-                        }),
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                        deleted: row.get::<_, i32>(5)? != 0,
-                    })
-                },
+                record_from_row,
             )
-            .map_err(|_| DbError::NotFound(id.to_string()))
+            .optional()?
+            .ok_or_else(|| DbError::NotFound(id.to_string()))
     }
 
     /// Get all records in a collection
@@ -435,20 +502,7 @@ impl XdbDatabase {
         )?;
 
         let records = stmt
-            .query_map(params![collection], |row| {
-                let raw_data = row.get::<_, String>(2)?;
-                Ok(Record {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    data: serde_json::from_str(&raw_data).unwrap_or_else(|e| {
-                        tracing::warn!("Invalid JSON in record data (get_collection): {}", e);
-                        serde_json::Value::Null
-                    }),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    deleted: row.get::<_, i32>(5)? != 0,
-                })
-            })?
+            .query_map(params![collection], record_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(records)
@@ -495,41 +549,7 @@ impl XdbDatabase {
                     .map_err(|e| DbError::Crdt(e.to_string()))?;
             }
 
-            // Extract records from CRDT state
-            let txn = doc.transact();
-            let mut records = Vec::new();
-            if let Some(map) = txn.get_map("records") {
-                for (key, value) in map.iter(&txn) {
-                    let yrs::Out::Any(yrs::Any::String(json_str)) = value else {
-                        return Err(DbError::Crdt(
-                            "Invalid record payload type in CRDT map".to_string(),
-                        ));
-                    };
-
-                    let record =
-                        serde_json::from_str::<Record>(json_str.as_ref()).map_err(|e| {
-                            DbError::Crdt(format!("Invalid record JSON in CRDT map: {}", e))
-                        })?;
-
-                    if record.collection != collection {
-                        return Err(DbError::Crdt(format!(
-                            "CRDT record collection mismatch: expected '{}', got '{}'",
-                            collection, record.collection
-                        )));
-                    }
-
-                    let map_key = key.to_string();
-                    if record.id != map_key {
-                        return Err(DbError::Crdt(format!(
-                            "CRDT record id mismatch: key '{}' vs record.id '{}'",
-                            map_key, record.id
-                        )));
-                    }
-
-                    records.push(record);
-                }
-            }
-            records
+            Self::records_from_doc(collection, doc)?
         };
 
         // Now update SQLite with the extracted records
@@ -555,6 +575,42 @@ impl XdbDatabase {
         Self::save_crdt_state_to_db(&self.conn, collection, doc)?;
 
         Ok(updated_records)
+    }
+
+    fn records_from_doc(collection: &str, doc: &Doc) -> DbResult<Vec<Record>> {
+        let txn = doc.transact();
+        let mut records = Vec::new();
+        if let Some(map) = txn.get_map("records") {
+            for (key, value) in map.iter(&txn) {
+                let yrs::Out::Any(yrs::Any::String(json_str)) = value else {
+                    return Err(DbError::Crdt(
+                        "Invalid record payload type in CRDT map".to_string(),
+                    ));
+                };
+
+                let record = serde_json::from_str::<Record>(json_str.as_ref()).map_err(|e| {
+                    DbError::Crdt(format!("Invalid record JSON in CRDT map: {}", e))
+                })?;
+
+                if record.collection != collection {
+                    return Err(DbError::Crdt(format!(
+                        "CRDT record collection mismatch: expected '{}', got '{}'",
+                        collection, record.collection
+                    )));
+                }
+
+                let map_key = key.to_string();
+                if record.id != map_key {
+                    return Err(DbError::Crdt(format!(
+                        "CRDT record id mismatch: key '{}' vs record.id '{}'",
+                        map_key, record.id
+                    )));
+                }
+
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     /// Get current state vector for syncing
@@ -604,9 +660,11 @@ impl XdbDatabase {
         Ok(())
     }
 
-    /// Export database to a file path
+    /// Export a consistent SQLite snapshot, including recent writes in the WAL.
     pub fn export_to_file(&self, path: &PathBuf) -> DbResult<()> {
-        std::fs::copy(&self.db_path, path)?;
+        self.require_autocommit("export")?;
+        self.require_distinct_path(path)?;
+        self.conn.backup(DatabaseName::Main, path, None)?;
         Ok(())
     }
 
@@ -624,12 +682,18 @@ impl XdbDatabase {
             |row| row.get(0),
         )?;
 
-        let db_size = std::fs::metadata(&self.db_path)?.len();
+        // Logical database size includes pages whose latest version is in WAL.
+        let page_count: u64 = self
+            .conn
+            .pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))?;
 
         Ok(DbStats {
             record_count: record_count as u64,
             collection_count: collection_count as u64,
-            db_size_bytes: db_size,
+            db_size_bytes: page_count * page_size,
         })
     }
 }
@@ -647,3 +711,7 @@ pub type SharedDb = Arc<Mutex<XdbDatabase>>;
 pub fn create_shared_db(path: PathBuf) -> DbResult<SharedDb> {
     Ok(Arc::new(Mutex::new(XdbDatabase::open(path)?)))
 }
+
+#[cfg(test)]
+#[path = "db_tests.rs"]
+mod tests;

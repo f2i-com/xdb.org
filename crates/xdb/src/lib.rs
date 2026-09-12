@@ -41,7 +41,7 @@
 //! Then in your `lib.rs`:
 //!
 //! ```rust,ignore
-//! use xdb::tauri::{setup_xdb, get_xdb_commands};
+//! use xdb::tauri::setup_xdb;
 //!
 //! pub fn run() {
 //!     tauri::Builder::default()
@@ -67,16 +67,14 @@ mod network;
 pub mod tauri;
 
 // Re-export main types
-pub use db::{
-    create_shared_db, DbError, DbResult, DbStats, Record, SharedDb, XdbDatabase,
-};
+pub use db::{create_shared_db, DbError, DbResult, DbStats, Record, SharedDb, XdbDatabase};
 
 #[cfg(feature = "tauri-commands")]
 pub use tauri::{DbManager, SharedDbManager};
 
 pub use network::{
-    create_shared_network, NetworkCommand, NetworkEvent, NetworkMessage, NetworkNode,
-    PeerInfo, SharedNetwork,
+    create_shared_network, NetworkCommand, NetworkEvent, NetworkMessage, NetworkNode, PeerInfo,
+    SharedNetwork,
 };
 
 /// Library version
