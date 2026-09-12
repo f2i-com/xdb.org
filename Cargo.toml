@@ -26,7 +26,7 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 yrs = "0.21"
 
 # P2P Networking
-libp2p = { version = "0.55", features = [
+libp2p = { version = "0.57", features = [
     "tokio",
     "tcp",
     "noise",

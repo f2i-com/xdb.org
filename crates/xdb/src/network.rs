@@ -96,7 +96,7 @@ fn publish_message(
     match serde_json::to_vec(message) {
         Ok(data) => match behaviour.publish(topic.clone(), data) {
             Ok(_) => {}
-            Err(gossipsub::PublishError::InsufficientPeers) => {
+            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
                 // Local writes have already been persisted. An offline node
                 // cannot deliver this update; this is not a database failure.
                 debug!("No subscribed peers available to receive XDB update");
