@@ -123,6 +123,7 @@ Core methods include:
 | `export_to_file`, `replace_from_file` | Export and restore SQLite storage. |
 | `clear_collection`, `get_stats` | Local reset of a collection or inspect database statistics. |
 | `import_records` | Import several collections in ONE transaction; summary returned after the commit (SN-01). |
+| `update_records` | Update several records in ONE transaction with one CRDT snapshot per touched collection; all-or-nothing (XD-04). |
 | `reset_collection`, `bump_epoch`, `get_epoch`, `apply_remote_reset`, `apply_remote_update_at_epoch` | Reset epochs for replicated resets and stale-peer rejection (XD-03). |
 | `reconcile_plan`, `unknown_collections` | Inputs for join/repair reconciliation (XD-02). |
 
@@ -210,7 +211,7 @@ Nonpositive or nonfinite polling intervals disable background polling. `useFind`
 
 Database commands accept optional `appId`:
 
-- CRUD: `create_record`, `update_record`, `delete_record`, `upsert_record`.
+- CRUD: `create_record`, `update_record`, `delete_record`, `upsert_record`; `update_records` batches updates in one transaction.
 - Reads: `get_record`, `get_collection`, `get_collections`, `get_db_stats`, `get_db_path`.
 - Maintenance: `clear_collection` (local), `reset_collection` (`scope`: `local` | `replicated`), `import_records`, `export_database`, `import_database` (`scope`: `local` | `fork` | `replace`).
 - Synchronization (default scope only): `request_sync`, `reconcile_network`, `resume_sync`.

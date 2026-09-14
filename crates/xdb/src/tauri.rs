@@ -681,6 +681,48 @@ pub async fn update_record(
     Ok(record)
 }
 
+/// Update several records in ONE transaction (XD-04 follow-up): one CRDT
+/// snapshot per touched collection instead of one per record, all-or-nothing,
+/// and the deltas are published only after the commit. Returns the updated
+/// records in request order.
+#[tauri::command]
+pub async fn update_records(
+    db_manager: State<'_, SharedDbManager>,
+    network: State<'_, SharedNetwork>,
+    app_id: Option<String>,
+    updates: Vec<UpdateRecordPayload>,
+) -> Result<Vec<Record>, String> {
+    let app_id = app_id.unwrap_or_default();
+    let db = db_manager.get_db(&app_id)?;
+    let (records, deltas) = {
+        let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+        let out = db_lock
+            .update_records(updates.into_iter().map(|u| (u.id, u.data)).collect())
+            .map_err(|e| e.to_string())?;
+        let mut records = Vec::with_capacity(out.len());
+        let mut deltas = Vec::with_capacity(out.len());
+        for (record, update) in out {
+            let epoch = db_lock.get_epoch(&record.collection).unwrap_or(0);
+            deltas.push((record.collection.clone(), epoch, update));
+            records.push(record);
+        }
+        (records, deltas)
+    };
+
+    let mut touched: Vec<&str> = records.iter().map(|r| r.collection.as_str()).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    for collection in touched {
+        db_manager.emit_change(&app_id, "update", Some(collection));
+    }
+    for (collection, epoch, update) in deltas {
+        broadcast_scoped_update(&network, &app_id, &collection, epoch, update).await;
+    }
+
+    info!("Updated {} records in one transaction", records.len());
+    Ok(records)
+}
+
 /// Delete a record (soft delete)
 #[tauri::command]
 pub async fn delete_record(
@@ -1349,6 +1391,7 @@ macro_rules! xdb_commands {
         tauri::generate_handler![
             $crate::tauri::create_record,
             $crate::tauri::update_record,
+            $crate::tauri::update_records,
             $crate::tauri::delete_record,
             $crate::tauri::upsert_record,
             $crate::tauri::get_record,

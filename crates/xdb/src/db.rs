@@ -565,6 +565,17 @@ impl XdbDatabase {
         id: &str,
         data: serde_json::Value,
     ) -> DbResult<(Record, Vec<u8>)> {
+        self.update_record_batched(id, data, true)
+    }
+
+    /// `persist_doc = false` defers the CRDT snapshot write to the caller
+    /// (one save per collection per batch instead of one per record).
+    fn update_record_batched(
+        &mut self,
+        id: &str,
+        data: serde_json::Value,
+        persist_doc: bool,
+    ) -> DbResult<(Record, Vec<u8>)> {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Get existing record (need current data for merge)
@@ -608,11 +619,40 @@ impl XdbDatabase {
         };
 
         // Save CRDT state (separate borrow scope)
-        if let Some(doc) = self.docs.get(&collection) {
-            Self::save_crdt_state_to_db(&self.conn, &collection, doc)?;
+        if persist_doc {
+            if let Some(doc) = self.docs.get(&collection) {
+                Self::save_crdt_state_to_db(&self.conn, &collection, doc)?;
+            }
         }
 
         Ok((record, update))
+    }
+
+    /// Update several records in ONE transaction with one CRDT snapshot per
+    /// touched collection (the benchmark's "batch edit" lane wrote the whole
+    /// document after every record). All updates commit or none does; the
+    /// returned deltas must be published only after this returns.
+    pub fn update_records(
+        &mut self,
+        updates: Vec<(String, serde_json::Value)>,
+    ) -> DbResult<Vec<(Record, Vec<u8>)>> {
+        self.with_transaction(|this| {
+            let mut out = Vec::with_capacity(updates.len());
+            let mut touched: Vec<String> = Vec::new();
+            for (id, data) in updates {
+                let (record, update) = this.update_record_batched(&id, data, false)?;
+                if !touched.contains(&record.collection) {
+                    touched.push(record.collection.clone());
+                }
+                out.push((record, update));
+            }
+            for collection in touched {
+                if let Some(doc) = this.docs.get(&collection) {
+                    Self::save_crdt_state_to_db(&this.conn, &collection, doc)?;
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// Soft delete a record

@@ -771,3 +771,44 @@ fn authoritative_restore_exceeds_both_live_and_snapshot_epochs_over_the_union_of
     assert_eq!(live.get_epoch("notes").unwrap(), 7);
     assert_eq!(live.get_epoch("new").unwrap(), 3);
 }
+
+
+// ── XD-04 follow-up: a batch of updates persists the CRDT document once per collection ──
+
+#[test]
+fn update_records_commits_all_or_nothing_with_one_snapshot_per_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = database(&dir, "batch.sqlite");
+    let ids: Vec<String> = (0..20)
+        .map(|i| db.create_record("notes", json!({"n": i})).unwrap().0.id)
+        .collect();
+    let other = db.create_record("tasks", json!({"t": 0})).unwrap().0.id;
+
+    let before = db.total_changes();
+    let updates: Vec<(String, serde_json::Value)> = ids
+        .iter()
+        .map(|id| (id.clone(), json!({"edited": true})))
+        .chain(std::iter::once((other.clone(), json!({"edited": true}))))
+        .collect();
+    let out = db.update_records(updates).unwrap();
+    assert_eq!(out.len(), 21);
+    // 21 record rows + 2 crdt_state rows (one per collection), not 21 + 21.
+    assert_eq!(db.total_changes() - before, 23);
+    assert!(out.iter().all(|(r, _)| r.data["edited"] == true));
+
+    // The persisted document agrees with the rows: a peer applying the full
+    // state sees every edit.
+    let peer_notes = replicated_records(&mut db, "notes");
+    assert!(peer_notes.iter().all(|r| r.data["edited"] == true));
+
+    // One bad id rolls back the whole batch, including records already updated.
+    let failed = db.update_records(vec![
+        (ids[0].clone(), json!({"edited": "second"})),
+        ("missing".into(), json!({})),
+    ]);
+    assert!(matches!(failed, Err(DbError::NotFound(_))));
+    assert_eq!(db.get_record(&ids[0]).unwrap().data["edited"], true);
+    assert!(replicated_records(&mut db, "notes")
+        .iter()
+        .all(|r| r.data["edited"] == true));
+}

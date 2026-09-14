@@ -147,17 +147,14 @@ fn run(n: usize) -> Vec<Lane> {
     // ── one batch of 100 edits in one transaction ───────────────────────────
     checkpoint(&db);
     let rows0 = db.total_changes();
+    let updates: Vec<(String, serde_json::Value)> = (0..BATCH)
+        .map(|i| (format!("r{:08}", (i * 104729) % n), json!({"batch": i})))
+        .collect();
     let t = Instant::now();
-    db.with_transaction(|this| {
-        for i in 0..BATCH {
-            let id = format!("r{:08}", (i * 104729) % n);
-            this.update_record(&id, json!({"batch": i}))?;
-        }
-        Ok(())
-    })
-    .unwrap();
+    let batch_deltas = db.update_records(updates).unwrap();
     let mut batch = vec![t.elapsed()];
-    lanes.push(lane("batch edit (100 updates, 1 txn)", &mut batch, db.total_changes() - rows0, wal_bytes(&db), 0));
+    let batch_delta_bytes: u64 = batch_deltas.iter().map(|(_, d)| d.len() as u64).sum();
+    lanes.push(lane("batch edit (100 updates, 1 txn)", &mut batch, db.total_changes() - rows0, wal_bytes(&db), batch_delta_bytes));
 
     // ── initial sync into an empty peer (SAMPLES independent fresh peers) ──
     let full = db.get_full_state("bench").unwrap();
