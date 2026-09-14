@@ -38,6 +38,11 @@ use crate::network::{
     create_shared_network, NetworkEvent, NetworkMessage, NetworkNode, NetworkOptions,
     SharedNetwork, SyncGate, SyncStats,
 };
+
+/// The network state a host's `setup_xdb` manages, named here so a host can
+/// wrap the commands that take it (for example to gate `import_database`
+/// behind its own checks) without reaching into the private module.
+pub use crate::network::SharedNetwork as SharedNetworkState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
