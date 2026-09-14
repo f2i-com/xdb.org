@@ -90,4 +90,4 @@ npm run typecheck -w @xdb/react && npm test -w @xdb/react
 XDB_BENCH_LARGE=1 cargo test -p xdb --release -- --ignored --nocapture bench_persistence
 ```
 
-A live two-machine LAN run (discovery, partition, reconnect) is still a manual check with two demo instances; the in-process tests exercise the database-level convergence, epoch and import semantics that the network loop calls.
+A live two-machine LAN run (discovery, partition, reconnect) is still a manual check with two demo instances. Short of that, `two_nodes_discover_deliver_partition_and_reconcile_over_loopback` (ignored by default; `cargo test -p xdb -- --ignored two_nodes`) runs two real `NetworkNode`s in one process over loopback sockets: mDNS discovery, GossipSub delivery, one node shut down while both sides write, a restart under a new peer identity on the same database, convergence in both directions with no manual sync request, and live delivery after the reconnect. Recorded 14 September 2026 on Windows 11: passes in about 35 s. The database-level tests exercise the convergence, epoch and import semantics that the network loop calls.

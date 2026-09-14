@@ -1089,3 +1089,7 @@ mod tests {
         assert!(repair_jitter(&peer) < Duration::from_secs(5));
     }
 }
+
+#[cfg(test)]
+#[path = "network_tests.rs"]
+mod loopback_tests;

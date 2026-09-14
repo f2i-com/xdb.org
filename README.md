@@ -247,7 +247,13 @@ cargo test -p xdb --release -- --ignored --nocapture bench_persistence
 
 Rust checks cover database behavior and, with default features enabled, Tauri integration helpers. The second command needs platform-native Tauri build dependencies. Build checks alone do not verify discovery or live synchronization between two machines.
 
-For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing, enable networking in BOTH demo instances first (it is off by default), use a trusted local network, and verify create/update/delete propagation in the default database; then disconnect one instance, edit on both sides, reconnect and confirm both converge without pressing sync.
+One further test drives two real network nodes over loopback sockets in one process (mDNS discovery, GossipSub delivery, a partition with writes on both sides, a restart under a new peer identity, automatic reconciliation, live delivery afterwards). It needs multicast on the host and takes about 35 seconds, so it is ignored by default:
+
+```sh
+cargo test -p xdb -- --ignored two_nodes --nocapture
+```
+
+For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing across two machines, enable networking in BOTH demo instances first (it is off by default), use a trusted local network, and verify create/update/delete propagation in the default database; then disconnect one instance, edit on both sides, reconnect and confirm both converge without pressing sync. The loopback test above is the single-machine version of that sequence; it does not stand in for a run across two hosts and two network stacks.
 
 Softn native builds use this crate as a sibling path dependency. Their [dependency checkout script](https://github.com/f2i-com/softn.com/blob/main/.github/scripts/checkout-xdb.sh) pins a specific XDB revision; adopting changes in release builds requires updating that pin as well as the checkout.
 
