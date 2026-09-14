@@ -6,6 +6,7 @@ import {
   useCollection,
   useDbStats,
   useNetworkStatus,
+  useNetworkSettings,
   useDbPath,
   type Record,
 } from "@xdb/react";
@@ -493,8 +494,12 @@ function StatusPanel({ showNotification }: { showNotification: (msg: string) => 
     });
     if (path) {
       try {
-        await invoke("import_database", { sourcePath: path });
-        showNotification("Database imported successfully!");
+        // Local scope: this instance only. While peers are connected the node
+        // pauses synchronization until the operator chooses local/fork/replace.
+        const outcome = await invoke<{ sync_paused: boolean }>("import_database", { sourcePath: path, scope: "local" });
+        showNotification(outcome.sync_paused
+          ? "Database imported. Synchronization is paused until you resume it (Network panel)."
+          : "Database imported successfully!");
       } catch (e) {
         showNotification(`Import failed: ${e}`);
       }
@@ -507,15 +512,49 @@ function StatusPanel({ showNotification }: { showNotification: (msg: string) => 
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  const { settings, setEnabled, resumeSync } = useNetworkSettings();
+  const toggleNetworking = async () => {
+    try {
+      const next = !(settings?.enabled ?? false);
+      await setEnabled(next);
+      showNotification(next
+        ? "Peer networking enabled for this trusted local network."
+        : "Peer networking disabled. Local data keeps working.");
+    } catch (e) {
+      showNotification(`Could not change networking: ${e}`);
+    }
+  };
+
   return (
     <aside className="status-panel">
       <h3>Network Status</h3>
+      <div className="status-item">
+        <span>Mode:</span>
+        <span>{status?.mode === "trusted-lan" ? "Trusted LAN (opt-in)" : "Local only"}</span>
+      </div>
       <div className="status-item">
         <span>Status:</span>
         <span className={status?.is_running ? "status-online" : "status-offline"}>
           {status?.is_running ? "Online" : "Offline"}
         </span>
       </div>
+      <div className="status-item">
+        <button className="sync-btn" onClick={toggleNetworking}>
+          {settings?.enabled ? "Disable peer networking" : "Enable peer networking (trusted LAN only)"}
+        </button>
+      </div>
+      {status?.sync_paused && (
+        <div className="status-item">
+          <span>Sync paused after a local restore.</span>
+          <button className="sync-btn" onClick={() => void resumeSync().then(() => showNotification("Synchronization resumed."))}>Resume</button>
+        </div>
+      )}
+      {status?.is_running && (
+        <div className="status-item">
+          <span>Delivered / undelivered publishes:</span>
+          <span>{status.stats.publishes_sent} / {status.stats.publishes_without_peers}</span>
+        </div>
+      )}
       <div className="status-item">
         <span>Peer ID:</span>
         <span className="peer-id">{status?.peer_id?.substring(0, 16) || "-"}...</span>

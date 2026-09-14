@@ -6,14 +6,14 @@ use rusqlite::{
     params, Connection, DatabaseName, OpenFlags, OptionalExtension,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, Map, ReadTxn, Transact, Update, WriteTxn};
+use yrs::{Doc, Map, Observable, ReadTxn, Transact, Update, WriteTxn};
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -41,6 +41,52 @@ pub struct Record {
     pub created_at: String,
     pub updated_at: String,
     pub deleted: bool,
+}
+
+/// One collection's contribution to a bulk import (audit SN-01).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionImport {
+    pub collection: String,
+    /// Replace: every existing record NOT in `records` is tombstoned (a
+    /// replicated deletion), then the incoming records are upserted. Merge
+    /// (false): incoming records are upserted over what exists.
+    #[serde(default)]
+    pub replace: bool,
+    pub records: Vec<Record>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionImportResult {
+    pub collection: String,
+    pub replaced: bool,
+    pub imported: u64,
+    pub tombstoned: u64,
+    pub epoch: u64,
+}
+
+/// What a committed bulk import did. Only returned after the transaction
+/// committed, so a caller holding it holds a durable-completion signal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub collections: Vec<CollectionImportResult>,
+    pub imported: u64,
+    pub tombstoned: u64,
+}
+
+/// Deltas produced by a committed import: (collection, epoch, update bytes).
+/// Publish them only after the commit that produced them.
+pub type CommittedDeltas = Vec<(String, u64, Vec<u8>)>;
+
+/// Outcome of applying a peer's update against the local reset epoch (audit XD-03).
+#[derive(Debug)]
+pub enum RemoteApplyOutcome {
+    /// Applied; the records the update touched.
+    Applied(Vec<Record>),
+    /// The sender is behind an acknowledged reset. Nothing was applied.
+    StaleEpoch { local: u64, remote: u64 },
+    /// The sender knows a newer reset than this node. Nothing was applied;
+    /// adopt it with `apply_remote_reset` and retry.
+    MissingReset { local: u64, remote: u64 },
 }
 
 /// The XDB Database - wraps SQLite with CRDT sync capabilities
@@ -102,6 +148,16 @@ impl XdbDatabase {
                 collection TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 update_data BLOB NOT NULL
+            );
+
+            -- Reset epochs (audit XD-03): an administrative reset of a shared
+            -- collection bumps its epoch; updates from peers on an older epoch
+            -- are rejected instead of resurrecting pre-reset records.
+            CREATE TABLE IF NOT EXISTS collection_epochs (
+                collection TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                origin TEXT,
+                reset_at TEXT NOT NULL
             );
             "#,
         )?;
@@ -414,6 +470,12 @@ impl XdbDatabase {
     }
 
     fn delete_record_inner(&mut self, id: &str) -> DbResult<Vec<u8>> {
+        self.delete_record_batched(id, true)
+    }
+
+    /// `persist_doc = false` defers the CRDT snapshot write to the caller (one
+    /// save per collection per batch instead of one per record, audit XD-04).
+    fn delete_record_batched(&mut self, id: &str, persist_doc: bool) -> DbResult<Vec<u8>> {
         let now = chrono::Utc::now().to_rfc3339();
 
         let mut record = self.get_record(id)?;
@@ -438,8 +500,10 @@ impl XdbDatabase {
         };
 
         // Save CRDT state (separate borrow scope)
-        if let Some(doc) = self.docs.get(&collection) {
-            Self::save_crdt_state_to_db(&self.conn, &collection, doc)?;
+        if persist_doc {
+            if let Some(doc) = self.docs.get(&collection) {
+                Self::save_crdt_state_to_db(&self.conn, &collection, doc)?;
+            }
         }
 
         Ok(update)
@@ -451,6 +515,11 @@ impl XdbDatabase {
     }
 
     fn upsert_record_inner(&mut self, record: Record) -> DbResult<Vec<u8>> {
+        self.upsert_record_batched(record, true)
+    }
+
+    /// `persist_doc = false` defers the CRDT snapshot write to the caller (audit XD-04).
+    fn upsert_record_batched(&mut self, record: Record, persist_doc: bool) -> DbResult<Vec<u8>> {
         let record_json = serde_json::to_string(&record)?;
 
         // Upsert into SQLite
@@ -476,8 +545,10 @@ impl XdbDatabase {
         };
 
         // Save CRDT state (separate borrow scope)
-        if let Some(doc) = self.docs.get(&record.collection) {
-            Self::save_crdt_state_to_db(&self.conn, &record.collection, doc)?;
+        if persist_doc {
+            if let Some(doc) = self.docs.get(&record.collection) {
+                Self::save_crdt_state_to_db(&self.conn, &record.collection, doc)?;
+            }
         }
 
         Ok(update)
@@ -519,6 +590,222 @@ impl XdbDatabase {
         Ok(collections)
     }
 
+    // ── Reset epochs (audit XD-03) ────────────────────────────────────────────
+
+    /// The collection's reset epoch (0 until it has ever been reset).
+    pub fn get_epoch(&self, collection: &str) -> DbResult<u64> {
+        let epoch: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT epoch FROM collection_epochs WHERE collection = ?1",
+                params![collection],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(epoch.unwrap_or(0).max(0) as u64)
+    }
+
+    fn set_epoch(&self, collection: &str, epoch: u64, origin: &str) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO collection_epochs (collection, epoch, origin, reset_at) VALUES (?1, ?2, ?3, ?4)",
+            params![collection, epoch as i64, origin, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Administrative reset of a SHARED collection: clears local records and
+    /// CRDT state and advances the epoch. The caller broadcasts the returned
+    /// epoch; peers on the old epoch adopt it and can no longer reintroduce
+    /// pre-reset records. Compare `clear_collection`, which is local only.
+    pub fn reset_collection(&mut self, collection: &str, origin: &str) -> DbResult<u64> {
+        let collection = collection.to_string();
+        let origin = origin.to_string();
+        self.with_transaction(|this| {
+            let epoch = this.get_epoch(&collection)? + 1;
+            this.clear_collection_inner(&collection)?;
+            this.set_epoch(&collection, epoch, &origin)?;
+            Ok(epoch)
+        })
+    }
+
+    /// Advance the epoch WITHOUT clearing: the current local contents become
+    /// the authoritative post-reset state (a "replace synchronized state"
+    /// restore). Peers adopt the reset and then fetch this node's state.
+    pub fn bump_epoch(&mut self, collection: &str, origin: &str) -> DbResult<u64> {
+        let collection = collection.to_string();
+        let origin = origin.to_string();
+        self.with_transaction(|this| {
+            let epoch = this.get_epoch(&collection)? + 1;
+            this.set_epoch(&collection, epoch, &origin)?;
+            Ok(epoch)
+        })
+    }
+
+    /// Adopt a reset announced by a peer. Returns true when the epoch was
+    /// newer than ours and the collection was cleared; false (nothing done)
+    /// for an equal or OLDER epoch — a stale peer cannot undo a newer reset.
+    pub fn apply_remote_reset(
+        &mut self,
+        collection: &str,
+        epoch: u64,
+        origin: &str,
+    ) -> DbResult<bool> {
+        let collection = collection.to_string();
+        let origin = origin.to_string();
+        self.with_transaction(|this| {
+            if epoch <= this.get_epoch(&collection)? {
+                return Ok(false);
+            }
+            this.clear_collection_inner(&collection)?;
+            this.set_epoch(&collection, epoch, &origin)?;
+            Ok(true)
+        })
+    }
+
+    /// Apply a peer's update only when its epoch matches ours.
+    pub fn apply_remote_update_at_epoch(
+        &mut self,
+        collection: &str,
+        epoch: u64,
+        update_bytes: &[u8],
+    ) -> DbResult<RemoteApplyOutcome> {
+        let local = self.get_epoch(collection)?;
+        if epoch < local {
+            return Ok(RemoteApplyOutcome::StaleEpoch {
+                local,
+                remote: epoch,
+            });
+        }
+        if epoch > local {
+            return Ok(RemoteApplyOutcome::MissingReset {
+                local,
+                remote: epoch,
+            });
+        }
+        Ok(RemoteApplyOutcome::Applied(
+            self.apply_remote_update(collection, update_bytes)?,
+        ))
+    }
+
+    // ── Bulk import (audit SN-01) ─────────────────────────────────────────────
+
+    fn validate_import_record(collection: &str, record: &Record) -> DbResult<()> {
+        if record.id.trim().is_empty() {
+            return Err(DbError::InvalidOperation(format!(
+                "Import into '{collection}' contains a record without an id"
+            )));
+        }
+        if record.collection != collection {
+            return Err(DbError::InvalidOperation(format!(
+                "Record '{}' belongs to '{}' but was imported into '{}'",
+                record.id, record.collection, collection
+            )));
+        }
+        Ok(())
+    }
+
+    /// Import several collections in ONE transaction. Either every batch
+    /// commits or none does; the summary is returned only after the commit.
+    ///
+    /// - The whole batch is validated (non-empty collection names, non-empty
+    ///   ids, records that belong to their batch) before any write.
+    /// - `replace` tombstones records absent from the batch instead of hard
+    ///   deleting them, so the removal REPLICATES to peers; a local hard
+    ///   reset stays the separate, explicit `clear_collection`.
+    /// - Returned deltas must be published only after this returns.
+    pub fn import_records(
+        &mut self,
+        batches: Vec<CollectionImport>,
+    ) -> DbResult<(ImportSummary, CommittedDeltas)> {
+        for batch in &batches {
+            if batch.collection.trim().is_empty() {
+                return Err(DbError::InvalidOperation(
+                    "Import contains a batch without a collection name".into(),
+                ));
+            }
+            for record in &batch.records {
+                Self::validate_import_record(&batch.collection, record)?;
+            }
+        }
+        self.with_transaction(|this| {
+            let mut summary = ImportSummary::default();
+            let mut deltas: CommittedDeltas = Vec::new();
+            for batch in batches {
+                let epoch = this.get_epoch(&batch.collection)?;
+                let mut tombstoned = 0u64;
+                if batch.replace {
+                    let incoming: HashMap<&str, ()> =
+                        batch.records.iter().map(|r| (r.id.as_str(), ())).collect();
+                    let existing = this.get_collection(&batch.collection)?;
+                    for record in existing {
+                        if !incoming.contains_key(record.id.as_str()) {
+                            let update = this.delete_record_batched(&record.id, false)?;
+                            deltas.push((batch.collection.clone(), epoch, update));
+                            tombstoned += 1;
+                        }
+                    }
+                }
+                let mut imported = 0u64;
+                for record in batch.records {
+                    let update = this.upsert_record_batched(record, false)?;
+                    deltas.push((batch.collection.clone(), epoch, update));
+                    imported += 1;
+                }
+                // One CRDT snapshot per collection per batch (audit XD-04): saving
+                // the whole document after EVERY record made a bulk import O(N^2)
+                // in encoded bytes. The transaction still commits all or nothing.
+                if let Some(doc) = this.docs.get(&batch.collection) {
+                    Self::save_crdt_state_to_db(&this.conn, &batch.collection, doc)?;
+                }
+                summary.imported += imported;
+                summary.tombstoned += tombstoned;
+                summary.collections.push(CollectionImportResult {
+                    collection: batch.collection,
+                    replaced: batch.replace,
+                    imported,
+                    tombstoned,
+                    epoch,
+                });
+            }
+            Ok((summary, deltas))
+        })
+    }
+
+    // ── Reconciliation helpers (audit XD-02) ──────────────────────────────────
+
+    /// (collection, epoch, state vector) for every local collection: what a
+    /// join/repair pass sends so peers can return exactly what we lack.
+    pub fn reconcile_plan(&mut self) -> DbResult<Vec<(String, u64, Vec<u8>)>> {
+        let mut plan = Vec::new();
+        for collection in self.get_collections()? {
+            let epoch = self.get_epoch(&collection)?;
+            let sv = self.get_state_vector(&collection)?;
+            plan.push((collection, epoch, sv));
+        }
+        Ok(plan)
+    }
+
+    /// Collections a peer announced that this node has never stored.
+    pub fn unknown_collections(&self, announced: &[String]) -> DbResult<Vec<String>> {
+        let known: HashMap<String, ()> = self
+            .get_collections()?
+            .into_iter()
+            .map(|c| (c, ()))
+            .collect();
+        Ok(announced
+            .iter()
+            .filter(|c| !known.contains_key(*c))
+            .cloned()
+            .collect())
+    }
+
+    /// Total rows changed on this connection since it was opened (SQLite's
+    /// own counter). Benchmarks use it to measure write amplification.
+    pub fn total_changes(&self) -> u64 {
+        // SAFETY: the handle belongs to this live connection and is only read.
+        unsafe { rusqlite::ffi::sqlite3_total_changes(self.conn.handle()) as u64 }
+    }
+
     /// Apply a remote CRDT update
     pub fn apply_remote_update(
         &mut self,
@@ -538,18 +825,37 @@ impl XdbDatabase {
         // Parse the update first
         let update = Update::decode_v1(update_bytes).map_err(|e| DbError::Crdt(e.to_string()))?;
 
-        // Apply update and extract records in one scope
+        // Apply the update and extract ONLY the records it changed (audit
+        // XD-04): a map observer collects the touched keys while the
+        // transaction commits, so a one-record delta writes one row instead
+        // of re-upserting the whole collection. A duplicate delivery changes
+        // no key and therefore writes nothing.
         let updated_records: Vec<Record> = {
             let doc = self.get_or_create_doc(collection)?;
+            let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            let map = doc.get_or_insert_map("records");
+            let sink = changed.clone();
+            let subscription = map.observe(move |txn, event| {
+                if let Ok(mut keys) = sink.lock() {
+                    for key in event.keys(txn).keys() {
+                        keys.insert(key.to_string());
+                    }
+                }
+            });
 
-            // Apply the update
+            // Apply the update (observers fire when the transaction commits)
             {
                 let mut txn = doc.transact_mut();
                 txn.apply_update(update)
                     .map_err(|e| DbError::Crdt(e.to_string()))?;
             }
+            drop(subscription);
 
-            Self::records_from_doc(collection, doc)?
+            let keys = changed
+                .lock()
+                .map(|k| k.clone())
+                .unwrap_or_default();
+            Self::records_from_doc_keys(collection, doc, &keys)?
         };
 
         // Now update SQLite with the extracted records
@@ -575,6 +881,46 @@ impl XdbDatabase {
         Self::save_crdt_state_to_db(&self.conn, collection, doc)?;
 
         Ok(updated_records)
+    }
+
+    /// Validated records for the given map keys only (keys no longer present
+    /// are skipped: records are never removed from the map, only tombstoned).
+    fn records_from_doc_keys(
+        collection: &str,
+        doc: &Doc,
+        keys: &HashSet<String>,
+    ) -> DbResult<Vec<Record>> {
+        let txn = doc.transact();
+        let mut records = Vec::with_capacity(keys.len());
+        if let Some(map) = txn.get_map("records") {
+            for key in keys {
+                let Some(value) = map.get(&txn, key.as_str()) else {
+                    continue;
+                };
+                let yrs::Out::Any(yrs::Any::String(json_str)) = value else {
+                    return Err(DbError::Crdt(
+                        "Invalid record payload type in CRDT map".to_string(),
+                    ));
+                };
+                let record = serde_json::from_str::<Record>(json_str.as_ref()).map_err(|e| {
+                    DbError::Crdt(format!("Invalid record JSON in CRDT map: {}", e))
+                })?;
+                if record.collection != collection {
+                    return Err(DbError::Crdt(format!(
+                        "CRDT record collection mismatch: expected '{}', got '{}'",
+                        collection, record.collection
+                    )));
+                }
+                if &record.id != key {
+                    return Err(DbError::Crdt(format!(
+                        "CRDT record id mismatch: key '{}' vs record.id '{}'",
+                        key, record.id
+                    )));
+                }
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     fn records_from_doc(collection: &str, doc: &Doc) -> DbResult<Vec<Record>> {
@@ -641,7 +987,11 @@ impl XdbDatabase {
         Ok(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
     }
 
-    /// Clear all records in a collection (hard delete from SQLite and reset CRDT state)
+    /// LOCAL cache reset: hard-delete the collection's records and CRDT state on
+    /// THIS node only. Nothing is replicated — peers keep their copy and will
+    /// repopulate this node on the next reconciliation. For a replicated
+    /// deletion use `delete_record` (a tombstone); for an authoritative reset
+    /// of a shared collection use `reset_collection` (an epoch), audit XD-03.
     pub fn clear_collection(&mut self, collection: &str) -> DbResult<()> {
         self.with_transaction(|this| this.clear_collection_inner(collection))
     }
@@ -715,3 +1065,7 @@ pub fn create_shared_db(path: PathBuf) -> DbResult<SharedDb> {
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bench_tests.rs"]
+mod bench_tests;

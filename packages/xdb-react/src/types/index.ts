@@ -36,7 +36,27 @@ export interface DbStats {
 }
 
 /**
- * Network status information
+ * What the network node actually did (cumulative for its lifetime). There is
+ * deliberately no single "synced" flag: a publish that reached the mesh is not
+ * a peer acknowledgement, and a peer applying an update is not peer persistence.
+ */
+export interface SyncStats {
+  publishes_sent: number;
+  publishes_without_peers: number;
+  publish_failures: number;
+  updates_applied: number;
+  updates_rejected_stale: number;
+  updates_skipped_paused: number;
+  resets_applied: number;
+  sync_requests_sent: number;
+  sync_responses_applied: number;
+  last_announce_at: string | null;
+  last_repair_at: string | null;
+  last_update_applied_at: string | null;
+}
+
+/**
+ * Network status information (honest: enabled vs running vs paused)
  */
 export interface NetworkStatus {
   /** This node's peer ID */
@@ -45,6 +65,51 @@ export interface NetworkStatus {
   connected_peers: string[];
   /** Whether the network is running */
   is_running: boolean;
+  /** "local-only" (default) or "trusted-lan" (explicit opt-in) */
+  mode: "local-only" | "trusted-lan";
+  /** The persisted opt-in */
+  enabled: boolean;
+  discovery: boolean;
+  listening: boolean;
+  /** Held after a local-scope restore until resume_sync */
+  sync_paused: boolean;
+  stats: SyncStats;
+}
+
+/**
+ * Persisted networking choice. Defaults to local-only.
+ */
+export interface NetworkSettings {
+  enabled: boolean;
+  discovery: boolean;
+  listen: boolean;
+}
+
+/** What a database import means for synchronized data. */
+export type ImportScope = "local" | "fork" | "replace";
+
+/** Result of import_database */
+export interface ImportOutcome {
+  app_id: string;
+  scope: ImportScope;
+  /** True when synchronization is held until resume_sync */
+  sync_paused: boolean;
+  reset_collections: string[];
+}
+
+/** One collection's batch for import_records */
+export interface CollectionImport<T = unknown> {
+  collection: string;
+  /** Tombstone records absent from `records` (a replicated deletion) before upserting */
+  replace?: boolean;
+  records: Record<T>[];
+}
+
+/** Result of import_records; returned only after the transaction committed. */
+export interface ImportSummary {
+  collections: Array<{ collection: string; replaced: boolean; imported: number; tombstoned: number; epoch: number }>;
+  imported: number;
+  tombstoned: number;
 }
 
 /**
@@ -71,10 +136,12 @@ export interface UpdateRecordPayload<T = unknown> {
  * Sync event payload emitted when data is synced
  */
 export interface SyncEvent {
-  /** Type of sync event */
-  type: "sync_update" | "sync_response";
+  /** Type of sync event; "reset" is an adopted administrative reset */
+  type: "sync_update" | "sync_response" | "reset";
   /** Collection that was synced */
   collection: string;
+  /** Reset epoch (reset events only) */
+  epoch?: number;
   /** App scope, when provided; legacy events belong to the default database. */
   app_id?: string;
 }

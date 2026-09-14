@@ -6,7 +6,7 @@
 //! ## Features
 //!
 //! - **Local-First**: All data stored locally in SQLite
-//! - **P2P Sync**: Automatic discovery and sync via mDNS and GossipSub
+//! - **P2P Sync** (explicit opt-in): mDNS discovery and GossipSub on a trusted LAN; local-only by default
 //! - **CRDT Conflict Resolution**: Concurrent edits automatically merged using Yrs
 //! - **Tauri Integration**: Optional Tauri command handlers (enabled by default)
 //!
@@ -67,14 +67,21 @@ mod network;
 pub mod tauri;
 
 // Re-export main types
-pub use db::{create_shared_db, DbError, DbResult, DbStats, Record, SharedDb, XdbDatabase};
+pub use db::{
+    create_shared_db, CollectionImport, CollectionImportResult, CommittedDeltas, DbError,
+    DbResult, DbStats, ImportSummary, Record, RemoteApplyOutcome, SharedDb, XdbDatabase,
+};
 
 #[cfg(feature = "tauri-commands")]
-pub use tauri::{DbManager, SharedDbManager};
+pub use tauri::{
+    DbManager, ImportOutcome, NetworkControl, NetworkSettings, NetworkStatus, SharedDbManager,
+    SharedNetworkControl,
+};
 
 pub use network::{
-    create_shared_network, NetworkCommand, NetworkEvent, NetworkMessage, NetworkNode, PeerInfo,
-    SharedNetwork,
+    create_shared_network, NetworkCommand, NetworkEvent, NetworkMessage, NetworkNode,
+    NetworkOptions, PeerInfo, PublishOutcome, SharedNetwork, SyncGate, SyncStats,
+    MAX_COLLECTIONS_PER_PASS, REPAIR_BATCH, REPAIR_INTERVAL,
 };
 
 /// Library version

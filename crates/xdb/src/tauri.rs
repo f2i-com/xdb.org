@@ -31,9 +31,12 @@
 //!     .expect("error running app");
 //! ```
 
-use crate::db::{create_shared_db, DbStats, Record, SharedDb};
+use crate::db::{
+    create_shared_db, CollectionImport, DbStats, ImportSummary, Record, SharedDb,
+};
 use crate::network::{
-    create_shared_network, NetworkEvent, NetworkMessage, NetworkNode, SharedNetwork,
+    create_shared_network, NetworkEvent, NetworkMessage, NetworkNode, NetworkOptions,
+    SharedNetwork, SyncGate, SyncStats,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,7 +44,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRecordPayload {
@@ -55,11 +58,131 @@ pub struct UpdateRecordPayload {
     pub data: serde_json::Value,
 }
 
+/// Honest network status (audit XD-01/XD-02): what is ENABLED, what is
+/// RUNNING, whether synchronization is paused, and counters of what the node
+/// actually did. There is deliberately no single "synced" flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub peer_id: String,
     pub connected_peers: Vec<String>,
     pub is_running: bool,
+    /// "local-only" (default) or "trusted-lan" (explicit opt-in).
+    pub mode: String,
+    pub enabled: bool,
+    pub discovery: bool,
+    pub listening: bool,
+    /// Held after a local-scope restore until `resume_sync` (audit XD-03).
+    pub sync_paused: bool,
+    pub stats: SyncStats,
+}
+
+/// Persisted networking choice (audit XD-01). Defaults to LOCAL ONLY: opening
+/// a database never starts discovery or listening; the user/admin opts in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub discovery: bool,
+    #[serde(default = "default_true")]
+    pub listen: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discovery: true,
+            listen: true,
+        }
+    }
+}
+
+impl NetworkSettings {
+    pub const FILE_NAME: &'static str = "network-settings.json";
+
+    pub fn path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join(Self::FILE_NAME)
+    }
+
+    /// Missing or unreadable settings mean local-only, never "enabled".
+    pub fn load(base_dir: &std::path::Path) -> Self {
+        match std::fs::read(Self::path(base_dir)) {
+            Ok(bytes) => match serde_json::from_slice::<NetworkSettings>(&bytes) {
+                Ok(settings) => settings,
+                Err(e) => {
+                    warn!("Ignoring unreadable network settings (local-only): {}", e);
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self, base_dir: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(base_dir).map_err(|e| e.to_string())?;
+        let path = Self::path(base_dir);
+        let pending = path.with_extension("json.pending");
+        std::fs::write(
+            &pending,
+            serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::rename(&pending, &path).map_err(|e| e.to_string())
+    }
+
+    pub fn options(&self) -> NetworkOptions {
+        NetworkOptions {
+            discovery: self.discovery,
+            listen: self.listen,
+        }
+    }
+}
+
+/// Host-side control of networking: the persisted choice, the pause gate and
+/// the default database the legacy protocol serves.
+pub struct NetworkControl {
+    base_dir: PathBuf,
+    settings: StdMutex<NetworkSettings>,
+    gate: Arc<SyncGate>,
+    default_db: SharedDb,
+}
+
+impl NetworkControl {
+    pub fn new(base_dir: PathBuf, settings: NetworkSettings, default_db: SharedDb) -> Self {
+        Self {
+            base_dir,
+            settings: StdMutex::new(settings),
+            gate: SyncGate::new(),
+            default_db,
+        }
+    }
+
+    pub fn settings(&self) -> NetworkSettings {
+        self.settings.lock().map(|s| *s).unwrap_or_default()
+    }
+
+    pub fn gate(&self) -> Arc<SyncGate> {
+        self.gate.clone()
+    }
+}
+
+pub type SharedNetworkControl = Arc<NetworkControl>;
+
+/// What a database import did, including the identity it landed in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportOutcome {
+    pub app_id: String,
+    /// "local" | "fork" | "replace" (audit XD-03).
+    pub scope: String,
+    /// True when synchronization is now held until `resume_sync`.
+    pub sync_paused: bool,
+    /// Collections whose epoch was advanced (replace scope only).
+    pub reset_collections: Vec<String>,
 }
 
 // ============================================================================
@@ -180,6 +303,7 @@ async fn broadcast_scoped_update(
     network: &SharedNetwork,
     app_id: &str,
     collection: &str,
+    epoch: u64,
     update: Vec<u8>,
 ) {
     // The v1 wire format has no app identity. Sending named-app data through
@@ -189,11 +313,17 @@ async fn broadcast_scoped_update(
     }
     let net = { network.lock().await.clone() };
     if let Some(net) = net {
-        if let Err(e) = net.broadcast_update(collection, update).await {
+        if net.gate().is_paused() {
+            // Local commit succeeded; publication is held until the operator
+            // resolves the pending restore (audit XD-03).
+            return;
+        }
+        if let Err(e) = net.broadcast_update(collection, epoch, update).await {
             error!("Failed to broadcast update: {}", e);
         }
     }
 }
+
 
 fn backup_database_for_import(
     db: &crate::db::XdbDatabase,
@@ -210,10 +340,12 @@ fn backup_database_for_import(
     Ok(backup_path)
 }
 
-/// Setup XDB in a Tauri application
+/// Setup XDB in a Tauri application: LOCAL databases only (audit XD-01).
 ///
-/// This function initializes the database and network, and stores the state
-/// in the Tauri app. Call this in your `setup` hook.
+/// Opening a database never starts peer discovery or listening. Networking
+/// starts only when the persisted `NetworkSettings` say `enabled: true`
+/// (written by `set_network_enabled` after an explicit user/admin choice).
+/// Call this in your `setup` hook.
 ///
 /// ## Example
 ///
@@ -247,22 +379,38 @@ pub fn setup_xdb(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         app_data_dir.join("apps")
     );
 
-    // Create shared network state
+    finish_setup(app, app_data_dir, db, db_manager)
+}
+
+/// Shared tail of both setup paths: manage state and start networking ONLY
+/// when the persisted settings opt in.
+fn finish_setup(
+    app: &tauri::App,
+    base_dir: PathBuf,
+    db: SharedDb,
+    db_manager: Arc<DbManager>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = NetworkSettings::load(&base_dir);
+    let control = Arc::new(NetworkControl::new(base_dir, settings, db.clone()));
     let network = create_shared_network();
 
-    // Store state in app
     app.manage(db.clone());
     app.manage(db_manager);
     app.manage(network.clone());
+    app.manage(control.clone());
 
-    // Initialize network in background
-    let app_handle = app.handle().clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = init_network(app_handle, db, network).await {
-            error!("Failed to initialize XDB network: {}", e);
-        }
-    });
-
+    if settings.enabled {
+        info!("XDB peer networking enabled by persisted opt-in (trusted LAN)");
+        let app_handle = app.handle().clone();
+        let gate = control.gate();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = init_network(app_handle, db, network, settings.options(), gate).await {
+                error!("Failed to initialize XDB network: {}", e);
+            }
+        });
+    } else {
+        info!("XDB running local-only; peer networking is off until explicitly enabled");
+    }
     Ok(())
 }
 
@@ -286,40 +434,26 @@ pub fn setup_xdb_with_path(
 
     // Create per-app database manager
     let db_manager = Arc::new(
-        DbManager::with_default_database(base_dir, db.clone())?
+        DbManager::with_default_database(base_dir.clone(), db.clone())?
             .with_app_handle(app.handle().clone()),
     );
 
-    // Create shared network state
-    let network = create_shared_network();
-
-    // Store state in app
-    app.manage(db.clone());
-    app.manage(db_manager);
-    app.manage(network.clone());
-
-    // Initialize network in background
-    let app_handle = app.handle().clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = init_network(app_handle, db, network).await {
-            error!("Failed to initialize XDB network: {}", e);
-        }
-    });
-
-    Ok(())
+    finish_setup(app, base_dir, db, db_manager)
 }
 
-/// Initialize the P2P network
+/// Start the P2P network (only ever called after an explicit opt-in).
 async fn init_network(
     app_handle: AppHandle,
     db: SharedDb,
     network: SharedNetwork,
+    options: NetworkOptions,
+    gate: Arc<SyncGate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create broadcast channel for network events
     let (event_tx, event_rx) = broadcast::channel::<NetworkEvent>(100);
 
     // Start the P2P network node
-    let node = NetworkNode::new(db.clone(), event_tx).await?;
+    let node = NetworkNode::new(db.clone(), event_tx, options, gate).await?;
     info!("XDB Network started with peer ID: {}", node.local_peer_id());
 
     // Store the network node
@@ -359,15 +493,17 @@ pub async fn create_record(
 ) -> Result<Record, String> {
     let app_id = app_id.unwrap_or_default();
     let db = db_manager.get_db(&app_id)?;
-    let (record, update) = {
+    let (record, update, epoch) = {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
-        db_lock
+        let (record, update) = db_lock
             .create_record(&payload.collection, payload.data)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let epoch = db_lock.get_epoch(&payload.collection).unwrap_or(0);
+        (record, update, epoch)
     };
 
     db_manager.emit_change(&app_id, "create", Some(&payload.collection));
-    broadcast_scoped_update(&network, &app_id, &payload.collection, update).await;
+    broadcast_scoped_update(&network, &app_id, &payload.collection, epoch, update).await;
 
     info!(
         "Created record {} in collection {}",
@@ -386,15 +522,17 @@ pub async fn update_record(
 ) -> Result<Record, String> {
     let app_id = app_id.unwrap_or_default();
     let db = db_manager.get_db(&app_id)?;
-    let (record, update) = {
+    let (record, update, epoch) = {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
-        db_lock
+        let (record, update) = db_lock
             .update_record(&payload.id, payload.data)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let epoch = db_lock.get_epoch(&record.collection).unwrap_or(0);
+        (record, update, epoch)
     };
 
     db_manager.emit_change(&app_id, "update", Some(&record.collection));
-    broadcast_scoped_update(&network, &app_id, &record.collection, update).await;
+    broadcast_scoped_update(&network, &app_id, &record.collection, epoch, update).await;
 
     info!("Updated record {}", record.id);
     Ok(record)
@@ -410,15 +548,16 @@ pub async fn delete_record(
 ) -> Result<bool, String> {
     let app_id = app_id.unwrap_or_default();
     let db = db_manager.get_db(&app_id)?;
-    let (collection, update) = {
+    let (collection, update, epoch) = {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
         let record = db_lock.get_record(&id).map_err(|e| e.to_string())?;
         let update = db_lock.delete_record(&id).map_err(|e| e.to_string())?;
-        (record.collection, update)
+        let epoch = db_lock.get_epoch(&record.collection).unwrap_or(0);
+        (record.collection, update, epoch)
     };
 
     db_manager.emit_change(&app_id, "delete", Some(&collection));
-    broadcast_scoped_update(&network, &app_id, &collection, update).await;
+    broadcast_scoped_update(&network, &app_id, &collection, epoch, update).await;
 
     info!("Deleted record {}", id);
     Ok(true)
@@ -434,17 +573,92 @@ pub async fn upsert_record(
 ) -> Result<Record, String> {
     let app_id = app_id.unwrap_or_default();
     let db = db_manager.get_db(&app_id)?;
-    let update = {
+    let (update, epoch) = {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
-        db_lock
+        let update = db_lock
             .upsert_record(record.clone())
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let epoch = db_lock.get_epoch(&record.collection).unwrap_or(0);
+        (update, epoch)
     };
 
     db_manager.emit_change(&app_id, "upsert", Some(&record.collection));
-    broadcast_scoped_update(&network, &app_id, &record.collection, update).await;
+    broadcast_scoped_update(&network, &app_id, &record.collection, epoch, update).await;
 
     Ok(record)
+}
+
+/// Bulk import in ONE transaction (audit SN-01): validates the whole batch,
+/// applies replace/merge per collection, and returns the summary only after
+/// the commit. Deltas are published after the commit, never before.
+#[tauri::command]
+pub async fn import_records(
+    db_manager: State<'_, SharedDbManager>,
+    network: State<'_, SharedNetwork>,
+    app_id: Option<String>,
+    batches: Vec<CollectionImport>,
+) -> Result<ImportSummary, String> {
+    let app_id = app_id.unwrap_or_default();
+    let db = db_manager.get_db(&app_id)?;
+    let (summary, deltas) = {
+        let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+        db_lock.import_records(batches).map_err(|e| e.to_string())?
+    };
+    for result in &summary.collections {
+        db_manager.emit_change(&app_id, "import", Some(&result.collection));
+    }
+    for (collection, epoch, update) in deltas {
+        broadcast_scoped_update(&network, &app_id, &collection, epoch, update).await;
+    }
+    info!(
+        "Imported {} records ({} tombstoned) across {} collections",
+        summary.imported,
+        summary.tombstoned,
+        summary.collections.len()
+    );
+    Ok(summary)
+}
+
+/// Reset a collection (audit XD-03). `scope`:
+/// - "local" (default): this node's cache only; peers keep their copy and will
+///   repopulate this node on the next reconciliation.
+/// - "replicated": an administrative reset of the SHARED dataset — the epoch
+///   advances and peers adopt it; stale peers cannot reintroduce old records.
+#[tauri::command]
+pub async fn reset_collection(
+    db_manager: State<'_, SharedDbManager>,
+    network: State<'_, SharedNetwork>,
+    app_id: Option<String>,
+    collection: String,
+    scope: Option<String>,
+) -> Result<u64, String> {
+    let app_id = app_id.unwrap_or_default();
+    let scope = scope.unwrap_or_else(|| "local".to_string());
+    let db = db_manager.get_db(&app_id)?;
+    let epoch = {
+        let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+        match scope.as_str() {
+            "local" => {
+                db_lock
+                    .clear_collection(&collection)
+                    .map_err(|e| e.to_string())?;
+                db_lock.get_epoch(&collection).unwrap_or(0)
+            }
+            "replicated" => db_lock
+                .reset_collection(&collection, "local-admin")
+                .map_err(|e| e.to_string())?,
+            other => return Err(format!("Unknown reset scope '{other}' (local | replicated)")),
+        }
+    };
+    db_manager.emit_change(&app_id, "clear", Some(&collection));
+    if scope == "replicated" && supports_legacy_sync(&app_id) {
+        let net = { network.lock().await.clone() };
+        if let Some(net) = net {
+            net.broadcast_reset(&collection, epoch).await?;
+        }
+    }
+    info!("Reset collection {} (scope {}, epoch {})", collection, scope, epoch);
+    Ok(epoch)
 }
 
 /// Get a single record by ID
@@ -484,7 +698,8 @@ pub fn get_collections(
     db_lock.get_collections().map_err(|e| e.to_string())
 }
 
-/// Clear all records in a collection
+/// LOCAL cache reset of a collection: nothing is replicated (audit XD-03).
+/// Use `reset_collection` with scope "replicated" for a shared reset.
 #[tauri::command]
 pub fn clear_collection(
     db_manager: State<'_, SharedDbManager>,
@@ -514,24 +729,117 @@ pub fn get_db_stats(
     db_lock.get_stats().map_err(|e| e.to_string())
 }
 
-/// Get network status
+/// Get network status (honest: enabled vs running vs paused, plus counters).
 #[tauri::command]
 pub async fn get_network_status(
     network: State<'_, SharedNetwork>,
+    control: State<'_, SharedNetworkControl>,
 ) -> Result<NetworkStatus, String> {
+    let settings = control.settings();
     let net = { network.lock().await.clone() };
     if let Some(net) = net.filter(NetworkNode::is_running) {
+        let options = net.options();
         Ok(NetworkStatus {
             peer_id: net.local_peer_id(),
             connected_peers: net.get_connected_peers().await,
             is_running: true,
+            mode: "trusted-lan".to_string(),
+            enabled: settings.enabled,
+            discovery: options.discovery,
+            listening: options.listen,
+            sync_paused: net.gate().is_paused(),
+            stats: net.stats(),
         })
     } else {
         Ok(NetworkStatus {
             peer_id: String::new(),
             connected_peers: vec![],
             is_running: false,
+            mode: "local-only".to_string(),
+            enabled: settings.enabled,
+            discovery: false,
+            listening: false,
+            sync_paused: control.gate().is_paused(),
+            stats: SyncStats::default(),
         })
+    }
+}
+
+/// The persisted networking choice.
+#[tauri::command]
+pub fn get_network_settings(control: State<'_, SharedNetworkControl>) -> Result<NetworkSettings, String> {
+    Ok(control.settings())
+}
+
+/// Explicitly enable or disable peer networking (audit XD-01). The choice is
+/// persisted; enabling starts discovery/listening now, disabling stops the
+/// node and its listeners without touching local persistence.
+#[tauri::command]
+pub async fn set_network_enabled(
+    app: AppHandle,
+    network: State<'_, SharedNetwork>,
+    control: State<'_, SharedNetworkControl>,
+    enabled: bool,
+    discovery: Option<bool>,
+    listen: Option<bool>,
+) -> Result<NetworkSettings, String> {
+    let mut settings = control.settings();
+    settings.enabled = enabled;
+    if let Some(d) = discovery {
+        settings.discovery = d;
+    }
+    if let Some(l) = listen {
+        settings.listen = l;
+    }
+    settings.save(&control.base_dir)?;
+    if let Ok(mut guard) = control.settings.lock() {
+        *guard = settings;
+    }
+
+    // Stop whatever is running; restart only when enabled.
+    shutdown_xdb(&network).await;
+    if enabled {
+        init_network(
+            app,
+            control.default_db.clone(),
+            network.inner().clone(),
+            settings.options(),
+            control.gate(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        info!("XDB peer networking enabled (trusted LAN)");
+    } else {
+        info!("XDB peer networking disabled; local persistence continues");
+    }
+    Ok(settings)
+}
+
+/// Lift the pause set by a local-scope restore (audit XD-03) and reconcile.
+#[tauri::command]
+pub async fn resume_sync(
+    network: State<'_, SharedNetwork>,
+    control: State<'_, SharedNetworkControl>,
+) -> Result<bool, String> {
+    control.gate().resume();
+    let net = { network.lock().await.clone() };
+    if let Some(net) = net {
+        net.reconcile().await?;
+    }
+    Ok(true)
+}
+
+/// Announce local collections and request reconciliation for all of them now
+/// (audit XD-02): what a join or repair pass does, on demand.
+#[tauri::command]
+pub async fn reconcile_network(network: State<'_, SharedNetwork>) -> Result<bool, String> {
+    let net = { network.lock().await.clone() };
+    match net {
+        Some(net) => {
+            net.reconcile().await?;
+            Ok(true)
+        }
+        None => Err("Peer networking is disabled (local-only). Enable it explicitly to synchronize.".to_string()),
     }
 }
 
@@ -548,22 +856,27 @@ pub async fn request_sync(
         return Err("Native P2P sync is only available for the default database; named apps require an app-scoped sync backend".to_string());
     }
     let db = db_manager.get_db(&app_id)?;
-    let state_vector = {
+    let (state_vector, epoch) = {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
-        db_lock
+        let sv = db_lock
             .get_state_vector(&collection)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let epoch = db_lock.get_epoch(&collection).map_err(|e| e.to_string())?;
+        (sv, epoch)
     };
 
     let net = { network.lock().await.clone() };
     if let Some(net) = net {
-        net.request_sync(&collection, state_vector)
+        if net.gate().is_paused() {
+            return Err("Synchronization is paused after a local restore; resolve it with resume_sync first".to_string());
+        }
+        net.request_sync(&collection, epoch, state_vector)
             .await
             .map_err(|e| e.to_string())?;
         info!("Requested sync for collection: {}", collection);
         Ok(true)
     } else {
-        Err("Network not initialized".to_string())
+        Err("Peer networking is disabled (local-only). Enable it explicitly to synchronize.".to_string())
     }
 }
 
@@ -620,15 +933,38 @@ pub fn get_db_base_dir(db_manager: State<'_, SharedDbManager>) -> Result<String,
         .to_string())
 }
 
-/// Import/restore database from a file
+/// Import/restore a database file (audit XD-03). `scope` decides what the
+/// restore MEANS for synchronized data:
+/// - "local" (default): replace this node's data. On the synchronized default
+///   database, synchronization is PAUSED until `resume_sync`, because a later
+///   sync would otherwise silently merge peer state back over the restore.
+/// - "fork": restore into a NEW isolated app namespace; nothing shared changes.
+/// - "replace": replace this node's data AND make it authoritative for peers:
+///   every collection's epoch advances and peers adopt the reset.
 #[tauri::command]
 pub async fn import_database(
     app: AppHandle,
     db_manager: State<'_, SharedDbManager>,
+    network: State<'_, SharedNetwork>,
+    control: State<'_, SharedNetworkControl>,
     app_id: Option<String>,
     source_path: String,
-) -> Result<bool, String> {
-    let app_id = app_id.unwrap_or_default();
+    scope: Option<String>,
+) -> Result<ImportOutcome, String> {
+    let requested_app = app_id.unwrap_or_default();
+    let scope = scope.unwrap_or_else(|| "local".to_string());
+    if !matches!(scope.as_str(), "local" | "fork" | "replace") {
+        return Err(format!("Unknown import scope '{scope}' (local | fork | replace)"));
+    }
+    let app_id = if scope == "fork" {
+        format!(
+            "{}-fork-{}",
+            sanitize_app_id(&requested_app),
+            chrono::Utc::now().format("%Y%m%d%H%M%S")
+        )
+    } else {
+        requested_app.clone()
+    };
     let db = db_manager.get_db(&app_id)?;
     let source = PathBuf::from(&source_path);
     if !source.exists() {
@@ -652,31 +988,71 @@ pub async fn import_database(
     }
     drop(source_conn);
 
-    // Serialize import under the DB mutex to prevent concurrent writes.
-    let mut db_lock = db.lock().map_err(|e| e.to_string())?;
-    // Create backup of current database
-    let backup_path = backup_database_for_import(&db_lock, &source)?;
-    info!(
-        "Saved pre-import database backup: {}",
-        backup_path.display()
-    );
+    // Serialize import under the DB mutex to prevent concurrent writes. The
+    // guard lives only inside this block: it must never be held across an
+    // await (the network calls below), so the command future stays Send.
+    let reset_collections: Vec<(String, u64)> = {
+        let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+        // Create backup of current database
+        let backup_path = backup_database_for_import(&db_lock, &source)?;
+        info!(
+            "Saved pre-import database backup: {}",
+            backup_path.display()
+        );
 
-    // Replace the database file and reload in-memory state atomically under lock.
-    db_lock
-        .replace_from_file(&source)
-        .map_err(|e| format!("Failed to replace database after import: {}", e))?;
+        // Replace the database file and reload in-memory state atomically under lock.
+        db_lock
+            .replace_from_file(&source)
+            .map_err(|e| format!("Failed to replace database after import: {}", e))?;
 
-    drop(db_lock);
+        let mut reset_collections = Vec::new();
+        if scope == "replace" {
+            // The restored contents are now authoritative for every peer.
+            for collection in db_lock.get_collections().map_err(|e| e.to_string())? {
+                let epoch = db_lock
+                    .bump_epoch(&collection, "local-restore")
+                    .map_err(|e| e.to_string())?;
+                reset_collections.push((collection, epoch));
+            }
+        }
+        reset_collections
+    };
     db_manager.emit_change(&app_id, "import", None);
-    info!("Imported database from: {}", source_path);
+    info!("Imported database from: {} (scope {})", source_path, scope);
+
+    let mut sync_paused = false;
+    if supports_legacy_sync(&app_id) {
+        let net = { network.lock().await.clone() };
+        match scope.as_str() {
+            "local" if net.as_ref().is_some_and(NetworkNode::is_running) => {
+                control.gate().pause();
+                sync_paused = true;
+                warn!("Synchronization paused after a local restore; call resume_sync once the operator has chosen local/fork/replace");
+            }
+            "replace" => {
+                if let Some(net) = net {
+                    for (collection, epoch) in &reset_collections {
+                        net.broadcast_reset(collection, *epoch).await?;
+                    }
+                    net.reconcile().await?;
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Emit event to notify frontend to reload
     let _ = app.emit(
         "db-imported",
-        serde_json::json!({ "app_id": sanitize_app_id(&app_id) }),
+        serde_json::json!({ "app_id": sanitize_app_id(&app_id), "scope": scope, "sync_paused": sync_paused }),
     );
 
-    Ok(true)
+    Ok(ImportOutcome {
+        app_id: sanitize_app_id(&app_id),
+        scope,
+        sync_paused,
+        reset_collections: reset_collections.into_iter().map(|(c, _)| c).collect(),
+    })
 }
 
 /// Setup network event listener that emits to frontend
@@ -701,6 +1077,16 @@ fn setup_network_events(app: AppHandle, mut event_rx: broadcast::Receiver<Networ
                                 serde_json::json!({
                                     "type": "sync_response",
                                     "collection": collection
+                                }),
+                            );
+                        }
+                        NetworkMessage::CollectionReset { collection, epoch, .. } => {
+                            let _ = app.emit(
+                                "xdb-sync-event",
+                                serde_json::json!({
+                                    "type": "reset",
+                                    "collection": collection,
+                                    "epoch": epoch
                                 }),
                             );
                         }
@@ -771,8 +1157,14 @@ macro_rules! xdb_commands {
             $crate::tauri::get_collection,
             $crate::tauri::get_collections,
             $crate::tauri::clear_collection,
+            $crate::tauri::reset_collection,
+            $crate::tauri::import_records,
             $crate::tauri::get_db_stats,
             $crate::tauri::get_network_status,
+            $crate::tauri::get_network_settings,
+            $crate::tauri::set_network_enabled,
+            $crate::tauri::resume_sync,
+            $crate::tauri::reconcile_network,
             $crate::tauri::request_sync,
             $crate::tauri::export_database,
             $crate::tauri::import_database,
@@ -862,6 +1254,48 @@ mod tests {
         assert!(supports_legacy_sync("_default"));
         assert!(!supports_legacy_sync("fieldnotes"));
         assert!(!supports_legacy_sync("bundle-123"));
+    }
+
+    #[test]
+    fn network_settings_default_to_local_only_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = NetworkSettings::load(dir.path());
+        assert_eq!(loaded, NetworkSettings::default());
+        assert!(!loaded.enabled, "opening a database must never imply networking");
+
+        let chosen = NetworkSettings {
+            enabled: true,
+            discovery: true,
+            listen: false,
+        };
+        chosen.save(dir.path()).unwrap();
+        assert_eq!(NetworkSettings::load(dir.path()), chosen);
+        assert_eq!(
+            chosen.options(),
+            NetworkOptions {
+                discovery: true,
+                listen: false
+            }
+        );
+
+        // Damaged settings fail closed (local-only), never open.
+        std::fs::write(NetworkSettings::path(dir.path()), b"{not json").unwrap();
+        assert!(!NetworkSettings::load(dir.path()).enabled);
+        // Older files without the newer fields still parse; enabled stays explicit.
+        std::fs::write(NetworkSettings::path(dir.path()), br#"{"enabled":true}"#).unwrap();
+        let older = NetworkSettings::load(dir.path());
+        assert!(older.enabled && older.discovery && older.listen);
+    }
+
+    #[test]
+    fn network_control_starts_unpaused_with_the_persisted_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let control = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        assert!(!control.settings().enabled);
+        assert!(!control.gate().is_paused());
+        control.gate().pause();
+        assert!(control.gate().is_paused());
     }
 
     #[test]

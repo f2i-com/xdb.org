@@ -25,13 +25,13 @@ See the [September 2026 review](docs/audit-2026-09-12.md) for the fixes, verific
 
 ### Three synchronization paths
 
-- **Native XDB peer sync (experimental):** libp2p, mDNS discovery, GossipSub messages and Yrs documents. The current wire protocol supports the default database only.
+- **Native XDB peer sync (experimental, opt-in):** libp2p, mDNS discovery, GossipSub messages and Yrs documents. OFF by default: opening a database never starts it; a host enables it explicitly (`set_network_enabled`) and the choice is persisted. The current wire protocol supports the default database only and is a trusted-LAN development feature. See [docs/networking-and-restore-policy.md](docs/networking-and-restore-policy.md).
 - **Softn browser peer sync:** Softn's separate Yjs + WebRTC implementation, joined explicitly by app and room.
 - **Softn server sync:** Softn's WebSocket client and Rust server. FormLogic's hosted actions use a separate authenticated backend bridge.
 
 These are separate transports. Running a Softn browser app does not start this repository's libp2p network or make it a native XDB peer.
 
-Native writes remain saved locally while offline, but outgoing deltas are not queued for later delivery. After peers reconnect, explicitly request synchronization for the collections that need reconciling. Peer discovery alone does not replay the offline writes.
+Native writes remain saved locally while offline. There is no delivery queue; convergence comes from retained CRDT state plus anti-entropy: on every new peer connection the node announces its collections and requests reconciliation for each (unknown collections included), and a bounded repair pass repeats that every 30 s while peers are connected. `get_network_status` reports what actually happened (publishes that reached a peer versus none, updates applied versus rejected, last reconcile time) rather than a single "synced" flag.
 
 ## Data model
 
@@ -39,7 +39,10 @@ A record contains `id`, `collection`, `data`, `created_at`, `updated_at` and `de
 
 - `update_record` shallow-merges object fields; a non-object payload replaces `data`.
 - `delete_record` writes a tombstone. `get_collection` hides deleted records; the lower-level `get_record` can return a tombstone.
-- `clear_collection` is a local hard reset, not a replicated set of tombstones. Import also replaces local state without distributing a complete reset. Existing peers can reintroduce records on subsequent synchronization.
+- `clear_collection` is a LOCAL hard reset, not a replicated deletion: peers repopulate this node on the next reconciliation. A replicated deletion is a tombstone (`delete_record`, or `import_records` with `replace`). An authoritative reset of a shared collection is `reset_collection` with scope `replicated`: it advances the collection's reset epoch, which every sync message carries; peers adopt the reset and updates from peers still on the old epoch are rejected.
+- `import_database` takes a `scope`: `local` (this node only; synchronization pauses until `resume_sync`), `fork` (a new isolated namespace) or `replace` (this data becomes authoritative for peers through reset epochs).
+- `import_records` imports several collections in one transaction and returns its summary only after the commit.
+- Tombstones and epochs are retained indefinitely; there is no compaction that could make a rejoining peer diverge silently.
 - `with_transaction` groups SQLite and CRDT changes. Publish returned deltas only after the containing transaction succeeds.
 - Nested transactions use savepoints. A failed operation rolls back its SQLite writes and cached CRDT state, including when the caller catches an inner error.
 - Each CRDT map entry contains one serialized record. Concurrent changes to **different records** can merge; concurrent edits to the **same record** resolve to one whole record. This is not field-by-field collaborative editing.
@@ -118,7 +121,10 @@ Core methods include:
 | `with_transaction` | Run a group of operations in one transaction. |
 | `get_full_state`, `get_state_vector`, `get_updates_since`, `apply_remote_update` | Integrate a host's synchronization transport. |
 | `export_to_file`, `replace_from_file` | Export and restore SQLite storage. |
-| `clear_collection`, `get_stats` | Clear a collection or inspect database statistics. |
+| `clear_collection`, `get_stats` | Local reset of a collection or inspect database statistics. |
+| `import_records` | Import several collections in ONE transaction; summary returned after the commit (SN-01). |
+| `reset_collection`, `bump_epoch`, `get_epoch`, `apply_remote_reset`, `apply_remote_update_at_epoch` | Reset epochs for replicated resets and stale-peer rejection (XD-03). |
+| `reconcile_plan`, `unknown_collections` | Inputs for join/repair reconciliation (XD-02). |
 
 ## Use React + Tauri
 
@@ -206,10 +212,11 @@ Database commands accept optional `appId`:
 
 - CRUD: `create_record`, `update_record`, `delete_record`, `upsert_record`.
 - Reads: `get_record`, `get_collection`, `get_collections`, `get_db_stats`, `get_db_path`.
-- Maintenance: `clear_collection`, `export_database`, `import_database`.
-- Synchronization: `request_sync` (default scope only).
+- Maintenance: `clear_collection` (local), `reset_collection` (`scope`: `local` | `replicated`), `import_records`, `export_database`, `import_database` (`scope`: `local` | `fork` | `replace`).
+- Synchronization (default scope only): `request_sync`, `reconcile_network`, `resume_sync`.
+- Networking policy: `get_network_settings`, `set_network_enabled` (persisted opt-in; local-only by default).
 
-`get_network_status` reports the shared default network. `get_db_base_dir` reports the directory containing app databases. Register additional commands explicitly if your application uses more than the demo does.
+`get_network_status` reports the shared default network honestly: `mode`, `enabled`, `discovery`, `listening`, `is_running`, `sync_paused` and `stats` (see the policy document). `get_db_base_dir` reports the directory containing app databases. Register additional commands explicitly if your application uses more than the demo does.
 
 ### Events
 
@@ -229,14 +236,17 @@ Run from this repository's root:
 ```sh
 cargo test --locked -p xdb --no-default-features
 cargo test --locked -p xdb
+cargo clippy -p xdb --all-targets
 npm run typecheck -w @xdb/react
 npm test -w @xdb/react
 npm run build
+# persistence / write-amplification baseline (docs/benchmarks.md)
+cargo test -p xdb --release -- --ignored --nocapture bench_persistence
 ```
 
 Rust checks cover database behavior and, with default features enabled, Tauri integration helpers. The second command needs platform-native Tauri build dependencies. Build checks alone do not verify discovery or live synchronization between two machines.
 
-For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing, use two demo instances on a trusted local network and verify create/update/delete propagation in the default database.
+For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing, enable networking in BOTH demo instances first (it is off by default), use a trusted local network, and verify create/update/delete propagation in the default database; then disconnect one instance, edit on both sides, reconnect and confirm both converge without pressing sync.
 
 Softn native builds use this crate as a sibling path dependency. Their [dependency checkout script](https://github.com/f2i-com/softn.com/blob/main/.github/scripts/checkout-xdb.sh) pins a specific XDB revision; adopting changes in release builds requires updating that pin as well as the checkout.
 

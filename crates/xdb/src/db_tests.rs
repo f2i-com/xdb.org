@@ -310,3 +310,313 @@ fn import_rejects_damaged_records_or_sync_state_before_replacing_target() {
         );
     }
 }
+
+// ── Audit SN-01: bulk import is one transaction with a durable completion signal ──
+
+fn imported(id: &str, collection: &str, title: &str) -> Record {
+    let now = chrono::Utc::now().to_rfc3339();
+    Record {
+        id: id.to_string(),
+        collection: collection.to_string(),
+        data: json!({ "title": title }),
+        created_at: now.clone(),
+        updated_at: now,
+        deleted: false,
+    }
+}
+
+fn live_ids(db: &XdbDatabase, collection: &str) -> Vec<String> {
+    let mut ids: Vec<String> = db
+        .get_collection(collection)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn bulk_import_commits_every_batch_or_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = database(&dir, "bulk.sqlite");
+    let good = CollectionImport {
+        collection: "notes".into(),
+        replace: false,
+        records: vec![imported("n1", "notes", "one"), imported("n2", "notes", "two")],
+    };
+    let malformed = CollectionImport {
+        collection: "tasks".into(),
+        replace: false,
+        records: vec![imported("", "tasks", "no id")],
+    };
+    let mismatched = CollectionImport {
+        collection: "tasks".into(),
+        replace: false,
+        records: vec![imported("t1", "notes", "wrong collection")],
+    };
+
+    for bad in [malformed, mismatched] {
+        let result = db.import_records(vec![good.clone(), bad]);
+        assert!(matches!(result, Err(DbError::InvalidOperation(_))), "{result:?}");
+        assert!(live_ids(&db, "notes").is_empty(), "a failed batch commits nothing");
+        assert!(db.get_collections().unwrap().is_empty());
+    }
+
+    let (summary, deltas) = db.import_records(vec![good]).unwrap();
+    assert_eq!(summary.imported, 2);
+    assert_eq!(summary.tombstoned, 0);
+    assert_eq!(summary.collections.len(), 1);
+    assert_eq!(deltas.len(), 2, "one delta per written record, all after the commit");
+    assert!(deltas.iter().all(|(c, epoch, _)| c == "notes" && *epoch == 0));
+
+    // Immediately "exit" and reopen: the durable signal was truthful.
+    drop(db);
+    let reopened = database(&dir, "bulk.sqlite");
+    assert_eq!(live_ids(&reopened, "notes"), vec!["n1", "n2"]);
+}
+
+#[test]
+fn replace_import_tombstones_absent_records_so_peers_drop_them_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = database(&dir, "replace.sqlite");
+    db.import_records(vec![CollectionImport {
+        collection: "notes".into(),
+        replace: false,
+        records: vec![
+            imported("n1", "notes", "one"),
+            imported("n2", "notes", "two"),
+            imported("n3", "notes", "three"),
+        ],
+    }])
+    .unwrap();
+    let mut peer = database(&dir, "peer.sqlite");
+    peer.apply_remote_update("notes", &db.get_full_state("notes").unwrap())
+        .unwrap();
+    assert_eq!(live_ids(&peer, "notes"), vec!["n1", "n2", "n3"]);
+
+    let (summary, deltas) = db
+        .import_records(vec![CollectionImport {
+            collection: "notes".into(),
+            replace: true,
+            records: vec![imported("n2", "notes", "two v2"), imported("n4", "notes", "four")],
+        }])
+        .unwrap();
+    assert_eq!((summary.imported, summary.tombstoned), (2, 2));
+    assert_eq!(live_ids(&db, "notes"), vec!["n2", "n4"]);
+    assert!(
+        db.get_record("n1").unwrap().deleted,
+        "absent rows become tombstones, not hard deletes"
+    );
+    assert_eq!(db.get_record("n2").unwrap().data["title"], "two v2");
+
+    // The tombstones travel with the deltas: the peer converges to the replacement.
+    for (collection, _epoch, update) in &deltas {
+        peer.apply_remote_update(collection, update).unwrap();
+    }
+    assert_eq!(live_ids(&peer, "notes"), vec!["n2", "n4"]);
+
+    // A duplicate import is deterministic and cache/disk agree.
+    let (again, again_deltas) = db
+        .import_records(vec![CollectionImport {
+            collection: "notes".into(),
+            replace: true,
+            records: vec![imported("n2", "notes", "two v2"), imported("n4", "notes", "four")],
+        }])
+        .unwrap();
+    assert_eq!((again.imported, again.tombstoned), (2, 0));
+    assert_eq!(again_deltas.len(), 2);
+    assert_eq!(live_ids(&db, "notes"), vec!["n2", "n4"]);
+    for (collection, _epoch, update) in &again_deltas {
+        peer.apply_remote_update(collection, update).unwrap();
+    }
+    assert_eq!(live_ids(&peer, "notes"), vec!["n2", "n4"]);
+}
+
+// ── Audit XD-03: local reset vs replicated deletion vs administrative reset ──
+
+#[test]
+fn reset_epochs_reject_stale_peers_and_replicate_the_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = database(&dir, "a.sqlite");
+    let mut b = database(&dir, "b.sqlite");
+    let mut c = database(&dir, "c.sqlite");
+    let (_, seed) = a
+        .create_record("notes", json!({"title": "shared"}))
+        .unwrap();
+    for peer in [&mut b, &mut c] {
+        peer.apply_remote_update("notes", &seed).unwrap();
+    }
+    assert_eq!(a.get_epoch("notes").unwrap(), 0);
+
+    // clear_collection is LOCAL: the next peer update simply repopulates it.
+    b.clear_collection("notes").unwrap();
+    assert!(live_ids(&b, "notes").is_empty());
+    b.apply_remote_update("notes", &a.get_full_state("notes").unwrap())
+        .unwrap();
+    assert_eq!(live_ids(&b, "notes").len(), 1, "a local reset is not authoritative");
+
+    // A replicated (administrative) reset advances the epoch and clears A.
+    let epoch = a.reset_collection("notes", "admin").unwrap();
+    assert_eq!(epoch, 1);
+    assert!(live_ids(&a, "notes").is_empty());
+    assert_eq!(a.get_epoch("notes").unwrap(), 1);
+
+    // A stale peer (still at epoch 0) cannot reintroduce pre-reset state.
+    let (_, stale_update) = b
+        .create_record("notes", json!({"title": "from stale B"}))
+        .unwrap();
+    match a
+        .apply_remote_update_at_epoch("notes", 0, &stale_update)
+        .unwrap()
+    {
+        RemoteApplyOutcome::StaleEpoch { local, remote } => assert_eq!((local, remote), (1, 0)),
+        other => panic!("stale update was not rejected: {other:?}"),
+    }
+    assert!(live_ids(&a, "notes").is_empty());
+
+    // B adopts the reset (clearing its copy); an equal/older reset does nothing.
+    assert!(b.apply_remote_reset("notes", 1, "a").unwrap());
+    assert!(live_ids(&b, "notes").is_empty());
+    assert_eq!(b.get_epoch("notes").unwrap(), 1);
+    assert!(!b.apply_remote_reset("notes", 1, "a").unwrap());
+    assert!(!b.apply_remote_reset("notes", 0, "c").unwrap());
+    assert_eq!(b.get_epoch("notes").unwrap(), 1);
+
+    // Post-reset writes at the new epoch flow normally.
+    let (_, fresh) = b
+        .create_record("notes", json!({"title": "post-reset"}))
+        .unwrap();
+    assert!(matches!(
+        a.apply_remote_update_at_epoch("notes", 1, &fresh).unwrap(),
+        RemoteApplyOutcome::Applied(_)
+    ));
+    assert_eq!(live_ids(&a, "notes").len(), 1);
+
+    // C was offline for the whole reset. Its old update is rejected by A, and
+    // when it hears a newer-epoch update it must adopt the reset first.
+    let offline_id = live_ids(&c, "notes")[0].clone();
+    let (_, from_c) = c
+        .update_record(&offline_id, json!({"title": "edited offline"}))
+        .unwrap();
+    assert!(matches!(
+        a.apply_remote_update_at_epoch("notes", 0, &from_c).unwrap(),
+        RemoteApplyOutcome::StaleEpoch { .. }
+    ));
+    match c.apply_remote_update_at_epoch("notes", 1, &fresh).unwrap() {
+        RemoteApplyOutcome::MissingReset { local, remote } => assert_eq!((local, remote), (0, 1)),
+        other => panic!("C applied a newer-epoch update without the reset: {other:?}"),
+    }
+    assert!(c.apply_remote_reset("notes", 1, "a").unwrap());
+    assert!(matches!(
+        c.apply_remote_update_at_epoch("notes", 1, &fresh).unwrap(),
+        RemoteApplyOutcome::Applied(_)
+    ));
+    assert_eq!(live_ids(&c, "notes"), live_ids(&a, "notes"));
+
+    // bump_epoch: the CURRENT contents become authoritative (replace-scope restore).
+    let bumped = a.bump_epoch("notes", "restore").unwrap();
+    assert_eq!(bumped, 2);
+    assert_eq!(live_ids(&a, "notes").len(), 1, "bump keeps the local records");
+    assert!(b.apply_remote_reset("notes", 2, "a").unwrap());
+    assert!(live_ids(&b, "notes").is_empty());
+    b.apply_remote_update("notes", &a.get_full_state("notes").unwrap())
+        .unwrap();
+    assert_eq!(live_ids(&b, "notes"), live_ids(&a, "notes"));
+
+    // Epochs survive a restart.
+    drop(a);
+    assert_eq!(database(&dir, "a.sqlite").get_epoch("notes").unwrap(), 2);
+}
+
+// ── Audit XD-02: disconnected peers converge through state-vector reconciliation ──
+
+/// One direction of a reconciliation pass: `to` asks `from` for what it lacks.
+fn reconcile(from: &mut XdbDatabase, to: &mut XdbDatabase) {
+    // Collections `to` has never seen are requested with an empty state vector.
+    let announced = from.get_collections().unwrap();
+    for collection in to.unknown_collections(&announced).unwrap() {
+        let empty = yrs::StateVector::default().encode_v1();
+        let update = from.get_updates_since(&collection, &empty).unwrap();
+        let epoch = from.get_epoch(&collection).unwrap();
+        assert!(matches!(
+            to.apply_remote_update_at_epoch(&collection, epoch, &update)
+                .unwrap(),
+            RemoteApplyOutcome::Applied(_)
+        ));
+    }
+    for (collection, epoch, sv) in to.reconcile_plan().unwrap() {
+        if !announced.contains(&collection) {
+            continue;
+        }
+        let update = from.get_updates_since(&collection, &sv).unwrap();
+        assert!(matches!(
+            to.apply_remote_update_at_epoch(&collection, epoch, &update)
+                .unwrap(),
+            RemoteApplyOutcome::Applied(_)
+        ));
+    }
+}
+
+fn snapshot(db: &XdbDatabase) -> Vec<(String, String, bool, serde_json::Value)> {
+    let mut all = Vec::new();
+    for collection in db.get_collections().unwrap() {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT id, collection, data, created_at, updated_at, deleted FROM records WHERE collection = ?1")
+            .unwrap();
+        for record in stmt.query_map([&collection], record_from_row).unwrap() {
+            let r = record.unwrap();
+            all.push((r.collection, r.id, r.deleted, r.data));
+        }
+    }
+    all.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+    all
+}
+
+#[test]
+fn disconnected_peers_converge_after_reconnecting_without_manual_intervention() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = database(&dir, "a.sqlite");
+    let mut b = database(&dir, "b.sqlite");
+    let (shared, seed) = a
+        .create_record("notes", json!({"title": "shared"}))
+        .unwrap();
+    b.apply_remote_update("notes", &seed).unwrap();
+
+    // Partition: disjoint edits, plus a collection that exists on one side only.
+    a.create_record("notes", json!({"title": "from A"})).unwrap();
+    a.create_record("tasks", json!({"title": "only A knows tasks"}))
+        .unwrap();
+    b.create_record("notes", json!({"title": "from B"})).unwrap();
+    b.delete_record(&shared.id).unwrap();
+
+    // Restart independently before reconnecting.
+    drop(a);
+    drop(b);
+    let mut a = database(&dir, "a.sqlite");
+    let mut b = database(&dir, "b.sqlite");
+    assert_ne!(snapshot(&a), snapshot(&b));
+
+    // Reconnect: each side announces and requests; no manual step.
+    reconcile(&mut a, &mut b);
+    reconcile(&mut b, &mut a);
+    assert_eq!(snapshot(&a), snapshot(&b));
+    assert_eq!(live_ids(&a, "notes").len(), 2, "both new notes; the shared one is deleted");
+    assert!(a.get_record(&shared.id).unwrap().deleted);
+    assert_eq!(live_ids(&b, "tasks").len(), 1, "B discovered the collection it never had");
+
+    // Repeated delivery and an interrupted pass are idempotent.
+    let before = snapshot(&a);
+    reconcile(&mut b, &mut a);
+    reconcile(&mut b, &mut a);
+    assert_eq!(snapshot(&a), before);
+
+    // Convergence persists across another restart.
+    drop(a);
+    drop(b);
+    assert_eq!(
+        snapshot(&database(&dir, "a.sqlite")),
+        snapshot(&database(&dir, "b.sqlite"))
+    );
+}

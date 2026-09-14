@@ -11,6 +11,11 @@ import type {
   Record,
   DbStats,
   NetworkStatus,
+  NetworkSettings,
+  ImportScope,
+  ImportOutcome,
+  CollectionImport,
+  ImportSummary,
   SyncEvent,
   PeerEvent,
   UseCollectionOptions,
@@ -125,13 +130,13 @@ function useDatabaseTransfer(command: string, pathKey: string, appId?: string) {
     scope.active = true;
     return () => { scope.active = false; };
   }, [scope]);
-  const run = useCallback(async (path: string): Promise<boolean> => {
+  const run = useCallback(async (path: string, extra?: globalThis.Record<string, unknown>): Promise<boolean> => {
     if (!scope.active) return false;
     scope.pending += 1;
     scope.error = null;
     render(value => value + 1);
     try {
-      await invoke(command, { [pathKey]: path, appId });
+      await invoke(command, { [pathKey]: path, appId, ...(extra ?? {}) });
       return true;
     } catch (error) {
       if (scope.active) scope.error = String(error);
@@ -581,8 +586,49 @@ export function useDbExport(appId?: string) {
  * ```
  */
 export function useDbImport(appId?: string) {
-  const { run: importDb, pending: importing, error } = useDatabaseTransfer("import_database", "sourcePath", appId);
+  const { run, pending: importing, error } = useDatabaseTransfer("import_database", "sourcePath", appId);
+  /**
+   * `scope` says what the restore means for synchronized data: "local" (default;
+   * synchronization pauses until resume_sync), "fork" (a new isolated
+   * namespace) or "replace" (this data becomes authoritative for peers).
+   */
+  const importDb = useCallback((path: string, scope?: ImportScope) => run(path, scope ? { scope } : undefined), [run]);
   return { importDb, importing, error };
+}
+
+/**
+ * Bulk import in one native transaction. Resolves with the summary only after
+ * the commit; rejects when nothing was written.
+ */
+export function useImportRecords(appId?: string) {
+  return useCallback(
+    (batches: CollectionImport[]) => invoke<ImportSummary>("import_records", { batches, appId }),
+    [appId]
+  );
+}
+
+/**
+ * The persisted networking choice (local-only by default) and the switches
+ * that change it. Enabling starts discovery/listening now; disabling stops the
+ * node without touching local persistence.
+ */
+export function useNetworkSettings() {
+  const { data: settings, loading, error, refresh } = useSnapshot<NetworkSettings>("get_network_settings");
+  const setEnabled = useCallback(async (enabled: boolean, options?: { discovery?: boolean; listen?: boolean }) => {
+    const saved = await invoke<NetworkSettings>("set_network_enabled", { enabled, ...(options ?? {}) });
+    await refresh();
+    return saved;
+  }, [refresh]);
+  const resumeSync = useCallback(() => invoke<boolean>("resume_sync"), []);
+  const reconcile = useCallback(() => invoke<boolean>("reconcile_network"), []);
+  return { settings, loading, error, refresh, setEnabled, resumeSync, reconcile };
+}
+
+/**
+ * Restore a database with an explicit scope and get the outcome back.
+ */
+export function importDatabase(sourcePath: string, scope: ImportScope = "local", appId?: string) {
+  return invoke<ImportOutcome>("import_database", { sourcePath, scope, appId });
 }
 
 /**
