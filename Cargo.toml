@@ -48,3 +48,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Tauri
 tauri = { version = "2", features = [] }
 tauri-build = "2"
+
+# GTK 3 (via Tauri on Linux) requires glib 0.18; this vendored copy backports
+# the RUSTSEC-2024-0429 fix (unsound VariantStrIter iterators) that upstream
+# shipped only in 0.20. The same copy Softn's desktop apps use.
+[patch.crates-io]
+glib = { path = "vendor/glib" }
