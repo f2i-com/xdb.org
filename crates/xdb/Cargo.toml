@@ -34,6 +34,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Only the lan-probe binary installs a subscriber (RUST_LOG); the library never does.
+tracing-subscriber = { workspace = true }
 
 # Optional Tauri integration
 tauri = { workspace = true, optional = true }

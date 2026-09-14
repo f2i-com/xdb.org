@@ -32,8 +32,9 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId, Swarm,
 };
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -42,6 +43,9 @@ use tracing::{debug, error, info, warn};
 
 const SYNC_TOPIC: &str = "xdb-sync";
 const PROTOCOL_VERSION: &str = "/xdb/1.0.0";
+
+/// How often mDNS re-queries the LAN for peers (see `NetworkNode::new`).
+pub const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the bounded repair pass runs while at least one peer is connected.
 pub const REPAIR_INTERVAL: Duration = Duration::from_secs(30);
@@ -229,8 +233,14 @@ pub enum NetworkCommand {
     Publish { message: NetworkMessage },
     /// Announce local collections and request reconciliation for every one of them.
     Reconcile,
+    /// Retry a dial to a discovered peer after a failed attempt (see `dial_discovered`).
+    Redial { peer_id: PeerId, attempt: u32 },
     Shutdown,
 }
+
+/// How many times a failed dial to a still-discovered peer is retried with
+/// exponential back-off before waiting for the next mDNS re-discovery.
+pub const MAX_DIAL_RETRIES: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
@@ -396,7 +406,17 @@ impl NetworkNode {
         // mDNS only when discovery was explicitly enabled.
         let mdns = if options.discovery {
             Toggle::from(Some(mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
+                mdns::Config {
+                    // libp2p's default re-query interval is five minutes. Two
+                    // nodes starting within a moment of each other can both send
+                    // their single initial query before the other has joined the
+                    // multicast group, and then not find each other until that
+                    // interval elapses. A 30 s re-query is one small multicast
+                    // packet on a trusted LAN and bounds discovery after such a
+                    // race (and after a peer restart) to well under a minute.
+                    query_interval: MDNS_QUERY_INTERVAL,
+                    ..mdns::Config::default()
+                },
                 local_peer_id,
             )?))
         } else {
@@ -446,10 +466,12 @@ impl NetworkNode {
         // Spawn the network loop
         let db_clone = db.clone();
         let peer_id_clone = local_peer_id;
+        let redial_tx = command_tx.clone();
         tokio::spawn(async move {
             Self::run_event_loop(
                 swarm,
                 &mut command_rx,
+                redial_tx,
                 event_tx,
                 db_clone,
                 peers_clone,
@@ -694,9 +716,68 @@ impl NetworkNode {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Dial a peer mDNS discovered, from a FRESH source port (R4 LAN run).
+    ///
+    /// libp2p's default dial reuses the listening port as the source port.
+    /// Two peers that discover each other in the same instant (two nodes
+    /// answering the same query) then dial each other at once with mirrored
+    /// 4-tuples, the kernel merges the two dials into one TCP simultaneous
+    /// open, both sides run the Noise handshake as initiator, and both fail
+    /// with "input error"; nothing retried, so the peers never connected.
+    /// A fresh source port keeps the two dials distinct (at worst two
+    /// connections, which the swarm handles), and `Redial` covers a dial
+    /// that still fails. The addresses come from the mDNS behaviour at dial
+    /// time, so a stale discovery dials nothing.
+    fn dial_discovered(swarm: &mut Swarm<XdbBehaviour>, peer_id: PeerId, attempt: u32) {
+        if swarm.is_connected(&peer_id) {
+            return;
+        }
+        let known = swarm
+            .behaviour()
+            .mdns
+            .as_ref()
+            .map(|m| m.discovered_nodes().any(|id| id == &peer_id))
+            .unwrap_or(false);
+        if !known {
+            debug!("Not dialing {}: no longer discovered", peer_id);
+            return;
+        }
+        let opts = DialOpts::peer_id(peer_id)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .allocate_new_port()
+            .build();
+        match swarm.dial(opts) {
+            Ok(()) => debug!("Dialing discovered peer {} (attempt {})", peer_id, attempt),
+            Err(e) => debug!("Dial of {} not started: {}", peer_id, e),
+        }
+    }
+
+    /// Schedule a retry after a failed dial: exponential back-off with jitter
+    /// derived from BOTH peer ids, so two peers retrying each other do not
+    /// collide again on the same instant.
+    fn schedule_redial(redial_tx: &mpsc::Sender<NetworkCommand>, local: &PeerId, peer_id: PeerId, attempt: u32) {
+        if attempt > MAX_DIAL_RETRIES {
+            warn!("Giving up dialing {} after {} attempts; the next mDNS discovery will retry", peer_id, attempt - 1);
+            return;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        local.hash(&mut hasher);
+        peer_id.hash(&mut hasher);
+        let jitter = Duration::from_millis(hasher.finish() % 700);
+        let delay = Duration::from_millis(400 * (1u64 << attempt.min(6))) + jitter;
+        let tx = redial_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(NetworkCommand::Redial { peer_id, attempt }).await;
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_event_loop(
         mut swarm: Swarm<XdbBehaviour>,
         command_rx: &mut mpsc::Receiver<NetworkCommand>,
+        redial_tx: mpsc::Sender<NetworkCommand>,
         event_tx: broadcast::Sender<NetworkEvent>,
         db: SharedDb,
         connected_peers: Arc<Mutex<HashSet<PeerId>>>,
@@ -705,6 +786,8 @@ impl NetworkNode {
         gate: Arc<SyncGate>,
     ) {
         let topic = IdentTopic::new(SYNC_TOPIC);
+        // Failed dial attempts per discovered peer; cleared when it connects.
+        let mut dial_attempts: HashMap<PeerId, u32> = HashMap::new();
         let mut repair = tokio::time::interval(REPAIR_INTERVAL + repair_jitter(&local_peer_id));
         repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut repair_cursor = 0usize;
@@ -734,9 +817,17 @@ impl NetworkNode {
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::Behaviour(XdbBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                            let mut seen = HashSet::new();
                             for (peer_id, addr) in peers {
                                 info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                if seen.insert(peer_id) {
+                                    // The explicit-peer registration happens once the
+                                    // connection exists (ConnectionEstablished): letting
+                                    // gossipsub dial here would reuse the listen port and
+                                    // collide with the peer's own dial.
+                                    dial_attempts.insert(peer_id, 0);
+                                    Self::dial_discovered(&mut swarm, peer_id, 0);
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(XdbBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -881,6 +972,19 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("Connection established with: {}", peer_id);
+                            dial_attempts.remove(&peer_id);
+                            // A LAN peer is an explicit gossipsub peer: messages always
+                            // reach it even when the mesh is thin. Registered only now,
+                            // so gossipsub never issues its own port-reusing dial.
+                            let discovered = swarm
+                                .behaviour()
+                                .mdns
+                                .as_ref()
+                                .map(|m| m.discovered_nodes().any(|id| id == &peer_id))
+                                .unwrap_or(false);
+                            if discovered {
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            }
                             let event = connection_event(
                                 &mut *connected_peers.lock().await,
                                 peer_id,
@@ -901,6 +1005,22 @@ impl NetworkNode {
                                 }
                                 let _ = event_tx.send(event);
                             }
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            warn!("Outgoing connection to {:?} failed: {}", peer_id, error);
+                            if let Some(peer_id) = peer_id {
+                                if !swarm.is_connected(&peer_id) {
+                                    let attempt = dial_attempts.entry(peer_id).or_insert(0);
+                                    *attempt += 1;
+                                    Self::schedule_redial(&redial_tx, &local_peer_id, peer_id, *attempt);
+                                }
+                            }
+                        }
+                        SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => {
+                            warn!("Incoming connection from {} failed: {}", send_back_addr, error);
+                        }
+                        SwarmEvent::Dialing { peer_id, .. } => {
+                            debug!("Dialing {:?}", peer_id);
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("Connection closed with: {}", peer_id);
@@ -941,6 +1061,9 @@ impl NetworkNode {
                             if let Ok(mut s) = stats.lock() {
                                 s.last_announce_at = Some(now_rfc3339());
                             }
+                        }
+                        Some(NetworkCommand::Redial { peer_id, attempt }) => {
+                            Self::dial_discovered(&mut swarm, peer_id, attempt);
                         }
                         Some(NetworkCommand::Shutdown) | None => {
                             info!("Network node shutting down");

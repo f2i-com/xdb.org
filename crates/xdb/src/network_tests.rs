@@ -101,7 +101,10 @@ async fn two_nodes_discover_deliver_partition_and_reconcile_over_loopback() {
     let db_b = create_shared_db(dir.path().join("b.sqlite")).unwrap();
 
     // 1. Discovery and connection over real sockets; nothing is configured by hand.
+    //    B starts a moment after A so A is listening when B's first query goes
+    //    out; the 30 s re-query covers the case where both start at once.
     let a = start(&db_a).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     let b = start(&db_b).await;
     wait_connected(&a.node, &b.node).await;
 
@@ -125,6 +128,7 @@ async fn two_nodes_discover_deliver_partition_and_reconcile_over_loopback() {
     // 4. B restarts on the same database with a NEW peer identity (as a real
     //    restart does). The connect-time announce and reconciliation must
     //    converge both databases without any manual sync request.
+    tokio::time::sleep(Duration::from_millis(750)).await;
     let b2 = start(&db_b).await;
     assert_ne!(b2.node.local_peer_id(), old_b);
     wait_connected(&a.node, &b2.node).await;

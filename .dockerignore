@@ -1,0 +1,9 @@
+# Build context for scripts/lan-probe.Dockerfile: sources only.
+target
+**/target
+node_modules
+**/node_modules
+.git
+apps/demo/dist
+apps/demo/src-tauri/target
+packages/*/dist

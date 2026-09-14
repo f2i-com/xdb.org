@@ -343,12 +343,14 @@ impl NetworkControl {
         Ok(())
     }
 
-    /// Whether `resume_sync` may lift the pause now (R3-XD-02). `Ok(None)`:
-    /// nothing is pending. `Ok(Some)`: the restore completed and may be
-    /// published/resolved. `Err`: the record is unreadable or the restore was
-    /// interrupted before it was applied; the pause stays and the error names
-    /// the recovery source and the actions `recover_restore` accepts.
-    pub fn resume_decision(&self) -> Result<Option<PendingRestore>, String> {
+    /// Whether `resume_sync` may lift the pause now (R3-XD-02, R4-XD-01).
+    /// `Ok(None)`: nothing is pending. `Ok(Some)`: the restore completed and
+    /// may be published/resolved. `Err`: the record is unreadable, the restore
+    /// was interrupted before it was applied, or it is an applied `replace`
+    /// whose reset plan cannot be published because no network node is
+    /// running (`node_available`); the pause stays and the error names the
+    /// recovery source and the actions that resolve it.
+    pub fn resume_decision(&self, node_available: bool) -> Result<Option<PendingRestore>, String> {
         let Some(pending) = self.pending_restore() else {
             return Ok(None);
         };
@@ -358,6 +360,7 @@ impl NetworkControl {
             ));
         }
         if pending.is_resumable() {
+            Self::publication_precondition(&pending, node_available)?;
             return Ok(Some(pending));
         }
         let backup = pending.backup_path.clone().unwrap_or_else(|| "(no backup was taken yet)".into());
@@ -365,6 +368,24 @@ impl NetworkControl {
             "Synchronization stays paused: the {} restore of '{}' started {} was interrupted before it was applied (phase {}). Its pre-restore backup is {}. Call recover_restore with action \"rollback\" (restore that backup) or \"complete\" (re-apply the journaled restore) before resuming",
             pending.scope, pending.app_id, pending.started_at, pending.phase(), backup
         ))
+    }
+
+    /// An applied `replace` restore is resolved only by PUBLISHING its reset
+    /// plan (R4-XD-01): without a running network node the plan would be
+    /// dropped and peers would never adopt the reset. The same rule decides
+    /// initial import, `recover_restore complete`/`publish` and `resume_sync`,
+    /// so the record stays pending (and the pause held) offline, survives a
+    /// restart, and is found again when networking is enabled. `local` scope
+    /// restores carry no plan and are resolved by the explicit resume alone.
+    pub fn publication_precondition(pending: &PendingRestore, node_available: bool) -> Result<(), String> {
+        if pending.scope == "replace" && pending.phase() == "applied" && !node_available {
+            return Err(format!(
+                "Synchronization stays paused: the authoritative (replace) restore of '{}' is applied, but its reset plan for {} collection(s) has not been published to peers and cannot be while networking is off. Enable networking (set_network_enabled), then call resume_sync or recover_restore with action \"complete\"; the plan is kept until then",
+                pending.app_id,
+                pending.reset_plan.len()
+            ));
+        }
+        Ok(())
     }
 
     /// What `recover_restore` must do for `action` (R3-XD-02), decided from
@@ -1193,8 +1214,8 @@ pub async fn resume_sync(
     // Refused for an unreadable record or a restore interrupted before it was
     // applied (R3-XD-02): the record is the only journal, and clearing it
     // would abandon an unknown data state. `recover_restore` handles those.
-    let pending = control.resume_decision()?;
     let net = { network.lock().await.clone() };
+    let pending = control.resume_decision(net.is_some())?;
     publish_and_resolve(&control, net.as_ref(), pending.as_ref()).await?;
     if let Some(net) = net {
         net.reconcile().await?;
@@ -1211,8 +1232,9 @@ async fn publish_and_resolve(
     net: Option<&NetworkNode>,
     pending: Option<&PendingRestore>,
 ) -> Result<(), String> {
-    if let (Some(p), Some(net)) = (pending, net) {
-        if p.scope == "replace" && p.phase() == "applied" {
+    if let Some(p) = pending {
+        NetworkControl::publication_precondition(p, net.is_some())?;
+        if let (true, Some(net)) = (p.scope == "replace" && p.phase() == "applied", net) {
             for (collection, epoch) in &p.reset_plan {
                 net.broadcast_reset(collection, *epoch).await?;
             }
@@ -1270,19 +1292,19 @@ pub async fn recover_restore(
             }
             db_manager.emit_change(&pending.app_id, "import", None);
             let applied = PendingRestore { phase: "applied".into(), applied: true, ..pending };
-            if applied.scope == "local" || net.is_some() {
-                publish_and_resolve(&control, net.as_ref(), Some(&applied)).await?;
-                "completed"
-            } else {
-                // Applied, but the plan cannot be published yet: stays pending
-                // (and resumable) until networking is on.
-                "completed"
+            match NetworkControl::publication_precondition(&applied, net.is_some()) {
+                Ok(()) => {
+                    publish_and_resolve(&control, net.as_ref(), Some(&applied)).await?;
+                    "completed"
+                }
+                // Applied, but the plan cannot be published yet (R4-XD-01): the
+                // record stays in the applied phase and the pause holds until
+                // networking is on and resume_sync/complete publishes it.
+                Err(_) => "applied-awaiting-publication",
             }
         }
         RecoveryStep::Publish { pending } => {
-            if pending.scope == "replace" && net.is_none() {
-                return Err("The restore is applied but its reset plan cannot be published while networking is off; enable networking, then resume_sync".to_string());
-            }
+            NetworkControl::publication_precondition(&pending, net.is_some())?;
             publish_and_resolve(&control, net.as_ref(), Some(&pending)).await?;
             "published"
         }
@@ -1873,7 +1895,7 @@ mod tests {
         assert!(!damaged.is_resumable());
         let held = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
         assert!(held.gate().is_paused());
-        assert!(held.resume_decision().unwrap_err().contains("cannot be read"));
+        assert!(held.resume_decision(true).unwrap_err().contains("cannot be read"));
     }
 
     // ── R3-XD-01: only a confirmed absent file means "no pending restore" ──
@@ -1892,7 +1914,7 @@ mod tests {
         assert!(control.gate().is_paused(), "unpaused synchronization must not start");
         let status_record = control.pending_restore().unwrap();
         assert!(status_record.unreadable.is_some(), "get_network_status can show the reason");
-        assert!(control.resume_decision().is_err());
+        assert!(control.resume_decision(true).is_err());
         // Only an explicit discard acknowledges it; rollback/complete have nothing to work from.
         assert!(control.recovery_plan("rollback").is_err());
         assert!(control.recovery_plan("complete").is_err());
@@ -1900,6 +1922,52 @@ mod tests {
     }
 
     // ── R3-XD-02: resume refuses an interrupted restore; recovery is explicit ──
+
+    #[test]
+    fn an_applied_replace_restore_keeps_its_plan_pending_while_networking_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let control = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        let applied = PendingRestore {
+            app_id: "_default".into(),
+            scope: "replace".into(),
+            started_at: "2026-09-15T00:00:00Z".into(),
+            applied: true,
+            reset_plan: vec![("notes".into(), 6), ("tasks".into(), 2)],
+            backup_path: Some("data.db.backup".into()),
+            phase: "applied".into(),
+            prior_catalog: vec![("notes".into(), 5)],
+            source_path: Some("snapshot.sqlite".into()),
+            unreadable: None,
+        };
+        control.begin_restore(applied.clone()).unwrap();
+
+        // No node: resume refuses, names the fix, keeps the record and the pause.
+        let refusal = control.resume_decision(false).unwrap_err();
+        assert!(refusal.contains("has not been published"), "{refusal}");
+        assert!(refusal.contains("2 collection(s)"), "{refusal}");
+        assert!(refusal.contains("set_network_enabled"), "{refusal}");
+        assert!(control.gate().is_paused());
+        assert_eq!(PendingRestore::load(dir.path()).unwrap().reset_plan, applied.reset_plan, "the plan is the journal");
+        // The recovery route agrees: "complete" on an applied plan is a publish, and it needs a node too.
+        assert_eq!(control.recovery_plan("complete").unwrap(), RecoveryStep::Publish { pending: applied.clone() });
+        assert!(NetworkControl::publication_precondition(&applied, false).is_err());
+
+        // A restart finds the same pending plan and starts paused.
+        let db2 = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let restarted = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db2);
+        assert!(restarted.gate().is_paused());
+        assert_eq!(restarted.pending_restore().unwrap().reset_plan, applied.reset_plan);
+
+        // With a node the same record may be published and resolved.
+        assert_eq!(restarted.resume_decision(true).unwrap().unwrap().reset_plan, applied.reset_plan);
+
+        // A local-scope restore carries no plan: its explicit resume needs no node.
+        let local = PendingRestore { scope: "local".into(), reset_plan: vec![], ..applied.clone() };
+        restarted.update_restore(local.clone()).unwrap();
+        assert_eq!(restarted.resume_decision(false).unwrap().unwrap().scope, "local");
+        assert!(NetworkControl::publication_precondition(&local, false).is_ok());
+    }
 
     #[test]
     fn resume_refuses_a_restore_interrupted_before_it_was_applied() {
@@ -1919,7 +1987,7 @@ mod tests {
             unreadable: None,
         };
         control.begin_restore(planned.clone()).unwrap();
-        let refusal = control.resume_decision().unwrap_err();
+        let refusal = control.resume_decision(true).unwrap_err();
         assert!(refusal.contains("interrupted before it was applied"), "{refusal}");
         assert!(refusal.contains("data.db.backup"), "names the recovery source: {refusal}");
         assert!(control.gate().is_paused());
@@ -1945,7 +2013,7 @@ mod tests {
         // Applied: resumable, and "complete" means publish/resolve.
         let applied = PendingRestore { phase: "applied".into(), applied: true, ..planned.clone() };
         control.update_restore(applied.clone()).unwrap();
-        assert_eq!(control.resume_decision().unwrap(), Some(applied.clone()));
+        assert_eq!(control.resume_decision(true).unwrap(), Some(applied.clone()));
         assert_eq!(control.recovery_plan("complete").unwrap(), RecoveryStep::Publish { pending: applied });
 
         // Records written before `phase` existed keep their meaning.

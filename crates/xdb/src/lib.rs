@@ -82,7 +82,7 @@ pub use tauri::{
 pub use network::{
     create_shared_network, NetworkCommand, NetworkEvent, NetworkMessage, NetworkNode,
     NetworkOptions, PeerInfo, PublishOutcome, SharedNetwork, SyncGate, SyncStats,
-    MAX_COLLECTIONS_PER_PASS, REPAIR_BATCH, REPAIR_INTERVAL,
+    MAX_COLLECTIONS_PER_PASS, MDNS_QUERY_INTERVAL, REPAIR_BATCH, REPAIR_INTERVAL,
 };
 
 /// Library version

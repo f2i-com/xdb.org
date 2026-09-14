@@ -255,7 +255,21 @@ One further test drives two real network nodes over loopback sockets in one proc
 cargo test -p xdb -- --ignored two_nodes --nocapture
 ```
 
-For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing across two machines, enable networking in BOTH demo instances first (it is off by default), use a trusted local network, and verify create/update/delete propagation in the default database; then disconnect one instance, edit on both sides, reconnect and confirm both converge without pressing sync. The loopback test above is the single-machine version of that sequence; it does not stand in for a run across two hosts and two network stacks.
+On Windows the multicast route decides which interface the discovery packets leave by; a virtual adapter with a better metric than the real card (WSL's Hyper-V adapter, for one) makes the two nodes invisible to each other and the test fails at discovery. A Linux container has no such problem, and `--network host` or the default bridge both work:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work rustlang/rust:nightly-bookworm   bash -c 'apt-get update -qq && apt-get install -y -qq cmake pkg-config >/dev/null; cargo test -p xdb --no-default-features -- --ignored two_nodes --nocapture'
+```
+
+Two nodes in two containers, each with its own network namespace, come closer to the two-host check. `scripts/lan-two-containers.sh` builds the `lan-probe` binary (`crates/xdb/src/bin/lan-probe.rs`: one node as a process that writes one record and waits until it holds the peer's too), starts two of them on a Docker bridge network and exits 0 only when both converged:
+
+```sh
+scripts/lan-two-containers.sh
+```
+
+Discovery re-queries the LAN every 30 s (`MDNS_QUERY_INTERVAL`) instead of libp2p's five-minute default, so two nodes that start at the same instant, or a peer that restarts, find each other within a minute even when both initial queries were sent before the other side was listening.
+
+For a manual demo check, create a note, update it, restart the app and verify it persists. Export to a new backup file, change the note, then import the backup and verify the restored state. Use a separate test database for this restore check. For peer testing across two machines, enable networking in BOTH demo instances first (it is off by default), use a trusted local network, and verify create/update/delete propagation in the default database; then disconnect one instance, edit on both sides, reconnect and confirm both converge without pressing sync. The loopback test and the two-container run are the single-machine versions of that sequence; a run across two real hosts still has to be recorded separately.
 
 Softn native builds use this crate as a sibling path dependency. Their [dependency checkout script](https://github.com/f2i-com/softn.com/blob/main/.github/scripts/checkout-xdb.sh) pins a specific XDB revision; adopting changes in release builds requires updating that pin as well as the checkout.
 
