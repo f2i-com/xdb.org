@@ -620,3 +620,154 @@ fn disconnected_peers_converge_after_reconnecting_without_manual_intervention() 
         snapshot(&database(&dir, "b.sqlite"))
     );
 }
+
+// ── R2-XD-03: a legacy snapshot is migrated in staging before it replaces the live schema ──
+
+fn legacy_snapshot(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+    // A backup taken by the revision before reset epochs existed: identical
+    // core tables, no collection_epochs.
+    let path = dir.path().join(name);
+    {
+        let mut db = database(dir, name);
+        db.create_record("notes", json!({"title": "legacy"})).unwrap();
+        db.create_record("archive", json!({"title": "tombstoned later"})).unwrap();
+        let archived = db.get_collection("archive").unwrap()[0].id.clone();
+        db.delete_record(&archived).unwrap();
+        db.conn.execute_batch("DROP TABLE collection_epochs").unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!tables.iter().any(|t| t == "collection_epochs"), "fixture must be legacy");
+    path
+}
+
+#[test]
+fn restoring_a_legacy_snapshot_keeps_the_epoch_table_usable_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_snapshot(&dir, "legacy.sqlite");
+    let mut live = database(&dir, "live.sqlite");
+    live.create_record("notes", json!({"title": "current"})).unwrap();
+    assert_eq!(live.reset_collection("notes", "admin").unwrap(), 1);
+
+    live.replace_from_file(&source).unwrap();
+
+    // Immediately, on the same connection: epochs and bulk import work.
+    assert_eq!(live.get_epoch("notes").unwrap(), 0, "the snapshot carried no epoch history");
+    assert_eq!(live_ids(&live, "notes").len(), 1);
+    assert_eq!(live.get_collection("notes").unwrap()[0].data["title"], "legacy");
+    assert!(live.get_collection("archive").unwrap().is_empty(), "tombstoned collection restored as tombstoned");
+    let (summary, _) = live
+        .import_records(vec![CollectionImport {
+            collection: "notes".into(),
+            replace: false,
+            records: vec![imported("n2", "notes", "after restore")],
+        }])
+        .unwrap();
+    assert_eq!(summary.imported, 1);
+    assert_eq!(live.bump_epoch("notes", "x").unwrap(), 1);
+    // The source file was not modified (still legacy) and no staging file remains.
+    let src = Connection::open(&source).unwrap();
+    assert!(src
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name='collection_epochs'", [], |r| r.get::<_, i64>(0))
+        .unwrap() == 0);
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("restore-staging"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging copies are removed");
+
+    // Reopen after success: still consistent.
+    drop(live);
+    let reopened = database(&dir, "live.sqlite");
+    assert_eq!(live_ids(&reopened, "notes").len(), 2);
+    assert_eq!(reopened.get_epoch("notes").unwrap(), 1);
+
+    // An empty legacy database restores to an empty, usable database too.
+    let empty = dir.path().join("empty-legacy.sqlite");
+    {
+        let db = database(&dir, "empty-legacy.sqlite");
+        db.conn.execute_batch("DROP TABLE collection_epochs").unwrap();
+    }
+    let mut target = database(&dir, "target.sqlite");
+    target.create_record("notes", json!({})).unwrap();
+    target.replace_from_file(&empty).unwrap();
+    assert!(target.get_collections().unwrap().is_empty());
+    assert_eq!(target.get_epoch("notes").unwrap(), 0);
+}
+
+#[test]
+fn a_snapshot_that_fails_staging_validation_leaves_the_live_database_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut live = database(&dir, "live.sqlite");
+    live.create_record("notes", json!({"title": "keep"})).unwrap();
+    // Missing a core table entirely: unsupported, rejected before any mutation.
+    let bogus = dir.path().join("bogus.sqlite");
+    let conn = Connection::open(&bogus).unwrap();
+    conn.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, collection TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted INTEGER DEFAULT 0)").unwrap();
+    drop(conn);
+    let err = live.replace_from_file(&bogus).unwrap_err();
+    assert!(err.to_string().contains("missing table 'crdt_state'"), "{err}");
+    assert_eq!(live_ids(&live, "notes").len(), 1);
+    live.create_record("notes", json!({"title": "still usable"})).unwrap();
+    assert_eq!(live_ids(&live, "notes").len(), 2);
+}
+
+// ── R2-XD-02: authoritative replacement keeps reset authority monotonic and covers omitted collections ──
+
+#[test]
+fn authoritative_restore_exceeds_both_live_and_snapshot_epochs_over_the_union_of_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    // Backup taken when notes was at epoch 1 and tasks did not exist.
+    let backup = dir.path().join("earlier.sqlite");
+    {
+        let mut db = database(&dir, "earlier.sqlite");
+        db.create_record("notes", json!({"title": "from backup"})).unwrap();
+        assert_eq!(db.reset_collection("notes", "a").unwrap(), 1);
+        db.create_record("notes", json!({"title": "post-reset in backup"})).unwrap();
+    }
+    // Live state moved on: notes at epoch 5, and a tasks collection peers know about.
+    let mut live = database(&dir, "live.sqlite");
+    live.create_record("notes", json!({"title": "live"})).unwrap();
+    for _ in 0..5 {
+        live.bump_epoch("notes", "live").unwrap();
+    }
+    live.create_record("tasks", json!({"title": "only live has tasks"})).unwrap();
+    let mut peer = database(&dir, "peer.sqlite");
+    peer.apply_remote_update("notes", &live.get_full_state("notes").unwrap()).unwrap();
+    peer.apply_remote_reset("notes", 5, "live").unwrap();
+    peer.apply_remote_update("tasks", &live.get_full_state("tasks").unwrap()).unwrap();
+
+    let plan = live.replace_from_file_authoritative(&backup, "restore").unwrap();
+    let plan: HashMap<String, u64> = plan.into_iter().collect();
+    assert_eq!(plan.get("notes"), Some(&6), "exceeds live 5 and snapshot 1, never announces 2");
+    assert_eq!(plan.get("tasks"), Some(&1), "a collection the snapshot omits is reset too");
+    assert_eq!(live.get_epoch("notes").unwrap(), 6);
+    assert_eq!(live.get_epoch("tasks").unwrap(), 1);
+    assert!(live.get_collection("tasks").unwrap().is_empty());
+    assert_eq!(live_ids(&live, "notes").len(), 1);
+
+    // The peer at epoch 5 adopts the replacement; a stale peer update is refused.
+    let (_, stale) = peer.create_record("notes", json!({"title": "peer edit at 5"})).unwrap();
+    assert!(matches!(
+        live.apply_remote_update_at_epoch("notes", 5, &stale).unwrap(),
+        RemoteApplyOutcome::StaleEpoch { local: 6, remote: 5 }
+    ));
+    assert!(peer.apply_remote_reset("notes", 6, "restore").unwrap());
+    assert!(peer.apply_remote_reset("tasks", 1, "restore").unwrap());
+    assert!(peer.get_collection("tasks").unwrap().is_empty(), "B did not silently survive on the peer");
+    peer.apply_remote_update("notes", &live.get_full_state("notes").unwrap()).unwrap();
+    assert_eq!(live_ids(&peer, "notes"), live_ids(&live, "notes"));
+
+    // Re-applying the persisted plan after an interruption is idempotent and never lowers an epoch.
+    live.bump_epoch("notes", "later").unwrap();
+    live.apply_reset_plan(&[("notes".into(), 6), ("tasks".into(), 1), ("new".into(), 3)], "replay").unwrap();
+    assert_eq!(live.get_epoch("notes").unwrap(), 7);
+    assert_eq!(live.get_epoch("new").unwrap(), 3);
+}

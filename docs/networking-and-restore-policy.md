@@ -1,6 +1,6 @@
 # Native networking, reconciliation and restore policy
 
-**Status:** implemented in the `xdb` crate on 14 September 2026 for the ecosystem review tickets XD-01, XD-02 and XD-03, plus the bulk import required by SN-01. This document is the contract hosts (Softn's native loader, the demo) rely on. Where a guarantee is *not* provided, it says so.
+**Status:** implemented in the `xdb` crate on 14 September 2026 for the ecosystem review tickets XD-01, XD-02 and XD-03, plus the bulk import required by SN-01; the same day's recheck tickets R2-XD-01 to R2-XD-04 are folded in below. This document is the contract hosts (Softn's native loader, the demo) rely on. Where a guarantee is *not* provided, it says so.
 
 ## 1. Networking is opt-in (XD-01)
 
@@ -56,13 +56,19 @@ Reset epochs:
 - An inbound update whose epoch is **behind** the local epoch is rejected (`RemoteApplyOutcome::StaleEpoch`): a peer that was offline during the reset cannot silently reverse it. An update whose epoch is **ahead** makes the receiver adopt the reset first (`MissingReset`), then apply.
 - A `SyncRequest` from a peer on an older epoch is answered with the reset followed by the whole post-reset state; a request from a peer on a newer epoch makes this node ask that peer instead.
 
+Pending restore record (R2-XD-01): for the synchronized default database, `import_database` writes `<app data>/pending-restore.json` and pauses the gate **before** any byte is replaced, whether or not a network node is running. `NetworkControl` loads that record at startup and starts paused, before any network node can exist; `set_network_enabled` shares the same gate, so enabling networking after an offline restore never accepts a merge implicitly. Only `resume_sync` (an explicit, durable resolution) removes the record and lifts the pause; an unreadable record is treated as pending. A `replace` restore stays pending until its committed reset plan has been published (immediately when networking is on, otherwise by `resume_sync`). A restore that fails mid-way keeps the record and the pre-restore backup.
+
 Database restore scopes (`import_database`, parameter `scope`):
 
 | Scope | Effect | Synchronization |
 | --- | --- | --- |
 | `local` (default) | Replace this node's database from the file (pre-import backup is kept beside it). | On the synchronized default database, synchronization is **paused** (`sync_paused: true`) until `resume_sync`; inbound updates and requests are held, outbound publishes are not sent. The operator must choose what the restore means before peers merge into it. |
-| `fork` | Restore into a new isolated app namespace (`<app>-fork-<timestamp>`). | Nothing shared changes; named apps are never synchronized. |
-| `replace` | Replace this node's database AND advance every collection's epoch, broadcasting resets. | Peers adopt the reset and fetch this node's state; their pre-restore state is discarded. |
+| `fork` | Restore into a new isolated app namespace (`<app>-fork-<uuid>`, create-only). | Nothing shared changes; named apps are never synchronized. |
+| `replace` | Replace this node's database AND make it authoritative (R2-XD-02): the reset plan covers the **union** of the pre-restore catalog and the restored one, and every collection's new epoch exceeds both its live pre-restore epoch and the snapshot's (`replace_from_file_authoritative`). Collections the snapshot omits get a reset epoch too, so peers clear them instead of rediscovering them. The plan is persisted in the pending-restore record before it is published and re-applied idempotently after an interruption. | Peers adopt the reset and fetch this node's state; their pre-restore state is discarded. A peer holding an even newer epoch (concurrent authority) makes this node adopt that reset instead: the policy is monotonic, not last-operator-wins. |
+
+Legacy snapshots (R2-XD-03): `replace_from_file` never modifies the source file. It copies the snapshot into a private staging database, runs this revision's idempotent schema initialisation on the copy (a snapshot from before reset epochs gains `collection_epochs`), validates every record row and CRDT document there, and only then copies the migrated staging database over the live connection. A snapshot missing a core table is rejected before any mutation; a staging failure leaves the live database untouched and usable.
+
+Fork identities (R2-XD-04): `scope: fork` allocates `<label>-fork-<uuid>` and retries while the destination path exists or is open, so two forks in the same second are independent and an existing namespace is never reused as a fork target.
 
 Retention and compaction rules (explicit so the offline window is knowable):
 

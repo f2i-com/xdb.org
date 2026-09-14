@@ -73,6 +73,9 @@ pub struct NetworkStatus {
     pub listening: bool,
     /// Held after a local-scope restore until `resume_sync` (audit XD-03).
     pub sync_paused: bool,
+    /// The unresolved restore holding the pause, when there is one (R2-XD-01).
+    #[serde(default)]
+    pub pending_restore: Option<PendingRestore>,
     pub stats: SyncStats,
 }
 
@@ -143,6 +146,75 @@ impl NetworkSettings {
     }
 }
 
+/// A restore of the synchronized default database whose consequence for
+/// peers is not settled yet (R2-XD-01). Written OUTSIDE the database bytes
+/// being replaced, BEFORE the replacement begins, and loaded before any
+/// network start, so a restart or a later "enable networking" cannot bypass
+/// the decision. `local` stays pending until `resume_sync`; `replace` stays
+/// pending until its reset plan has been published to peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRestore {
+    pub app_id: String,
+    /// "local" | "replace"
+    pub scope: String,
+    pub started_at: String,
+    /// True once the database bytes were replaced (for `replace`, the epoch
+    /// plan below is committed too); false means the restore was interrupted
+    /// before completion and the pre-restore backup is the recovery source.
+    #[serde(default)]
+    pub applied: bool,
+    /// The authoritative reset plan (replace scope) still to be published.
+    #[serde(default)]
+    pub reset_plan: Vec<(String, u64)>,
+    #[serde(default)]
+    pub backup_path: Option<String>,
+}
+
+impl PendingRestore {
+    pub const FILE_NAME: &'static str = "pending-restore.json";
+
+    pub fn path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join(Self::FILE_NAME)
+    }
+
+    pub fn load(base_dir: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(Self::path(base_dir)).ok()?;
+        match serde_json::from_slice::<PendingRestore>(&bytes) {
+            Ok(pending) => Some(pending),
+            Err(e) => {
+                // Unreadable pending state is treated as PENDING: the safe
+                // reading of an unknown restore decision is "not decided".
+                warn!("Unreadable pending-restore record; holding synchronization: {}", e);
+                Some(PendingRestore {
+                    app_id: "_default".into(),
+                    scope: "local".into(),
+                    started_at: String::new(),
+                    applied: true,
+                    reset_plan: Vec::new(),
+                    backup_path: None,
+                })
+            }
+        }
+    }
+
+    pub fn save(&self, base_dir: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(base_dir).map_err(|e| e.to_string())?;
+        let path = Self::path(base_dir);
+        let pending = path.with_extension("json.pending");
+        std::fs::write(&pending, serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&pending, &path).map_err(|e| e.to_string())
+    }
+
+    pub fn clear(base_dir: &std::path::Path) -> Result<(), String> {
+        match std::fs::remove_file(Self::path(base_dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// Host-side control of networking: the persisted choice, the pause gate and
 /// the default database the legacy protocol serves.
 pub struct NetworkControl {
@@ -150,15 +222,28 @@ pub struct NetworkControl {
     settings: StdMutex<NetworkSettings>,
     gate: Arc<SyncGate>,
     default_db: SharedDb,
+    pending_restore: StdMutex<Option<PendingRestore>>,
 }
 
 impl NetworkControl {
+    /// Loads any persisted pending restore and pauses the gate BEFORE any
+    /// network node can exist (R2-XD-01).
     pub fn new(base_dir: PathBuf, settings: NetworkSettings, default_db: SharedDb) -> Self {
+        let pending = PendingRestore::load(&base_dir);
+        let gate = SyncGate::new();
+        if let Some(p) = &pending {
+            warn!(
+                "Unresolved {} restore of '{}' from {}: synchronization stays paused until it is resolved",
+                p.scope, p.app_id, p.started_at
+            );
+            gate.pause();
+        }
         Self {
             base_dir,
             settings: StdMutex::new(settings),
-            gate: SyncGate::new(),
+            gate,
             default_db,
+            pending_restore: StdMutex::new(pending),
         }
     }
 
@@ -168,6 +253,40 @@ impl NetworkControl {
 
     pub fn gate(&self) -> Arc<SyncGate> {
         self.gate.clone()
+    }
+
+    pub fn pending_restore(&self) -> Option<PendingRestore> {
+        self.pending_restore.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// Persist the pending record first, then pause: nothing may apply once
+    /// the record exists, and a crash between the two leaves the pause to be
+    /// re-established at startup from the record.
+    pub fn begin_restore(&self, pending: PendingRestore) -> Result<(), String> {
+        pending.save(&self.base_dir)?;
+        self.gate.pause();
+        if let Ok(mut slot) = self.pending_restore.lock() {
+            *slot = Some(pending);
+        }
+        Ok(())
+    }
+
+    pub fn update_restore(&self, pending: PendingRestore) -> Result<(), String> {
+        pending.save(&self.base_dir)?;
+        if let Ok(mut slot) = self.pending_restore.lock() {
+            *slot = Some(pending);
+        }
+        Ok(())
+    }
+
+    /// The explicit, durable resolution: remove the record, then lift the pause.
+    pub fn resolve_restore(&self) -> Result<(), String> {
+        PendingRestore::clear(&self.base_dir)?;
+        if let Ok(mut slot) = self.pending_restore.lock() {
+            *slot = None;
+        }
+        self.gate.resume();
+        Ok(())
     }
 }
 
@@ -258,6 +377,15 @@ impl DbManager {
         Ok(db)
     }
 
+    /// Whether an app database is already open in this manager.
+    pub fn is_open(&self, app_id: &str) -> Option<()> {
+        let app_id = sanitize_app_id(app_id);
+        self.databases
+            .lock()
+            .ok()
+            .and_then(|dbs| dbs.contains_key(&app_id).then_some(()))
+    }
+
     /// Get the database file path for a given app ID.
     pub fn get_app_path(&self, app_id: &str) -> PathBuf {
         let app_id = sanitize_app_id(app_id);
@@ -324,6 +452,21 @@ async fn broadcast_scoped_update(
     }
 }
 
+
+/// Collision-resistant, create-only fork identity (R2-XD-04): a random id
+/// under the source app's sanitized label, retried while the destination
+/// already exists so an existing namespace is never reused as a fork target.
+fn allocate_fork_id(db_manager: &DbManager, requested_app: &str) -> Result<String, String> {
+    let label = sanitize_app_id(requested_app);
+    for _ in 0..8 {
+        let candidate = format!("{}-fork-{}", label, uuid::Uuid::new_v4().simple());
+        let path = db_manager.get_app_path(&candidate);
+        if !path.exists() && db_manager.is_open(&candidate).is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not allocate a fresh fork identity; try again".to_string())
+}
 
 fn backup_database_for_import(
     db: &crate::db::XdbDatabase,
@@ -748,6 +891,7 @@ pub async fn get_network_status(
             discovery: options.discovery,
             listening: options.listen,
             sync_paused: net.gate().is_paused(),
+            pending_restore: control.pending_restore(),
             stats: net.stats(),
         })
     } else {
@@ -760,6 +904,7 @@ pub async fn get_network_status(
             discovery: false,
             listening: false,
             sync_paused: control.gate().is_paused(),
+            pending_restore: control.pending_restore(),
             stats: SyncStats::default(),
         })
     }
@@ -796,7 +941,9 @@ pub async fn set_network_enabled(
         *guard = settings;
     }
 
-    // Stop whatever is running; restart only when enabled.
+    // Stop whatever is running; restart only when enabled. The gate is the
+    // control's, so an unresolved restore keeps synchronization paused across
+    // this switch: enabling networking never implicitly accepts a merge.
     shutdown_xdb(&network).await;
     if enabled {
         init_network(
@@ -815,14 +962,24 @@ pub async fn set_network_enabled(
     Ok(settings)
 }
 
-/// Lift the pause set by a local-scope restore (audit XD-03) and reconcile.
+/// Resolve a pending restore: remove the durable record, lift the pause and
+/// reconcile (R2-XD-01). For a `replace` restore whose reset plan was never
+/// published (network was off), publish it first so peers adopt it.
 #[tauri::command]
 pub async fn resume_sync(
     network: State<'_, SharedNetwork>,
     control: State<'_, SharedNetworkControl>,
 ) -> Result<bool, String> {
-    control.gate().resume();
+    let pending = control.pending_restore();
     let net = { network.lock().await.clone() };
+    if let (Some(p), Some(net)) = (&pending, &net) {
+        if p.scope == "replace" && p.applied {
+            for (collection, epoch) in &p.reset_plan {
+                net.broadcast_reset(collection, *epoch).await?;
+            }
+        }
+    }
+    control.resolve_restore()?;
     if let Some(net) = net {
         net.reconcile().await?;
     }
@@ -956,12 +1113,11 @@ pub async fn import_database(
     if !matches!(scope.as_str(), "local" | "fork" | "replace") {
         return Err(format!("Unknown import scope '{scope}' (local | fork | replace)"));
     }
+    if control.pending_restore().is_some() && supports_legacy_sync(&requested_app) && scope != "fork" {
+        return Err("A previous restore of the shared database is still unresolved; call resume_sync (or choose a scope for it) before restoring again".to_string());
+    }
     let app_id = if scope == "fork" {
-        format!(
-            "{}-fork-{}",
-            sanitize_app_id(&requested_app),
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
-        )
+        allocate_fork_id(&db_manager, &requested_app)?
     } else {
         requested_app.clone()
     };
@@ -988,10 +1144,28 @@ pub async fn import_database(
     }
     drop(source_conn);
 
+    // Shared (default) database: the pending-restore record is written and
+    // the pause established BEFORE any byte is replaced, whether or not a
+    // network node is running now (R2-XD-01). A crash after this point leaves
+    // the record, so startup re-establishes the pause.
+    let shared = supports_legacy_sync(&app_id) && scope != "fork";
+    if shared {
+        control.begin_restore(PendingRestore {
+            app_id: sanitize_app_id(&app_id),
+            scope: scope.clone(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            applied: false,
+            reset_plan: Vec::new(),
+            backup_path: None,
+        })?;
+    }
+
     // Serialize import under the DB mutex to prevent concurrent writes. The
     // guard lives only inside this block: it must never be held across an
     // await (the network calls below), so the command future stays Send.
-    let reset_collections: Vec<(String, u64)> = {
+    // The network loop applies inbound updates under this same lock and only
+    // while the gate is open, so nothing can apply across the replacement.
+    let restored: Result<(Vec<(String, u64)>, PathBuf), String> = (|| {
         let mut db_lock = db.lock().map_err(|e| e.to_string())?;
         // Create backup of current database
         let backup_path = backup_database_for_import(&db_lock, &source)?;
@@ -999,42 +1173,66 @@ pub async fn import_database(
             "Saved pre-import database backup: {}",
             backup_path.display()
         );
-
-        // Replace the database file and reload in-memory state atomically under lock.
-        db_lock
-            .replace_from_file(&source)
-            .map_err(|e| format!("Failed to replace database after import: {}", e))?;
-
-        let mut reset_collections = Vec::new();
-        if scope == "replace" {
-            // The restored contents are now authoritative for every peer.
-            for collection in db_lock.get_collections().map_err(|e| e.to_string())? {
-                let epoch = db_lock
-                    .bump_epoch(&collection, "local-restore")
-                    .map_err(|e| e.to_string())?;
-                reset_collections.push((collection, epoch));
-            }
+        let reset_collections = if scope == "replace" {
+            // Authoritative replacement (R2-XD-02): epochs exceed both the live
+            // and the snapshot generation, over the union of both catalogs.
+            db_lock
+                .replace_from_file_authoritative(&source, "local-restore")
+                .map_err(|e| format!("Failed to replace database after import: {}", e))?
+        } else {
+            db_lock
+                .replace_from_file(&source)
+                .map_err(|e| format!("Failed to replace database after import: {}", e))?;
+            Vec::new()
+        };
+        Ok((reset_collections, backup_path))
+    })();
+    let (reset_collections, backup_path) = match restored {
+        Ok(v) => v,
+        Err(e) => {
+            // The pending record stays: the pause is kept conservatively and
+            // the pre-restore backup is the recovery source.
+            return Err(e);
         }
-        reset_collections
     };
+    if shared {
+        control.update_restore(PendingRestore {
+            app_id: sanitize_app_id(&app_id),
+            scope: scope.clone(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            applied: true,
+            reset_plan: reset_collections.clone(),
+            backup_path: Some(backup_path.to_string_lossy().to_string()),
+        })?;
+    }
     db_manager.emit_change(&app_id, "import", None);
     info!("Imported database from: {} (scope {})", source_path, scope);
 
     let mut sync_paused = false;
-    if supports_legacy_sync(&app_id) {
+    if shared {
         let net = { network.lock().await.clone() };
         match scope.as_str() {
-            "local" if net.as_ref().is_some_and(NetworkNode::is_running) => {
-                control.gate().pause();
+            "local" => {
+                // Stays paused — durably — until resume_sync, whether or not
+                // networking is on now or is enabled later.
                 sync_paused = true;
                 warn!("Synchronization paused after a local restore; call resume_sync once the operator has chosen local/fork/replace");
             }
             "replace" => {
-                if let Some(net) = net {
-                    for (collection, epoch) in &reset_collections {
-                        net.broadcast_reset(collection, *epoch).await?;
+                match net {
+                    Some(net) => {
+                        // Publish only the COMMITTED plan, then resolve the pause.
+                        for (collection, epoch) in &reset_collections {
+                            net.broadcast_reset(collection, *epoch).await?;
+                        }
+                        control.resolve_restore()?;
+                        net.reconcile().await?;
                     }
-                    net.reconcile().await?;
+                    None => {
+                        // Nothing to publish to yet: the plan stays pending and
+                        // is published by resume_sync once networking is on.
+                        sync_paused = true;
+                    }
                 }
             }
             _ => {}
@@ -1296,6 +1494,93 @@ mod tests {
         assert!(!control.gate().is_paused());
         control.gate().pause();
         assert!(control.gate().is_paused());
+    }
+
+    // ── R2-XD-01: the restore pause is durable and established before mutation ──
+
+    #[test]
+    fn pending_restore_survives_restart_and_holds_the_gate_until_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let control = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db.clone());
+        assert!(control.pending_restore().is_none());
+
+        // begin_restore writes the record FIRST, then pauses.
+        control
+            .begin_restore(PendingRestore {
+                app_id: "_default".into(),
+                scope: "local".into(),
+                started_at: "2026-09-14T00:00:00Z".into(),
+                applied: false,
+                reset_plan: vec![],
+                backup_path: None,
+            })
+            .unwrap();
+        assert!(control.gate().is_paused());
+        assert!(PendingRestore::path(dir.path()).exists());
+
+        // "Restart": a fresh control over the same directory loads the record
+        // and starts PAUSED, before any network node could exist. Enabling
+        // networking later shares this gate, so it cannot lift the pause.
+        let restarted = NetworkControl::new(
+            dir.path().to_path_buf(),
+            NetworkSettings { enabled: true, discovery: true, listen: true },
+            db.clone(),
+        );
+        assert!(restarted.gate().is_paused());
+        assert_eq!(restarted.pending_restore().map(|p| p.scope), Some("local".to_string()));
+
+        // Only the explicit resolution clears the record and lifts the pause.
+        restarted.resolve_restore().unwrap();
+        assert!(!restarted.gate().is_paused());
+        assert!(!PendingRestore::path(dir.path()).exists());
+        let again = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        assert!(!again.gate().is_paused());
+
+        // An unreadable record is treated as pending, never as resolved.
+        std::fs::write(PendingRestore::path(dir.path()), b"{garbage").unwrap();
+        let damaged = PendingRestore::load(dir.path()).unwrap();
+        assert!(damaged.applied);
+        assert_eq!(damaged.scope, "local");
+    }
+
+    #[test]
+    fn pending_restore_records_the_committed_reset_plan_for_republishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingRestore {
+            app_id: "_default".into(),
+            scope: "replace".into(),
+            started_at: "2026-09-14T00:00:00Z".into(),
+            applied: true,
+            reset_plan: vec![("notes".into(), 6), ("tasks".into(), 2)],
+            backup_path: Some("x.db.backup".into()),
+        };
+        pending.save(dir.path()).unwrap();
+        assert_eq!(PendingRestore::load(dir.path()).unwrap(), pending);
+        PendingRestore::clear(dir.path()).unwrap();
+        assert!(PendingRestore::load(dir.path()).is_none());
+        PendingRestore::clear(dir.path()).unwrap();
+    }
+
+    // ── R2-XD-04: fork identities are unique and create-only ──
+
+    #[test]
+    fn fork_identities_are_distinct_within_one_second_and_never_reuse_an_existing_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DbManager::new(dir.path().to_path_buf());
+        let first = allocate_fork_id(&manager, "notes app").unwrap();
+        let second = allocate_fork_id(&manager, "notes app").unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("notes_app-fork-"));
+        // Neither exists yet: allocation is create-only and the caller creates it.
+        assert!(!manager.get_app_path(&first).exists());
+        // An identity that already exists on disk or is already open is never returned.
+        manager.get_db(&first).unwrap();
+        for _ in 0..20 {
+            let next = allocate_fork_id(&manager, "notes app").unwrap();
+            assert_ne!(next, first);
+            assert!(!manager.get_app_path(&next).exists());
+        }
     }
 
     #[test]

@@ -19,33 +19,35 @@ Fixed record (~180 B JSON), fixed seeds, 50 single edits, one 100-edit batch. "r
 
 Correctness was held fixed across the change: the transaction wrapper, consistent snapshot export, tombstones and epochs are untouched, and the regression suite (32 tests) includes duplicate remote apply, restart-after-convergence and snapshot import/export.
 
-## Baseline after the changes
+## Baseline after the changes (sampled, 14 September 2026 recheck)
+
+Single-operation lanes now take seven independent samples (`SAMPLES`), so their p50/p95 are distributions; bulk import and the batch edit are one-shot by nature and print one value twice.
 
 ### N = 1 000 records
 
 | lane | p50 ms | p95 ms | rows touched / op | WAL bytes / op | delta bytes / op |
 |---|---:|---:|---:|---:|---:|
-| bulk import (N records, 1 txn) | 13.02 | 13.02 | 1001 | 824032 | 406300 |
-| single edit (warm) | 3.52 | 8.57 | 2 | 85449 | 426 |
-| batch edit (100 updates, 1 txn) | 79.50 | 79.50 | 200 | 774592 | 0 |
-| initial sync (peer applies full state) | 9.36 | 9.36 | 1001 | 898192 | 409777 |
-| remote apply (1-record delta) | 5.88 | 5.88 | 2 | 453232 | 430 |
-| duplicate remote apply (no-op delta) | 5.80 | 5.80 | 1 | 424392 | 430 |
-| restart (open + read collection) | 2.59 | 2.59 | 0 | 0 | 0 |
-| compaction (checkpoint + VACUUM) | 9.19 | 9.19 | 0 | 0 | 0 |
+| bulk import (N records, 1 txn) | 14.51 | 14.51 | 1001 | 824032 | 406318 |
+| single edit (warm) | 3.47 | 8.70 | 2 | 86109 | 426 |
+| batch edit (100 updates, 1 txn) | 77.92 | 77.92 | 200 | 762232 | 0 |
+| initial sync (peer applies full state) | 9.65 | 10.17 | 1001 | 897603 | 409747 |
+| remote apply (1-record delta) | 5.63 | 6.35 | 2 | 450878 | 435 |
+| duplicate remote apply (no-op delta) | 6.00 | 6.32 | 1 | 424392 | 435 |
+| restart (open + read collection) | 1.95 | 2.12 | 0 | 0 | 0 |
+| compaction (checkpoint + VACUUM) | 10.36 | 10.36 | 0 | 0 | 0 |
 
 ### N = 10 000 records
 
 | lane | p50 ms | p95 ms | rows touched / op | WAL bytes / op | delta bytes / op |
 |---|---:|---:|---:|---:|---:|
-| bulk import (N records, 1 txn) | 94.42 | 94.42 | 10001 | 8001072 | 4073104 |
-| single edit (warm) | 22.52 | 24.59 | 2 | 164636 | 426 |
-| batch edit (100 updates, 1 txn) | 1152.52 | 1152.52 | 200 | 4560872 | 0 |
-| initial sync (peer applies full state) | 91.96 | 91.96 | 10001 | 8066992 | 4076587 |
-| remote apply (1-record delta) | 28.01 | 28.01 | 2 | 4148872 | 430 |
-| duplicate remote apply (no-op delta) | 17.50 | 17.50 | 1 | 4115912 | 430 |
-| restart (open + read collection) | 22.83 | 22.83 | 0 | 0 | 0 |
-| compaction (checkpoint + VACUUM) | 49.36 | 49.36 | 0 | 0 | 0 |
+| bulk import (N records, 1 txn) | 93.01 | 93.01 | 10001 | 8001072 | 4073056 |
+| single edit (warm) | 22.91 | 24.52 | 2 | 164636 | 426 |
+| batch edit (100 updates, 1 txn) | 1149.96 | 1149.96 | 200 | 4548512 | 0 |
+| initial sync (peer applies full state) | 94.22 | 102.46 | 10001 | 8069346 | 4076521 |
+| remote apply (1-record delta) | 28.95 | 30.73 | 2 | 4145341 | 433 |
+| duplicate remote apply (no-op delta) | 18.38 | 19.36 | 1 | 4115912 | 433 |
+| restart (open + read collection) | 23.63 | 24.50 | 0 | 0 | 0 |
+| compaction (checkpoint + VACUUM) | 51.72 | 51.72 | 0 | 0 | 0 |
 
 The 50 000-record lane was started under the original code and abandoned after several minutes inside the O(N²) bulk import; it has not been re-recorded here and should be run on the operator's reference hardware with `XDB_BENCH_LARGE=1` when a large-collection budget is set.
 

@@ -40,7 +40,7 @@ A record contains `id`, `collection`, `data`, `created_at`, `updated_at` and `de
 - `update_record` shallow-merges object fields; a non-object payload replaces `data`.
 - `delete_record` writes a tombstone. `get_collection` hides deleted records; the lower-level `get_record` can return a tombstone.
 - `clear_collection` is a LOCAL hard reset, not a replicated deletion: peers repopulate this node on the next reconciliation. A replicated deletion is a tombstone (`delete_record`, or `import_records` with `replace`). An authoritative reset of a shared collection is `reset_collection` with scope `replicated`: it advances the collection's reset epoch, which every sync message carries; peers adopt the reset and updates from peers still on the old epoch are rejected.
-- `import_database` takes a `scope`: `local` (this node only; synchronization pauses until `resume_sync`), `fork` (a new isolated namespace) or `replace` (this data becomes authoritative for peers through reset epochs).
+- `import_database` takes a `scope`: `local` (this node only; synchronization pauses until `resume_sync`), `fork` (a new isolated namespace with a collision-resistant identity) or `replace` (this data becomes authoritative for peers through reset epochs).
 - `import_records` imports several collections in one transaction and returns its summary only after the commit.
 - Tombstones and epochs are retained indefinitely; there is no compaction that could make a rejoining peer diverge silently.
 - `with_transaction` groups SQLite and CRDT changes. Publish returned deltas only after the containing transaction succeeds.

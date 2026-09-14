@@ -8,7 +8,9 @@
 //! ```
 //!
 //! Fixed record size and seed, three collection sizes (1k / 10k / 50k with
-//! `XDB_BENCH_LARGE=1`). For every lane it reports p50/p95 latency, SQLite rows
+//! `XDB_BENCH_LARGE=1`). Single-operation lanes take SAMPLES independent
+//! measurements (bulk import and the batch edit remain one-shot by nature and
+//! print the same value for p50 and p95). For every lane it reports p50/p95 latency, SQLite rows
 //! touched (`sqlite3_total_changes`), WAL bytes written, the encoded CRDT
 //! delta size, the stored `doc_state` size and live database memory is left
 //! to the operator's process monitor. Cold startup, warm mutation and the
@@ -24,6 +26,9 @@ use std::time::{Duration, Instant};
 
 const EDITS: usize = 50;
 const BATCH: usize = 100;
+/// Independent samples for the lanes that measure one operation, so p50/p95
+/// are distributions rather than a single reading (recheck, September 2026).
+const SAMPLES: usize = 7;
 
 fn sizes() -> Vec<usize> {
     if std::env::var("XDB_BENCH_LARGE").is_ok() {
@@ -154,41 +159,72 @@ fn run(n: usize) -> Vec<Lane> {
     let mut batch = vec![t.elapsed()];
     lanes.push(lane("batch edit (100 updates, 1 txn)", &mut batch, db.total_changes() - rows0, wal_bytes(&db), 0));
 
-    // ── initial sync into an empty peer ─────────────────────────────────────
-    let mut peer = XdbDatabase::open(dir.path().join("peer.sqlite")).unwrap();
+    // ── initial sync into an empty peer (SAMPLES independent fresh peers) ──
     let full = db.get_full_state("bench").unwrap();
-    let rows0 = peer.total_changes();
-    let t = Instant::now();
+    let mut initial = Vec::new();
+    let mut initial_rows = 0u64;
+    let mut initial_wal = 0u64;
+    for i in 0..SAMPLES {
+        let mut fresh_peer = XdbDatabase::open(dir.path().join(format!("peer-initial-{i}.sqlite"))).unwrap();
+        let rows0 = fresh_peer.total_changes();
+        let t = Instant::now();
+        fresh_peer.apply_remote_update("bench", &full).unwrap();
+        initial.push(t.elapsed());
+        initial_rows += fresh_peer.total_changes() - rows0;
+        initial_wal += wal_bytes(&fresh_peer);
+    }
+    lanes.push(lane("initial sync (peer applies full state)", &mut initial, initial_rows, initial_wal, full.len() as u64 * SAMPLES as u64));
+
+    // ── remote apply of ONE single-record delta on a converged peer (SAMPLES edits) ──
+    let mut peer = XdbDatabase::open(dir.path().join("peer.sqlite")).unwrap();
     peer.apply_remote_update("bench", &full).unwrap();
-    let mut initial = vec![t.elapsed()];
-    lanes.push(lane("initial sync (peer applies full state)", &mut initial, peer.total_changes() - rows0, wal_bytes(&peer), full.len() as u64));
+    let mut remote = Vec::new();
+    let mut remote_rows = 0u64;
+    let mut remote_wal = 0u64;
+    let mut remote_delta = 0u64;
+    let mut deltas = Vec::new();
+    for i in 0..SAMPLES {
+        let (_, fresh) = db.update_record(&format!("r{:08}", (i * 31) % n), json!({"remote": format!("edit {i}")})).unwrap();
+        checkpoint(&peer);
+        let rows0 = peer.total_changes();
+        let t = Instant::now();
+        peer.apply_remote_update("bench", &fresh).unwrap();
+        remote.push(t.elapsed());
+        remote_rows += peer.total_changes() - rows0;
+        remote_wal += wal_bytes(&peer);
+        remote_delta += fresh.len() as u64;
+        deltas.push(fresh);
+    }
+    lanes.push(lane("remote apply (1-record delta)", &mut remote, remote_rows, remote_wal, remote_delta));
 
-    // ── remote apply of ONE single-record delta on a converged peer ─────────
-    // Bring the peer up to date first, then measure one fresh edit.
-    let (_, fresh) = db.update_record("r00000001", json!({"remote": "one edit"})).unwrap();
-    checkpoint(&peer);
-    let rows0 = peer.total_changes();
-    let t = Instant::now();
-    peer.apply_remote_update("bench", &fresh).unwrap();
-    let mut remote = vec![t.elapsed()];
-    lanes.push(lane("remote apply (1-record delta)", &mut remote, peer.total_changes() - rows0, wal_bytes(&peer), fresh.len() as u64));
-
-    // ── duplicate delivery of that same delta (already converged) ───────────
-    checkpoint(&peer);
-    let rows0 = peer.total_changes();
-    let t = Instant::now();
-    peer.apply_remote_update("bench", &fresh).unwrap();
-    let mut dup = vec![t.elapsed()];
-    lanes.push(lane("duplicate remote apply (no-op delta)", &mut dup, peer.total_changes() - rows0, wal_bytes(&peer), fresh.len() as u64));
+    // ── duplicate delivery of those same deltas (already converged) ─────────
+    let mut dup = Vec::new();
+    let mut dup_rows = 0u64;
+    let mut dup_wal = 0u64;
+    for fresh in &deltas {
+        checkpoint(&peer);
+        let rows0 = peer.total_changes();
+        let t = Instant::now();
+        peer.apply_remote_update("bench", fresh).unwrap();
+        dup.push(t.elapsed());
+        dup_rows += peer.total_changes() - rows0;
+        dup_wal += wal_bytes(&peer);
+    }
+    lanes.push(lane("duplicate remote apply (no-op delta)", &mut dup, dup_rows, dup_wal, remote_delta));
     let _ = last_delta;
 
-    // ── restart: cold open + first collection read ──────────────────────────
+    // ── restart: cold open + first collection read (SAMPLES reopens) ────────
     let path = db.path().clone();
     drop(db);
-    let t = Instant::now();
-    let cold = XdbDatabase::open(path).unwrap();
-    let _ = cold.get_collection("bench").unwrap();
-    let mut restart = vec![t.elapsed()];
+    let mut restart = Vec::new();
+    let mut cold = XdbDatabase::open(path.clone()).unwrap();
+    for _ in 0..SAMPLES {
+        drop(cold);
+        let t = Instant::now();
+        cold = XdbDatabase::open(path.clone()).unwrap();
+        let _ = cold.get_collection("bench").unwrap();
+        restart.push(t.elapsed());
+    }
     lanes.push(lane("restart (open + read collection)", &mut restart, 0, 0, 0));
 
     // ── compaction proxy: checkpoint + VACUUM ────────────────────────────────

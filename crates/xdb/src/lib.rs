@@ -74,6 +74,7 @@ pub use db::{
 
 #[cfg(feature = "tauri-commands")]
 pub use tauri::{
+    PendingRestore,
     DbManager, ImportOutcome, NetworkControl, NetworkSettings, NetworkStatus, SharedDbManager,
     SharedNetworkControl,
 };

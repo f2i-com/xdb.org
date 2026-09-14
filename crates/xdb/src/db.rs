@@ -121,7 +121,20 @@ impl XdbDatabase {
         // when other connections read the same database.
         conn.pragma_update(None, "journal_mode", "WAL")?;
 
-        // Initialize schema
+        Self::initialize_schema(&conn)?;
+
+        Ok(Self {
+            conn,
+            docs: HashMap::new(),
+            db_path: path,
+        })
+    }
+
+    /// Create or migrate the schema on a connection. Every statement is
+    /// idempotent, so this doubles as the forward migration for a snapshot
+    /// taken by an older revision (R2-XD-03: a restored legacy file must get
+    /// the tables this revision relies on BEFORE it becomes the live database).
+    fn initialize_schema(conn: &Connection) -> DbResult<()> {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS records (
@@ -161,12 +174,20 @@ impl XdbDatabase {
             );
             "#,
         )?;
+        Ok(())
+    }
 
-        Ok(Self {
-            conn,
-            docs: HashMap::new(),
-            db_path: path,
-        })
+    /// Tables this revision requires; a snapshot lacking any of them is a
+    /// legacy snapshot that `replace_from_file` migrates in staging first.
+    const REQUIRED_TABLES: [&'static str; 4] =
+        ["records", "crdt_state", "sync_log", "collection_epochs"];
+
+    fn table_names(conn: &Connection) -> DbResult<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
     }
 
     /// Get the database file path
@@ -183,12 +204,37 @@ impl XdbDatabase {
     }
 
     /// Restore a validated XDB snapshot, including committed WAL contents.
-    /// SQLite's backup API keeps the current connection usable if restore fails.
+    ///
+    /// The source file is never modified. It is first copied into a private
+    /// STAGING database next to the live file; the staging copy is migrated to
+    /// this revision's schema (idempotent `initialize_schema`) and validated
+    /// (core tables, every record row, every saved CRDT document); only then is
+    /// it copied over the live connection with SQLite's backup API, which keeps
+    /// the current database intact if any step fails (R2-XD-03). Cached CRDT
+    /// documents are dropped so the next access reads the restored state.
     pub fn replace_from_file(&mut self, source_path: &PathBuf) -> DbResult<()> {
         self.require_autocommit("import")?;
         self.require_distinct_path(source_path)?;
+        let staging_path = self
+            .db_path
+            .with_extension(format!("restore-staging-{}", Uuid::new_v4().simple()));
+        let result = self.replace_from_file_staged(source_path, &staging_path);
+        // The staging copy is a temporary; remove it (and its journals) whatever happened.
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut path = staging_path.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    fn replace_from_file_staged(
+        &mut self,
+        source_path: &PathBuf,
+        staging_path: &PathBuf,
+    ) -> DbResult<()> {
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        // Hold one read snapshot through validation and restore.
+        // Hold one read snapshot through validation and copy.
         source.execute_batch("BEGIN")?;
         let integrity: String = source.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
         if integrity != "ok" {
@@ -196,47 +242,153 @@ impl XdbDatabase {
                 "Invalid SQLite snapshot: {integrity}"
             )));
         }
-        source.prepare(
+        // The core tables every supported snapshot revision has; newer tables
+        // (collection_epochs) are added by the staging migration below.
+        for table in ["records", "crdt_state", "sync_log"] {
+            if !Self::table_names(&source)?.iter().any(|t| t == table) {
+                return Err(DbError::InvalidOperation(format!(
+                    "Unsupported snapshot: missing table '{table}'"
+                )));
+            }
+        }
+
+        // 1. Copy the immutable source into a private staging database.
+        let mut staging = Connection::open(staging_path)?;
+        {
+            let backup = Backup::new(&source, &mut staging)?;
+            if backup.step(-1)? != StepResult::Done {
+                return Err(DbError::InvalidOperation(
+                    "Snapshot is busy; try importing again".into(),
+                ));
+            }
+        }
+        drop(source);
+
+        // 2. Migrate the staging copy forward and validate it completely.
+        Self::initialize_schema(&staging)?;
+        let tables = Self::table_names(&staging)?;
+        for table in Self::REQUIRED_TABLES {
+            if !tables.iter().any(|t| t == table) {
+                return Err(DbError::InvalidOperation(format!(
+                    "Snapshot migration did not produce table '{table}'"
+                )));
+            }
+        }
+        staging.prepare(
             "SELECT id, collection, data, created_at, updated_at, deleted FROM records LIMIT 0",
         )?;
-        source.prepare("SELECT collection, state_vector, doc_state FROM crdt_state LIMIT 0")?;
-        source.prepare(
+        staging.prepare("SELECT collection, state_vector, doc_state FROM crdt_state LIMIT 0")?;
+        staging.prepare(
             "SELECT id, peer_id, collection, timestamp, update_data FROM sync_log LIMIT 0",
         )?;
-        let mut records = source
-            .prepare("SELECT id, collection, data, created_at, updated_at, deleted FROM records")?;
-        for record in records.query_map([], record_from_row)? {
-            record?;
-        }
-        let mut states =
-            source.prepare("SELECT collection, state_vector, doc_state FROM crdt_state")?;
-        let snapshots = states.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        for snapshot in snapshots {
-            let (collection, state_vector, doc_state) = snapshot?;
-            yrs::StateVector::decode_v1(&state_vector).map_err(|e| DbError::Crdt(e.to_string()))?;
-            let update = Update::decode_v1(&doc_state).map_err(|e| DbError::Crdt(e.to_string()))?;
-            let doc = Doc::new();
-            doc.transact_mut()
-                .apply_update(update)
-                .map_err(|e| DbError::Crdt(e.to_string()))?;
-            Self::records_from_doc(&collection, &doc)?;
-        }
+        staging.prepare("SELECT collection, epoch, origin, reset_at FROM collection_epochs LIMIT 0")?;
         {
-            let backup = Backup::new(&source, &mut self.conn)?;
+            let mut records = staging
+                .prepare("SELECT id, collection, data, created_at, updated_at, deleted FROM records")?;
+            for record in records.query_map([], record_from_row)? {
+                record?;
+            }
+            let mut states =
+                staging.prepare("SELECT collection, state_vector, doc_state FROM crdt_state")?;
+            let snapshots = states.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            for snapshot in snapshots {
+                let (collection, state_vector, doc_state) = snapshot?;
+                yrs::StateVector::decode_v1(&state_vector)
+                    .map_err(|e| DbError::Crdt(e.to_string()))?;
+                let update =
+                    Update::decode_v1(&doc_state).map_err(|e| DbError::Crdt(e.to_string()))?;
+                let doc = Doc::new();
+                doc.transact_mut()
+                    .apply_update(update)
+                    .map_err(|e| DbError::Crdt(e.to_string()))?;
+                Self::records_from_doc(&collection, &doc)?;
+            }
+        }
+
+        // 3. Only a migrated, validated copy replaces the live database.
+        {
+            let backup = Backup::new(&staging, &mut self.conn)?;
             if backup.step(-1)? != StepResult::Done {
                 return Err(DbError::InvalidOperation(
                     "Database is busy; try importing again".into(),
                 ));
             }
         }
+        drop(staging);
         self.docs.clear();
         Ok(())
+    }
+
+    /// Every collection this database knows about: those with records AND
+    /// those that only have an epoch row (reset to empty, or absent from a
+    /// restored snapshot but still needing authority) — R2-XD-02.
+    pub fn catalog(&self) -> DbResult<HashMap<String, u64>> {
+        let mut catalog: HashMap<String, u64> = HashMap::new();
+        for collection in self.get_collections()? {
+            catalog.insert(collection, 0);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT collection, epoch FROM collection_epochs")?;
+        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))? {
+            let (collection, epoch) = row?;
+            catalog.insert(collection, epoch.max(0) as u64);
+        }
+        Ok(catalog)
+    }
+
+    /// Restore a snapshot as the AUTHORITATIVE shared state (replace scope,
+    /// R2-XD-02). The reset plan is computed over the union of the pre-restore
+    /// catalog and the restored one: every collection's new epoch exceeds both
+    /// its live pre-restore epoch and the snapshot's, so an older backup can
+    /// never announce a generation below what peers already hold; collections
+    /// intentionally absent from the snapshot get a reset epoch too, so peers
+    /// clear them instead of rediscovering them. The restore and the epoch
+    /// plan commit as one recoverable step: the caller persists the returned
+    /// plan before publishing it, and re-applies it after an interruption.
+    pub fn replace_from_file_authoritative(
+        &mut self,
+        source_path: &PathBuf,
+        origin: &str,
+    ) -> DbResult<Vec<(String, u64)>> {
+        let before = self.catalog()?;
+        self.replace_from_file(source_path)?;
+        let restored = self.catalog()?;
+        let mut union: Vec<String> = before.keys().chain(restored.keys()).cloned().collect();
+        union.sort();
+        union.dedup();
+        let origin = origin.to_string();
+        self.with_transaction(|this| {
+            let mut plan = Vec::with_capacity(union.len());
+            for collection in &union {
+                let live = before.get(collection).copied().unwrap_or(0);
+                let snapshot = restored.get(collection).copied().unwrap_or(0);
+                let epoch = live.max(snapshot) + 1;
+                this.set_epoch(collection, epoch, &origin)?;
+                plan.push((collection.clone(), epoch));
+            }
+            Ok(plan)
+        })
+    }
+
+    /// Re-apply a persisted reset plan (after an interrupted authoritative
+    /// restore): epochs only ever move forward, so this is idempotent.
+    pub fn apply_reset_plan(&mut self, plan: &[(String, u64)], origin: &str) -> DbResult<()> {
+        let origin = origin.to_string();
+        self.with_transaction(|this| {
+            for (collection, epoch) in plan {
+                if this.get_epoch(collection)? < *epoch {
+                    this.set_epoch(collection, *epoch, &origin)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Execute a closure atomically, rolling back both SQLite and cached CRDT state.
