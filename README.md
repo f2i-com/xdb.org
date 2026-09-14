@@ -40,7 +40,8 @@ A record contains `id`, `collection`, `data`, `created_at`, `updated_at` and `de
 - `update_record` shallow-merges object fields; a non-object payload replaces `data`.
 - `delete_record` writes a tombstone. `get_collection` hides deleted records; the lower-level `get_record` can return a tombstone.
 - `clear_collection` is a LOCAL hard reset, not a replicated deletion: peers repopulate this node on the next reconciliation. A replicated deletion is a tombstone (`delete_record`, or `import_records` with `replace`). An authoritative reset of a shared collection is `reset_collection` with scope `replicated`: it advances the collection's reset epoch, which every sync message carries; peers adopt the reset and updates from peers still on the old epoch are rejected.
-- `import_database` takes a `scope`: `local` (this node only; synchronization pauses until `resume_sync`), `fork` (a new isolated namespace with a collision-resistant identity) or `replace` (this data becomes authoritative for peers through reset epochs).
+- `import_database` takes a `scope`: `local` (this node only; synchronization pauses until `resume_sync`), `fork` (a new isolated namespace whose directory is reserved atomically) or `replace` (this data becomes authoritative for peers through reset epochs, activated together with the data in one step). The pending-restore record is a recovery journal (`phase`, backup, source, plan) written before anything is replaced.
+- `resume_sync` refuses an unreadable record or a restore interrupted before it was applied; `recover_restore` (`action`: `rollback` | `complete` | `discard`) resolves those explicitly. While paused, no inbound update, reset or request is applied or answered and no reconciliation runs; see the policy document.
 - `import_records` imports several collections in one transaction and returns its summary only after the commit.
 - Tombstones and epochs are retained indefinitely; there is no compaction that could make a rejoining peer diverge silently.
 - `with_transaction` groups SQLite and CRDT changes. Publish returned deltas only after the containing transaction succeeds.
@@ -121,6 +122,7 @@ Core methods include:
 | `with_transaction` | Run a group of operations in one transaction. |
 | `get_full_state`, `get_state_vector`, `get_updates_since`, `apply_remote_update` | Integrate a host's synchronization transport. |
 | `export_to_file`, `replace_from_file` | Export and restore SQLite storage. |
+| `plan_authoritative_restore`, `apply_authoritative_restore`, `replace_from_file_authoritative` | Compute the reset plan without touching the live database, then activate snapshot and epochs in one step (R3-XD-02). |
 | `clear_collection`, `get_stats` | Local reset of a collection or inspect database statistics. |
 | `import_records` | Import several collections in ONE transaction; summary returned after the commit (SN-01). |
 | `update_records` | Update several records in ONE transaction with one CRDT snapshot per touched collection; all-or-nothing (XD-04). |
@@ -214,7 +216,7 @@ Database commands accept optional `appId`:
 - CRUD: `create_record`, `update_record`, `delete_record`, `upsert_record`; `update_records` batches updates in one transaction.
 - Reads: `get_record`, `get_collection`, `get_collections`, `get_db_stats`, `get_db_path`.
 - Maintenance: `clear_collection` (local), `reset_collection` (`scope`: `local` | `replicated`), `import_records`, `export_database`, `import_database` (`scope`: `local` | `fork` | `replace`).
-- Synchronization (default scope only): `request_sync`, `reconcile_network`, `resume_sync`.
+- Synchronization (default scope only): `request_sync`, `reconcile_network`, `resume_sync`, `recover_restore` (`action`: `rollback` | `complete` | `discard`).
 - Networking policy: `get_network_settings`, `set_network_enabled` (persisted opt-in; local-only by default).
 
 `get_network_status` reports the shared default network honestly: `mode`, `enabled`, `discovery`, `listening`, `is_running`, `sync_paused` and `stats` (see the policy document). `get_db_base_dir` reports the directory containing app databases. Register additional commands explicitly if your application uses more than the demo does.

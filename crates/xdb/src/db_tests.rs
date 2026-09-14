@@ -812,3 +812,78 @@ fn update_records_commits_all_or_nothing_with_one_snapshot_per_collection() {
         .iter()
         .all(|r| r.data["edited"] == true));
 }
+
+
+// ── R3-XD-02: restored data and reset epochs activate in one step, or not at all ──
+
+#[test]
+fn authoritative_restore_activates_data_and_epochs_together_or_leaves_the_live_database_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("earlier.sqlite");
+    {
+        let mut db = database(&dir, "earlier.sqlite");
+        db.create_record("notes", json!({"title": "from backup"})).unwrap();
+        assert_eq!(db.reset_collection("notes", "a").unwrap(), 1);
+        db.create_record("notes", json!({"title": "post-reset in backup"})).unwrap();
+    }
+    let mut live = database(&dir, "live.sqlite");
+    live.create_record("notes", json!({"title": "live"})).unwrap();
+    for _ in 0..5 {
+        live.bump_epoch("notes", "live").unwrap();
+    }
+    live.create_record("tasks", json!({"title": "only live has tasks"})).unwrap();
+    let live_before = (live.catalog().unwrap(), live_ids(&live, "notes"), live_ids(&live, "tasks"));
+
+    // The plan is computed without touching anything.
+    let planned = live.plan_authoritative_restore(&backup).unwrap();
+    let plan: HashMap<String, u64> = planned.plan.iter().cloned().collect();
+    assert_eq!(plan.get("notes"), Some(&6));
+    assert_eq!(plan.get("tasks"), Some(&1));
+    assert_eq!(planned.prior.iter().cloned().collect::<HashMap<_, _>>(), live_before.0);
+    assert_eq!((live.catalog().unwrap(), live_ids(&live, "notes"), live_ids(&live, "tasks")), live_before);
+
+    // Interruption between staging validation and activation: nothing live changes,
+    // neither records nor the catalog, and the staging temporary is gone.
+    let failed = live.apply_authoritative_restore_with(&backup, &planned.plan, "restore", |staging| {
+        // The staging copy already carries data AND the plan at this point.
+        let epoch: i64 = staging
+            .query_row("SELECT epoch FROM collection_epochs WHERE collection = 'notes'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(epoch, 6);
+        Err(DbError::InvalidOperation("power loss before activation".into()))
+    });
+    assert!(matches!(failed, Err(DbError::InvalidOperation(m)) if m.contains("power loss")));
+    assert_eq!((live.catalog().unwrap(), live_ids(&live, "notes"), live_ids(&live, "tasks")), live_before);
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("restore-staging")),
+        "no staging temporary survives a failed activation"
+    );
+
+    // A journaled plan that no longer exceeds the live generation is refused untouched.
+    live.bump_epoch("notes", "moved on").unwrap();
+    let stale = live.apply_authoritative_restore(&backup, &planned.plan, "restore");
+    assert!(matches!(stale, Err(DbError::InvalidOperation(m)) if m.contains("Stale reset plan")));
+    assert_eq!(live.get_epoch("notes").unwrap(), 6);
+    assert_eq!(live_ids(&live, "notes"), live_before.1);
+    let missing = live.apply_authoritative_restore(&backup, &[("notes".into(), 9)], "restore");
+    assert!(matches!(missing, Err(DbError::InvalidOperation(m)) if m.contains("Incomplete reset plan")));
+
+    // Re-planned against the moved-on live state: data and epochs land together.
+    let replanned = live.plan_authoritative_restore(&backup).unwrap();
+    assert_eq!(replanned.plan.iter().find(|(c, _)| c == "notes").map(|(_, e)| *e), Some(7));
+    live.apply_authoritative_restore(&backup, &replanned.plan, "restore").unwrap();
+    assert_eq!(live.get_epoch("notes").unwrap(), 7);
+    assert_eq!(live.get_epoch("tasks").unwrap(), 1);
+    assert_eq!(live_ids(&live, "notes").len(), 1);
+    assert!(live.get_collection("tasks").unwrap().is_empty());
+    // Applying the same journaled plan again (a retry after a crash between
+    // activation and the journal update) is idempotent: the live state now
+    // equals the snapshot plus that plan, so the plan still qualifies.
+    live.apply_authoritative_restore(&backup, &replanned.plan, "restore").unwrap();
+    assert_eq!(live.get_epoch("notes").unwrap(), 7);
+    // A reopened database sees the same consistent pair.
+    drop(live);
+    let reopened = database(&dir, "live.sqlite");
+    assert_eq!(reopened.get_epoch("notes").unwrap(), 7);
+    assert_eq!(live_ids(&reopened, "notes").len(), 1);
+}

@@ -24,7 +24,7 @@
 //!   never a single "synced" boolean. Queueing a publish is not peer receipt,
 //!   and peer receipt is not peer persistence.
 
-use crate::db::{RemoteApplyOutcome, SharedDb};
+use crate::db::{RemoteApplyOutcome, SharedDb, XdbDatabase};
 use futures::StreamExt;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode},
@@ -167,6 +167,26 @@ pub struct SyncGate {
     paused: AtomicBool,
 }
 
+/// Everything the event loop can do that touches protected data or asks a
+/// peer to (R3-XD-01). The gate decides each of them in ONE place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncActivity {
+    /// Apply an inbound update or sync response to the database.
+    ApplyUpdate,
+    /// Adopt an inbound collection reset (clears local state).
+    ApplyReset,
+    /// Answer a peer's sync request with local data (and possibly a reset).
+    AnswerRequest,
+    /// Announce local collections and request data from peers (join, repair,
+    /// reconnect, the Reconcile command, a peer's announce).
+    Reconcile,
+    /// Publish a locally committed update.
+    PublishUpdate,
+    /// Publish a committed reset plan: this IS the resolution of a `replace`
+    /// restore, so it is the one data-bearing message allowed while paused.
+    PublishReset,
+}
+
 impl SyncGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -179,6 +199,18 @@ impl SyncGate {
     }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    /// The synchronization policy while a restore is unresolved (R3-XD-01):
+    /// nothing reads, writes, requests or answers protected data. Connection
+    /// bookkeeping (mDNS, connect/disconnect events) is not an activity here
+    /// and continues; the only data-bearing message that may leave is the
+    /// committed reset plan that resolves a `replace` restore.
+    pub fn permits(&self, activity: SyncActivity) -> bool {
+        if !self.is_paused() {
+            return true;
+        }
+        matches!(activity, SyncActivity::PublishReset)
     }
 }
 
@@ -270,6 +302,15 @@ fn publish_message(
         }
     }
     outcome
+}
+
+/// Which gate activity an outbound message is (R3-XD-01).
+fn publish_activity(message: &NetworkMessage) -> SyncActivity {
+    match message {
+        NetworkMessage::CollectionReset { .. } => SyncActivity::PublishReset,
+        NetworkMessage::SyncUpdate { .. } | NetworkMessage::SyncResponse { .. } => SyncActivity::PublishUpdate,
+        NetworkMessage::SyncRequest { .. } | NetworkMessage::PeerAnnounce { .. } => SyncActivity::Reconcile,
+    }
 }
 
 fn connection_event(
@@ -431,6 +472,7 @@ impl NetworkNode {
 
     /// Announce local collections and request reconciliation for each of them
     /// (bounded). Returns the number of requests queued.
+    #[allow(clippy::too_many_arguments)]
     fn reconcile_locally(
         swarm: &mut Swarm<XdbBehaviour>,
         topic: &IdentTopic,
@@ -439,7 +481,12 @@ impl NetworkNode {
         stats: &Arc<StdMutex<SyncStats>>,
         collections: &[String],
         announce: bool,
+        gate: &Arc<SyncGate>,
     ) -> usize {
+        if !gate.permits(SyncActivity::Reconcile) {
+            debug!("Synchronization paused; not announcing or requesting {} collections", collections.len());
+            return 0;
+        }
         let plan = match db.lock() {
             Ok(mut db_lock) => {
                 let mut plan = Vec::with_capacity(collections.len());
@@ -513,11 +560,8 @@ impl NetworkNode {
         gate: &Arc<SyncGate>,
         response: bool,
     ) -> bool {
-        if gate.is_paused() {
-            if let Ok(mut s) = stats.lock() {
-                s.updates_skipped_paused += 1;
-            }
-            debug!("Synchronization paused; holding update for {}", collection);
+        if !gate.permits(SyncActivity::ApplyUpdate) {
+            Self::hold_paused(stats, collection);
             return false;
         }
         let mut db_lock = match db.lock() {
@@ -527,6 +571,35 @@ impl NetworkNode {
                 return false;
             }
         };
+        Self::apply_inbound_locked(&mut db_lock, collection, epoch, update, author, stats, gate, response)
+    }
+
+    fn hold_paused(stats: &Arc<StdMutex<SyncStats>>, collection: &str) {
+        if let Ok(mut s) = stats.lock() {
+            s.updates_skipped_paused += 1;
+        }
+        debug!("Synchronization paused; holding update for {}", collection);
+    }
+
+    /// The part of `apply_inbound` that runs under the database lock. The
+    /// gate is checked AGAIN here (R3-XD-01): a restore that paused the gate
+    /// while this update was waiting for the lock takes precedence, because
+    /// the pause and the replacement are decided under this same mutex.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_inbound_locked(
+        db_lock: &mut XdbDatabase,
+        collection: &str,
+        epoch: u64,
+        update: &[u8],
+        author: &str,
+        stats: &Arc<StdMutex<SyncStats>>,
+        gate: &Arc<SyncGate>,
+        response: bool,
+    ) -> bool {
+        if !gate.permits(SyncActivity::ApplyUpdate) {
+            Self::hold_paused(stats, collection);
+            return false;
+        }
         for _attempt in 0..2 {
             match db_lock.apply_remote_update_at_epoch(collection, epoch, update) {
                 Ok(RemoteApplyOutcome::Applied(_)) => {
@@ -579,6 +652,47 @@ impl NetworkNode {
         false
     }
 
+    /// Adopt an inbound reset under the gate, re-checked under the database
+    /// lock (R3-XD-01). Returns true when the reset was applied.
+    fn apply_inbound_reset(
+        db: &SharedDb,
+        collection: &str,
+        epoch: u64,
+        author: &str,
+        stats: &Arc<StdMutex<SyncStats>>,
+        gate: &Arc<SyncGate>,
+    ) -> bool {
+        if !gate.permits(SyncActivity::ApplyReset) {
+            Self::hold_paused(stats, collection);
+            return false;
+        }
+        let applied = match db.lock() {
+            Ok(mut db_lock) => {
+                if !gate.permits(SyncActivity::ApplyReset) {
+                    Self::hold_paused(stats, collection);
+                    return false;
+                }
+                match db_lock.apply_remote_reset(collection, epoch, author) {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        error!("Failed to apply reset for {}: {}", collection, e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                error!("DB lock poisoned, dropping reset for {}: {}", collection, e);
+                false
+            }
+        };
+        if applied {
+            if let Ok(mut s) = stats.lock() {
+                s.resets_applied += 1;
+            }
+        }
+        applied
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_event_loop(
         mut swarm: Swarm<XdbBehaviour>,
@@ -603,9 +717,12 @@ impl NetworkNode {
                     if connected_peers.lock().await.is_empty() {
                         continue;
                     }
+                    if !gate.permits(SyncActivity::Reconcile) {
+                        continue;
+                    }
                     let all = Self::local_collections(&db);
                     let window = repair_window(&all, &mut repair_cursor, REPAIR_BATCH);
-                    Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &window, true);
+                    Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &window, true, &gate);
                     if let Ok(mut s) = stats.lock() {
                         let now = now_rfc3339();
                         s.last_repair_at = Some(now.clone());
@@ -667,12 +784,16 @@ impl NetworkNode {
                                         }
                                         NetworkMessage::SyncRequest { collection, state_vector, requester_id, epoch } => {
                                             info!("Received sync request for collection: {}", collection);
-                                            if gate.is_paused() {
+                                            if !gate.permits(SyncActivity::AnswerRequest) {
                                                 debug!("Synchronization paused; not answering request for {}", collection);
                                                 continue;
                                             }
                                             let reply = match db.lock() {
                                                 Ok(mut db_lock) => {
+                                                    // Re-checked under the lock (R3-XD-01).
+                                                    if !gate.permits(SyncActivity::AnswerRequest) {
+                                                        continue;
+                                                    }
                                                     let local_epoch = db_lock.get_epoch(collection).unwrap_or(0);
                                                     if *epoch < local_epoch {
                                                         // The requester is behind a reset: tell it, then
@@ -736,35 +857,16 @@ impl NetworkNode {
                                             // Discover collections this node has never seen: an
                                             // unknown collection gets an empty state vector, which
                                             // asks the peer for everything (audit XD-02).
-                                            if gate.is_paused() {
-                                                continue;
-                                            }
                                             let wanted: Vec<String> = collections.iter().take(MAX_COLLECTIONS_PER_PASS).cloned().collect();
-                                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &wanted, false);
+                                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &wanted, false, &gate);
                                             continue;
                                         }
                                         NetworkMessage::CollectionReset { collection, epoch, .. } => {
-                                            let applied = match db.lock() {
-                                                Ok(mut db_lock) => match db_lock.apply_remote_reset(collection, *epoch, &author_id) {
-                                                    Ok(applied) => applied,
-                                                    Err(e) => {
-                                                        error!("Failed to apply reset for {}: {}", collection, e);
-                                                        false
-                                                    }
-                                                },
-                                                Err(e) => {
-                                                    error!("DB lock poisoned, dropping reset for {}: {}", collection, e);
-                                                    false
-                                                }
-                                            };
-                                            if !applied {
+                                            if !Self::apply_inbound_reset(&db, collection, *epoch, &author_id, &stats, &gate) {
                                                 continue;
                                             }
-                                            if let Ok(mut s) = stats.lock() {
-                                                s.resets_applied += 1;
-                                            }
                                             // Fetch the post-reset state from the origin.
-                                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, std::slice::from_ref(collection), false);
+                                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, std::slice::from_ref(collection), false, &gate);
                                         }
                                     }
                                     let _ = event_tx.send(NetworkEvent::MessageReceived(msg));
@@ -788,10 +890,14 @@ impl NetworkNode {
                             if let Some(event) = event {
                                 // Join reconciliation (audit XD-02): announce and request every
                                 // local collection as soon as a NEW peer is connected.
-                                let all = Self::local_collections(&db);
-                                Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &all, true);
-                                if let Ok(mut s) = stats.lock() {
-                                    s.last_announce_at = Some(now_rfc3339());
+                                // While a restore is unresolved the connection is kept but
+                                // nothing is announced or requested (R3-XD-01).
+                                if gate.permits(SyncActivity::Reconcile) {
+                                    let all = Self::local_collections(&db);
+                                    Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &all, true, &gate);
+                                    if let Ok(mut s) = stats.lock() {
+                                        s.last_announce_at = Some(now_rfc3339());
+                                    }
                                 }
                                 let _ = event_tx.send(event);
                             }
@@ -816,11 +922,22 @@ impl NetworkNode {
                 command = command_rx.recv() => {
                     match command {
                         Some(NetworkCommand::Publish { message }) => {
+                            if !gate.permits(publish_activity(&message)) {
+                                debug!("Synchronization paused; not publishing {:?}", message.collection());
+                                if let Ok(mut s) = stats.lock() {
+                                    s.updates_skipped_paused += 1;
+                                }
+                                continue;
+                            }
                             publish_message(&mut swarm.behaviour_mut().gossipsub, &topic, &message, &stats);
                         }
                         Some(NetworkCommand::Reconcile) => {
+                            if !gate.permits(SyncActivity::Reconcile) {
+                                debug!("Synchronization paused; ignoring reconcile request");
+                                continue;
+                            }
                             let all = Self::local_collections(&db);
-                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &all, true);
+                            Self::reconcile_locally(&mut swarm, &topic, &db, &local_peer_id, &stats, &all, true, &gate);
                             if let Ok(mut s) = stats.lock() {
                                 s.last_announce_at = Some(now_rfc3339());
                             }
@@ -1015,6 +1132,102 @@ mod tests {
         assert!(!node.is_running());
         assert!(node.broadcast_update("notes", 0, vec![]).await.is_err());
         assert!(node.reconcile().await.is_err());
+    }
+
+    // ── R3-XD-01: one policy for every activity while a restore is unresolved ──
+
+    #[test]
+    fn a_paused_gate_permits_only_publishing_the_committed_reset_plan() {
+        let gate = SyncGate::new();
+        let all = [
+            SyncActivity::ApplyUpdate,
+            SyncActivity::ApplyReset,
+            SyncActivity::AnswerRequest,
+            SyncActivity::Reconcile,
+            SyncActivity::PublishUpdate,
+            SyncActivity::PublishReset,
+        ];
+        for activity in all {
+            assert!(gate.permits(activity), "{activity:?} is allowed while open");
+        }
+        gate.pause();
+        for activity in all {
+            assert_eq!(gate.permits(activity), activity == SyncActivity::PublishReset, "{activity:?} while paused");
+        }
+        gate.resume();
+        assert!(gate.permits(SyncActivity::ApplyUpdate));
+
+        let author = PeerId::random().to_string();
+        assert_eq!(publish_activity(&NetworkMessage::CollectionReset { collection: "n".into(), epoch: 1, origin_id: author.clone() }), SyncActivity::PublishReset);
+        assert_eq!(publish_activity(&NetworkMessage::SyncUpdate { collection: "n".into(), update: vec![], sender_id: author.clone(), epoch: 0 }), SyncActivity::PublishUpdate);
+        assert_eq!(publish_activity(&NetworkMessage::SyncResponse { collection: "n".into(), update: vec![], requester_id: author.clone(), responder_id: author.clone(), epoch: 0 }), SyncActivity::PublishUpdate);
+        assert_eq!(publish_activity(&NetworkMessage::SyncRequest { collection: "n".into(), state_vector: vec![], requester_id: author.clone(), epoch: 0 }), SyncActivity::Reconcile);
+        assert_eq!(publish_activity(&NetworkMessage::PeerAnnounce { peer_id: author, collections: vec![] }), SyncActivity::Reconcile);
+    }
+
+    fn peer_update(dir: &tempfile::TempDir, collection: &str) -> Vec<u8> {
+        let mut peer = crate::db::XdbDatabase::open(dir.path().join("peer.sqlite")).unwrap();
+        peer.create_record(collection, serde_json::json!({"title": "from peer"})).unwrap();
+        peer.get_full_state(collection).unwrap()
+    }
+
+    #[test]
+    fn an_update_waiting_for_the_database_lock_is_held_when_the_pause_lands_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let update = peer_update(&dir, "notes");
+        let stats = Arc::new(StdMutex::new(SyncStats::default()));
+        let gate = SyncGate::new();
+
+        // The gate is OPEN when the update arrives, so the pre-check passes;
+        // the update then waits for the database lock, which the test holds.
+        let guard = db.lock().unwrap();
+        let worker = {
+            let (db, update, stats, gate) = (db.clone(), update.clone(), stats.clone(), gate.clone());
+            std::thread::spawn(move || NetworkNode::apply_inbound(&db, "notes", 0, &update, "peer", &stats, &gate, false))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A restore pauses the gate while the update is still waiting.
+        gate.pause();
+        drop(guard);
+        assert!(!worker.join().unwrap(), "the pause that landed first wins");
+        assert!(db.lock().unwrap().get_collection("notes").unwrap().is_empty(), "protected data unchanged");
+        assert_eq!(stats.lock().unwrap().updates_skipped_paused, 1);
+        assert_eq!(stats.lock().unwrap().updates_applied, 0);
+
+        // The same decision, exercised directly under a held lock.
+        {
+            let mut locked = db.lock().unwrap();
+            assert!(!NetworkNode::apply_inbound_locked(&mut locked, "notes", 0, &update, "peer", &stats, &gate, true));
+            assert!(locked.get_collection("notes").unwrap().is_empty());
+        }
+        assert_eq!(stats.lock().unwrap().updates_skipped_paused, 2);
+
+        // Resolution lifts the hold: the held update is not lost, the repair
+        // pass re-fetches it, and a fresh delivery applies.
+        gate.resume();
+        assert!(NetworkNode::apply_inbound(&db, "notes", 0, &update, "peer", &stats, &gate, false));
+        assert_eq!(db.lock().unwrap().get_collection("notes").unwrap().len(), 1);
+        assert_eq!(stats.lock().unwrap().updates_applied, 1);
+    }
+
+    #[test]
+    fn inbound_resets_are_held_while_paused_and_adopted_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        db.lock().unwrap().create_record("notes", serde_json::json!({"title": "local"})).unwrap();
+        let stats = Arc::new(StdMutex::new(SyncStats::default()));
+        let gate = SyncGate::new();
+        gate.pause();
+        assert!(!NetworkNode::apply_inbound_reset(&db, "notes", 3, "peer", &stats, &gate));
+        assert_eq!(db.lock().unwrap().get_epoch("notes").unwrap(), 0, "no reset adopted while paused");
+        assert_eq!(db.lock().unwrap().get_collection("notes").unwrap().len(), 1, "local records untouched");
+        assert_eq!(stats.lock().unwrap().updates_skipped_paused, 1);
+        assert_eq!(stats.lock().unwrap().resets_applied, 0);
+        gate.resume();
+        assert!(NetworkNode::apply_inbound_reset(&db, "notes", 3, "peer", &stats, &gate));
+        assert_eq!(db.lock().unwrap().get_epoch("notes").unwrap(), 3);
+        assert_eq!(stats.lock().unwrap().resets_applied, 1);
     }
 
     #[test]

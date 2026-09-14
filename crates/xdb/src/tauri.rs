@@ -168,6 +168,23 @@ pub struct PendingRestore {
     pub reset_plan: Vec<(String, u64)>,
     #[serde(default)]
     pub backup_path: Option<String>,
+    /// Recovery journal (R3-XD-02), written BEFORE the live database is touched:
+    /// `"planned"` (backup taken and plan computed, nothing replaced yet),
+    /// `"applied"` (data and reset epochs activated in one step). Empty in
+    /// records written before this field existed; see `phase()`.
+    #[serde(default)]
+    pub phase: String,
+    /// The live catalog the plan was computed against.
+    #[serde(default)]
+    pub prior_catalog: Vec<(String, u64)>,
+    /// The snapshot being restored, so an interrupted restore can be completed.
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// Set when the record on disk could not be read or parsed (R3-XD-01): the
+    /// reason, for the operator. Such a record holds synchronization and can
+    /// only be discarded explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
 }
 
 impl PendingRestore {
@@ -177,22 +194,59 @@ impl PendingRestore {
         base_dir.join(Self::FILE_NAME)
     }
 
+    /// The recovery phase, also for records written before `phase` existed.
+    pub fn phase(&self) -> &str {
+        if !self.phase.is_empty() {
+            &self.phase
+        } else if self.applied {
+            "applied"
+        } else {
+            "planned"
+        }
+    }
+
+    /// Whether `resume_sync` may lift the pause: the restore completed
+    /// (data and metadata are consistent) and the record itself is readable.
+    pub fn is_resumable(&self) -> bool {
+        self.unreadable.is_none() && self.phase() == "applied"
+    }
+
+    fn unreadable(reason: String) -> Self {
+        PendingRestore {
+            app_id: "_default".into(),
+            scope: "unknown".into(),
+            started_at: String::new(),
+            applied: false,
+            reset_plan: Vec::new(),
+            backup_path: None,
+            phase: "unknown".into(),
+            prior_catalog: Vec::new(),
+            source_path: None,
+            unreadable: Some(reason),
+        }
+    }
+
+    /// Only a confirmed ABSENT file means "no pending restore" (R3-XD-01). A
+    /// file that exists but cannot be read (permissions, a directory in its
+    /// place, an I/O error) or parsed is returned as pending and `unreadable`,
+    /// because the safe reading of an unknown restore decision is "not decided".
     pub fn load(base_dir: &std::path::Path) -> Option<Self> {
-        let bytes = std::fs::read(Self::path(base_dir)).ok()?;
+        let path = Self::path(base_dir);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                let reason = format!("cannot read {}: {}", path.display(), e);
+                warn!("Pending-restore record unreadable; holding synchronization: {}", reason);
+                return Some(Self::unreadable(reason));
+            }
+        };
         match serde_json::from_slice::<PendingRestore>(&bytes) {
             Ok(pending) => Some(pending),
             Err(e) => {
-                // Unreadable pending state is treated as PENDING: the safe
-                // reading of an unknown restore decision is "not decided".
-                warn!("Unreadable pending-restore record; holding synchronization: {}", e);
-                Some(PendingRestore {
-                    app_id: "_default".into(),
-                    scope: "local".into(),
-                    started_at: String::new(),
-                    applied: true,
-                    reset_plan: Vec::new(),
-                    backup_path: None,
-                })
+                let reason = format!("cannot parse {}: {}", path.display(), e);
+                warn!("Pending-restore record unreadable; holding synchronization: {}", reason);
+                Some(Self::unreadable(reason))
             }
         }
     }
@@ -288,6 +342,109 @@ impl NetworkControl {
         self.gate.resume();
         Ok(())
     }
+
+    /// Whether `resume_sync` may lift the pause now (R3-XD-02). `Ok(None)`:
+    /// nothing is pending. `Ok(Some)`: the restore completed and may be
+    /// published/resolved. `Err`: the record is unreadable or the restore was
+    /// interrupted before it was applied; the pause stays and the error names
+    /// the recovery source and the actions `recover_restore` accepts.
+    pub fn resume_decision(&self) -> Result<Option<PendingRestore>, String> {
+        let Some(pending) = self.pending_restore() else {
+            return Ok(None);
+        };
+        if let Some(reason) = &pending.unreadable {
+            return Err(format!(
+                "Synchronization stays paused: the pending-restore record cannot be read ({reason}). Inspect the file; if the restore it recorded is known to be settled, call recover_restore with action \"discard\" to acknowledge it, otherwise restore the pre-restore backup by hand first"
+            ));
+        }
+        if pending.is_resumable() {
+            return Ok(Some(pending));
+        }
+        let backup = pending.backup_path.clone().unwrap_or_else(|| "(no backup was taken yet)".into());
+        Err(format!(
+            "Synchronization stays paused: the {} restore of '{}' started {} was interrupted before it was applied (phase {}). Its pre-restore backup is {}. Call recover_restore with action \"rollback\" (restore that backup) or \"complete\" (re-apply the journaled restore) before resuming",
+            pending.scope, pending.app_id, pending.started_at, pending.phase(), backup
+        ))
+    }
+
+    /// What `recover_restore` must do for `action` (R3-XD-02), decided from
+    /// the journal alone so the rule is testable without a database:
+    /// - `discard` acknowledges a record that changed nothing (unreadable, or
+    ///   planned before a backup was taken); a restore that touched data
+    ///   cannot be discarded.
+    /// - `rollback` restores the pre-restore backup, in every phase that has one.
+    /// - `complete` re-applies the journaled restore when it was interrupted
+    ///   before activation, or publishes/resolves an applied one.
+    pub fn recovery_plan(&self, action: &str) -> Result<RecoveryStep, String> {
+        let Some(pending) = self.pending_restore() else {
+            return Err("No restore is pending; nothing to recover".to_string());
+        };
+        // A readable record still in the `planned` phase with no backup taken
+        // means no byte of the live database has moved yet.
+        let nothing_changed =
+            pending.unreadable.is_none() && pending.phase() == "planned" && pending.backup_path.is_none();
+        match action {
+            "discard" => {
+                if pending.unreadable.is_some() || nothing_changed {
+                    Ok(RecoveryStep::Discard)
+                } else {
+                    Err(format!(
+                        "Refusing to discard: this {} restore (phase {}) changed or may have changed data; use \"rollback\" (backup {}) or \"complete\"",
+                        pending.scope,
+                        pending.phase(),
+                        pending.backup_path.clone().unwrap_or_default()
+                    ))
+                }
+            }
+            "rollback" => {
+                if let Some(reason) = &pending.unreadable {
+                    return Err(format!("The pending-restore record cannot be read ({reason}); no backup path is known. Restore by hand, then \"discard\""));
+                }
+                match &pending.backup_path {
+                    Some(backup) => Ok(RecoveryStep::Rollback { app_id: pending.app_id.clone(), backup: PathBuf::from(backup) }),
+                    None => Ok(RecoveryStep::Discard),
+                }
+            }
+            "complete" => {
+                if let Some(reason) = &pending.unreadable {
+                    return Err(format!("The pending-restore record cannot be read ({reason}); it cannot be completed"));
+                }
+                if pending.phase() == "applied" {
+                    return Ok(RecoveryStep::Publish { pending });
+                }
+                let Some(source) = &pending.source_path else {
+                    return Err("The journal has no source snapshot to complete from; use \"rollback\"".to_string());
+                };
+                if pending.scope == "replace" && pending.reset_plan.is_empty() {
+                    return Err("The journal has no reset plan to complete with; use \"rollback\"".to_string());
+                }
+                Ok(RecoveryStep::Complete { source: PathBuf::from(source), pending })
+            }
+            other => Err(format!("Unknown recovery action '{other}' (discard | rollback | complete)")),
+        }
+    }
+}
+
+/// One step `recover_restore` executes (R3-XD-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryStep {
+    /// Remove the record and lift the pause; nothing on disk changed.
+    Discard,
+    /// Restore the pre-restore backup, then resolve.
+    Rollback { app_id: String, backup: PathBuf },
+    /// Re-apply the journaled restore (data + plan in one step), then publish/resolve.
+    Complete { source: PathBuf, pending: PendingRestore },
+    /// The restore is applied: publish its plan (replace scope) and resolve.
+    Publish { pending: PendingRestore },
+}
+
+/// What `recover_restore` did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    pub action: String,
+    /// "discarded" | "rolled-back" | "completed" | "published"
+    pub result: String,
+    pub sync_paused: bool,
 }
 
 pub type SharedNetworkControl = Arc<NetworkControl>;
@@ -457,12 +614,33 @@ async fn broadcast_scoped_update(
 /// under the source app's sanitized label, retried while the destination
 /// already exists so an existing namespace is never reused as a fork target.
 fn allocate_fork_id(db_manager: &DbManager, requested_app: &str) -> Result<String, String> {
+    allocate_fork_id_with(db_manager, requested_app, || uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// The allocator with an injectable id source. The destination directory is
+/// RESERVED with create-new semantics before the identity is returned, so two
+/// concurrent allocations (or a collision of the id source) can never both
+/// receive the same namespace: the loser sees `AlreadyExists` and retries.
+fn allocate_fork_id_with(
+    db_manager: &DbManager,
+    requested_app: &str,
+    mut next_id: impl FnMut() -> String,
+) -> Result<String, String> {
     let label = sanitize_app_id(requested_app);
-    for _ in 0..8 {
-        let candidate = format!("{}-fork-{}", label, uuid::Uuid::new_v4().simple());
+    for _ in 0..16 {
+        let candidate = format!("{}-fork-{}", label, next_id());
+        if db_manager.is_open(&candidate).is_some() {
+            continue;
+        }
         let path = db_manager.get_app_path(&candidate);
-        if !path.exists() && db_manager.is_open(&candidate).is_none() {
-            return Ok(candidate);
+        let Some(dir) = path.parent() else { continue };
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        match std::fs::create_dir(dir) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not reserve fork namespace {}: {}", dir.display(), e)),
         }
     }
     Err("Could not allocate a fresh fork identity; try again".to_string())
@@ -1012,20 +1190,109 @@ pub async fn resume_sync(
     network: State<'_, SharedNetwork>,
     control: State<'_, SharedNetworkControl>,
 ) -> Result<bool, String> {
-    let pending = control.pending_restore();
+    // Refused for an unreadable record or a restore interrupted before it was
+    // applied (R3-XD-02): the record is the only journal, and clearing it
+    // would abandon an unknown data state. `recover_restore` handles those.
+    let pending = control.resume_decision()?;
     let net = { network.lock().await.clone() };
-    if let (Some(p), Some(net)) = (&pending, &net) {
-        if p.scope == "replace" && p.applied {
+    publish_and_resolve(&control, net.as_ref(), pending.as_ref()).await?;
+    if let Some(net) = net {
+        net.reconcile().await?;
+    }
+    Ok(true)
+}
+
+/// Publish an applied `replace` plan (when a node is running) and resolve
+/// the pending record. Publication hands the plan to GossipSub; it is not
+/// proof that any peer adopted it, which the repair pass and epoch checks
+/// establish afterwards.
+async fn publish_and_resolve(
+    control: &SharedNetworkControl,
+    net: Option<&NetworkNode>,
+    pending: Option<&PendingRestore>,
+) -> Result<(), String> {
+    if let (Some(p), Some(net)) = (pending, net) {
+        if p.scope == "replace" && p.phase() == "applied" {
             for (collection, epoch) in &p.reset_plan {
                 net.broadcast_reset(collection, *epoch).await?;
             }
         }
     }
-    control.resolve_restore()?;
-    if let Some(net) = net {
-        net.reconcile().await?;
+    control.resolve_restore()
+}
+
+/// Recover an interrupted or unreadable restore of the shared database
+/// (R3-XD-02). `action`: `discard` (acknowledge a record that changed
+/// nothing), `rollback` (restore the pre-restore backup), `complete`
+/// (re-apply the journaled restore: snapshot and reset plan in one step, or
+/// publish an applied one). The pause lifts only after the chosen step
+/// completed; a failing step keeps the record and the pause.
+#[tauri::command]
+pub async fn recover_restore(
+    db_manager: State<'_, SharedDbManager>,
+    network: State<'_, SharedNetwork>,
+    control: State<'_, SharedNetworkControl>,
+    action: String,
+) -> Result<RecoveryOutcome, String> {
+    let step = control.recovery_plan(&action)?;
+    let net = { network.lock().await.clone() };
+    let result = match step {
+        RecoveryStep::Discard => {
+            control.resolve_restore()?;
+            "discarded"
+        }
+        RecoveryStep::Rollback { app_id, backup } => {
+            let db = db_manager.get_db(&app_id)?;
+            {
+                let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+                db_lock
+                    .replace_from_file(&backup)
+                    .map_err(|e| format!("Rollback failed; the record and pause are kept: {e}"))?;
+            }
+            db_manager.emit_change(&app_id, "import", None);
+            control.resolve_restore()?;
+            "rolled-back"
+        }
+        RecoveryStep::Complete { source, pending } => {
+            let db = db_manager.get_db(&pending.app_id)?;
+            {
+                let mut db_lock = db.lock().map_err(|e| e.to_string())?;
+                if pending.scope == "replace" {
+                    db_lock
+                        .apply_authoritative_restore(&source, &pending.reset_plan, "local-restore")
+                        .map_err(|e| format!("Completing the restore failed; the record and pause are kept: {e}"))?;
+                } else {
+                    db_lock
+                        .replace_from_file(&source)
+                        .map_err(|e| format!("Completing the restore failed; the record and pause are kept: {e}"))?;
+                }
+                control.update_restore(PendingRestore { phase: "applied".into(), applied: true, ..pending.clone() })?;
+            }
+            db_manager.emit_change(&pending.app_id, "import", None);
+            let applied = PendingRestore { phase: "applied".into(), applied: true, ..pending };
+            if applied.scope == "local" || net.is_some() {
+                publish_and_resolve(&control, net.as_ref(), Some(&applied)).await?;
+                "completed"
+            } else {
+                // Applied, but the plan cannot be published yet: stays pending
+                // (and resumable) until networking is on.
+                "completed"
+            }
+        }
+        RecoveryStep::Publish { pending } => {
+            if pending.scope == "replace" && net.is_none() {
+                return Err("The restore is applied but its reset plan cannot be published while networking is off; enable networking, then resume_sync".to_string());
+            }
+            publish_and_resolve(&control, net.as_ref(), Some(&pending)).await?;
+            "published"
+        }
+    };
+    if let Some(net) = &net {
+        if !control.gate().is_paused() {
+            net.reconcile().await?;
+        }
     }
-    Ok(true)
+    Ok(RecoveryOutcome { action, result: result.to_string(), sync_paused: control.gate().is_paused() })
 }
 
 /// Announce local collections and request reconciliation for all of them now
@@ -1191,15 +1458,22 @@ pub async fn import_database(
     // network node is running now (R2-XD-01). A crash after this point leaves
     // the record, so startup re-establishes the pause.
     let shared = supports_legacy_sync(&app_id) && scope != "fork";
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let journal = |phase: &str, applied: bool, backup: Option<&PathBuf>, plan: &crate::db::AuthoritativeRestorePlan| PendingRestore {
+        app_id: sanitize_app_id(&app_id),
+        scope: scope.clone(),
+        started_at: started_at.clone(),
+        applied,
+        reset_plan: plan.plan.clone(),
+        backup_path: backup.map(|b| b.to_string_lossy().to_string()),
+        phase: phase.into(),
+        prior_catalog: plan.prior.clone(),
+        source_path: Some(source.to_string_lossy().to_string()),
+        unreadable: None,
+    };
+    let no_plan = crate::db::AuthoritativeRestorePlan { prior: Vec::new(), plan: Vec::new() };
     if shared {
-        control.begin_restore(PendingRestore {
-            app_id: sanitize_app_id(&app_id),
-            scope: scope.clone(),
-            started_at: chrono::Utc::now().to_rfc3339(),
-            applied: false,
-            reset_plan: Vec::new(),
-            backup_path: None,
-        })?;
+        control.begin_restore(journal("planned", false, None, &no_plan))?;
     }
 
     // Serialize import under the DB mutex to prevent concurrent writes. The
@@ -1215,38 +1489,44 @@ pub async fn import_database(
             "Saved pre-import database backup: {}",
             backup_path.display()
         );
-        let reset_collections = if scope == "replace" {
-            // Authoritative replacement (R2-XD-02): epochs exceed both the live
-            // and the snapshot generation, over the union of both catalogs.
+        // Authoritative replacement (R2-XD-02/R3-XD-02): the plan is computed
+        // over the union of both catalogs WITHOUT touching the live database,
+        // journaled together with the backup and prior catalog, and only then
+        // activated together with the restored data in one step.
+        let planned = if scope == "replace" {
             db_lock
-                .replace_from_file_authoritative(&source, "local-restore")
-                .map_err(|e| format!("Failed to replace database after import: {}", e))?
+                .plan_authoritative_restore(&source)
+                .map_err(|e| format!("Failed to plan the authoritative restore: {}", e))?
+        } else {
+            no_plan.clone()
+        };
+        if shared {
+            control.update_restore(journal("planned", false, Some(&backup_path), &planned))?;
+        }
+        if scope == "replace" {
+            db_lock
+                .apply_authoritative_restore(&source, &planned.plan, "local-restore")
+                .map_err(|e| format!("Failed to replace database after import: {}", e))?;
         } else {
             db_lock
                 .replace_from_file(&source)
                 .map_err(|e| format!("Failed to replace database after import: {}", e))?;
-            Vec::new()
-        };
-        Ok((reset_collections, backup_path))
+        }
+        if shared {
+            // Written under the database lock: nobody can observe the new
+            // data before the journal says it is applied.
+            control.update_restore(journal("applied", true, Some(&backup_path), &planned))?;
+        }
+        Ok((planned.plan, backup_path))
     })();
-    let (reset_collections, backup_path) = match restored {
+    let (reset_collections, _backup_path) = match restored {
         Ok(v) => v,
         Err(e) => {
-            // The pending record stays: the pause is kept conservatively and
-            // the pre-restore backup is the recovery source.
+            // The pending record stays in its journaled phase: the pause is
+            // kept and recover_restore (rollback | complete) resolves it.
             return Err(e);
         }
     };
-    if shared {
-        control.update_restore(PendingRestore {
-            app_id: sanitize_app_id(&app_id),
-            scope: scope.clone(),
-            started_at: chrono::Utc::now().to_rfc3339(),
-            applied: true,
-            reset_plan: reset_collections.clone(),
-            backup_path: Some(backup_path.to_string_lossy().to_string()),
-        })?;
-    }
     db_manager.emit_change(&app_id, "import", None);
     info!("Imported database from: {} (scope {})", source_path, scope);
 
@@ -1405,6 +1685,7 @@ macro_rules! xdb_commands {
             $crate::tauri::get_network_settings,
             $crate::tauri::set_network_enabled,
             $crate::tauri::resume_sync,
+            $crate::tauri::recover_restore,
             $crate::tauri::reconcile_network,
             $crate::tauri::request_sync,
             $crate::tauri::export_database,
@@ -1557,6 +1838,10 @@ mod tests {
                 applied: false,
                 reset_plan: vec![],
                 backup_path: None,
+                phase: "planned".into(),
+                prior_catalog: vec![],
+                source_path: None,
+                unreadable: None,
             })
             .unwrap();
         assert!(control.gate().is_paused());
@@ -1577,14 +1862,99 @@ mod tests {
         restarted.resolve_restore().unwrap();
         assert!(!restarted.gate().is_paused());
         assert!(!PendingRestore::path(dir.path()).exists());
-        let again = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        let again = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db.clone());
         assert!(!again.gate().is_paused());
 
-        // An unreadable record is treated as pending, never as resolved.
+        // An unreadable record is treated as pending, never as resolved, and
+        // says why; it cannot be resumed, only discarded explicitly (R3-XD-01).
         std::fs::write(PendingRestore::path(dir.path()), b"{garbage").unwrap();
         let damaged = PendingRestore::load(dir.path()).unwrap();
-        assert!(damaged.applied);
-        assert_eq!(damaged.scope, "local");
+        assert!(damaged.unreadable.as_deref().unwrap_or("").contains("cannot parse"));
+        assert!(!damaged.is_resumable());
+        let held = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        assert!(held.gate().is_paused());
+        assert!(held.resume_decision().unwrap_err().contains("cannot be read"));
+    }
+
+    // ── R3-XD-01: only a confirmed absent file means "no pending restore" ──
+
+    #[test]
+    fn pending_restore_read_failure_holds_synchronization_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        assert!(PendingRestore::load(dir.path()).is_none(), "NotFound is the only absence");
+        // A directory where the record belongs: fs::read fails with a non-NotFound error.
+        std::fs::create_dir(PendingRestore::path(dir.path())).unwrap();
+        let held = PendingRestore::load(dir.path()).expect("an unreadable record is pending");
+        assert!(held.unreadable.as_deref().unwrap_or("").contains("cannot read"));
+        assert!(!held.is_resumable());
+        let control = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings { enabled: true, discovery: true, listen: true }, db);
+        assert!(control.gate().is_paused(), "unpaused synchronization must not start");
+        let status_record = control.pending_restore().unwrap();
+        assert!(status_record.unreadable.is_some(), "get_network_status can show the reason");
+        assert!(control.resume_decision().is_err());
+        // Only an explicit discard acknowledges it; rollback/complete have nothing to work from.
+        assert!(control.recovery_plan("rollback").is_err());
+        assert!(control.recovery_plan("complete").is_err());
+        assert_eq!(control.recovery_plan("discard").unwrap(), RecoveryStep::Discard);
+    }
+
+    // ── R3-XD-02: resume refuses an interrupted restore; recovery is explicit ──
+
+    #[test]
+    fn resume_refuses_a_restore_interrupted_before_it_was_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_shared_db(dir.path().join("data.sqlite")).unwrap();
+        let control = NetworkControl::new(dir.path().to_path_buf(), NetworkSettings::default(), db);
+        let planned = PendingRestore {
+            app_id: "_default".into(),
+            scope: "replace".into(),
+            started_at: "2026-09-14T00:00:00Z".into(),
+            applied: false,
+            reset_plan: vec![("notes".into(), 6)],
+            backup_path: Some("data.db.backup".into()),
+            phase: "planned".into(),
+            prior_catalog: vec![("notes".into(), 5)],
+            source_path: Some("snapshot.sqlite".into()),
+            unreadable: None,
+        };
+        control.begin_restore(planned.clone()).unwrap();
+        let refusal = control.resume_decision().unwrap_err();
+        assert!(refusal.contains("interrupted before it was applied"), "{refusal}");
+        assert!(refusal.contains("data.db.backup"), "names the recovery source: {refusal}");
+        assert!(control.gate().is_paused());
+        assert!(PendingRestore::path(dir.path()).exists(), "the only journal is kept");
+        // Recovery choices: a restore that may have touched data cannot be discarded.
+        assert!(control.recovery_plan("discard").unwrap_err().contains("Refusing to discard"));
+        assert_eq!(
+            control.recovery_plan("rollback").unwrap(),
+            RecoveryStep::Rollback { app_id: "_default".into(), backup: PathBuf::from("data.db.backup") }
+        );
+        assert_eq!(
+            control.recovery_plan("complete").unwrap(),
+            RecoveryStep::Complete { source: PathBuf::from("snapshot.sqlite"), pending: planned.clone() }
+        );
+        assert!(control.recovery_plan("frobnicate").is_err());
+
+        // Journaled before any backup existed: nothing was changed, discard is honest.
+        let untouched = PendingRestore { backup_path: None, ..planned.clone() };
+        control.update_restore(untouched).unwrap();
+        assert_eq!(control.recovery_plan("discard").unwrap(), RecoveryStep::Discard);
+        assert_eq!(control.recovery_plan("rollback").unwrap(), RecoveryStep::Discard);
+
+        // Applied: resumable, and "complete" means publish/resolve.
+        let applied = PendingRestore { phase: "applied".into(), applied: true, ..planned.clone() };
+        control.update_restore(applied.clone()).unwrap();
+        assert_eq!(control.resume_decision().unwrap(), Some(applied.clone()));
+        assert_eq!(control.recovery_plan("complete").unwrap(), RecoveryStep::Publish { pending: applied });
+
+        // Records written before `phase` existed keep their meaning.
+        let legacy: PendingRestore = serde_json::from_str(r#"{"app_id":"_default","scope":"local","started_at":"t","applied":true}"#).unwrap();
+        assert_eq!(legacy.phase(), "applied");
+        assert!(legacy.is_resumable());
+        let legacy_planned: PendingRestore = serde_json::from_str(r#"{"app_id":"_default","scope":"local","started_at":"t"}"#).unwrap();
+        assert_eq!(legacy_planned.phase(), "planned");
+        assert!(!legacy_planned.is_resumable());
     }
 
     #[test]
@@ -1597,6 +1967,10 @@ mod tests {
             applied: true,
             reset_plan: vec![("notes".into(), 6), ("tasks".into(), 2)],
             backup_path: Some("x.db.backup".into()),
+            phase: "applied".into(),
+            prior_catalog: vec![("notes".into(), 5), ("tasks".into(), 1)],
+            source_path: Some("snapshot.sqlite".into()),
+            unreadable: None,
         };
         pending.save(dir.path()).unwrap();
         assert_eq!(PendingRestore::load(dir.path()).unwrap(), pending);
@@ -1623,6 +1997,53 @@ mod tests {
             let next = allocate_fork_id(&manager, "notes app").unwrap();
             assert_ne!(next, first);
             assert!(!manager.get_app_path(&next).exists());
+        }
+    }
+
+    // ── R3: fork destinations are reserved atomically ──
+
+    #[test]
+    fn fork_allocation_reserves_the_destination_and_retries_a_colliding_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DbManager::new(dir.path().to_path_buf());
+        // Deterministic collision: the id source repeats an id that is already reserved.
+        let taken = allocate_fork_id_with(&manager, "notes", || "fixed".to_string()).unwrap();
+        assert_eq!(taken, "notes-fork-fixed");
+        assert!(manager.get_app_path(&taken).parent().unwrap().is_dir(), "reserved before the caller opens it");
+        let mut ids = vec!["fresh", "fixed", "fixed"].into_iter();
+        let next = allocate_fork_id_with(&manager, "notes", || ids.next_back().unwrap().to_string()).unwrap();
+        assert_eq!(next, "notes-fork-fresh", "collisions are retried, never reused");
+        assert!(manager.get_app_path(&next).parent().unwrap().is_dir());
+        // An id source that never produces a free id fails instead of overwriting.
+        assert!(allocate_fork_id_with(&manager, "notes", || "fixed".to_string()).is_err());
+    }
+
+    #[test]
+    fn concurrent_fork_allocations_never_share_an_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = std::sync::Arc::new(DbManager::new(dir.path().to_path_buf()));
+        // Every thread walks the SAME id sequence, so they all race for the same
+        // candidates; only the reservation decides who gets which.
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let manager = manager.clone();
+                std::thread::spawn(move || {
+                    let mut n = 0;
+                    allocate_fork_id_with(&manager, "shared", move || {
+                        n += 1;
+                        format!("seq{n}")
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        ids.sort();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(ids, unique, "every allocation got a distinct identity");
+        for id in &ids {
+            assert!(manager.get_app_path(id).parent().unwrap().is_dir(), "{id} is reserved on disk");
         }
     }
 

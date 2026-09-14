@@ -213,12 +213,24 @@ impl XdbDatabase {
     /// the current database intact if any step fails (R2-XD-03). Cached CRDT
     /// documents are dropped so the next access reads the restored state.
     pub fn replace_from_file(&mut self, source_path: &PathBuf) -> DbResult<()> {
+        self.replace_from_file_prepared(source_path, |_| Ok(()))
+    }
+
+    /// `replace_from_file` with one extra step: `prepare` runs against the
+    /// validated STAGING copy before it is activated, so whatever it writes
+    /// (reset epochs, R3-XD-02) becomes live in the same backup step as the
+    /// restored data. An error from `prepare` leaves the live database untouched.
+    pub(crate) fn replace_from_file_prepared(
+        &mut self,
+        source_path: &PathBuf,
+        prepare: impl FnOnce(&Connection) -> DbResult<()>,
+    ) -> DbResult<()> {
         self.require_autocommit("import")?;
         self.require_distinct_path(source_path)?;
         let staging_path = self
             .db_path
             .with_extension(format!("restore-staging-{}", Uuid::new_v4().simple()));
-        let result = self.replace_from_file_staged(source_path, &staging_path);
+        let result = self.replace_from_file_staged(source_path, &staging_path, prepare);
         // The staging copy is a temporary; remove it (and its journals) whatever happened.
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let mut path = staging_path.clone().into_os_string();
@@ -232,6 +244,7 @@ impl XdbDatabase {
         &mut self,
         source_path: &PathBuf,
         staging_path: &PathBuf,
+        prepare: impl FnOnce(&Connection) -> DbResult<()>,
     ) -> DbResult<()> {
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Hold one read snapshot through validation and copy.
@@ -311,7 +324,13 @@ impl XdbDatabase {
             }
         }
 
-        // 3. Only a migrated, validated copy replaces the live database.
+        // 3. The caller's preparation (reset epochs for an authoritative
+        //    restore) is written into the staging copy and re-validated, so
+        //    data and metadata activate together (R3-XD-02).
+        prepare(&staging)?;
+        staging.prepare("SELECT collection, epoch, origin, reset_at FROM collection_epochs LIMIT 0")?;
+
+        // 4. Only a migrated, validated copy replaces the live database.
         {
             let backup = Backup::new(&staging, &mut self.conn)?;
             if backup.step(-1)? != StepResult::Done {
@@ -329,18 +348,63 @@ impl XdbDatabase {
     /// those that only have an epoch row (reset to empty, or absent from a
     /// restored snapshot but still needing authority) — R2-XD-02.
     pub fn catalog(&self) -> DbResult<HashMap<String, u64>> {
+        Self::catalog_of(&self.conn)
+    }
+
+    /// `catalog` for any connection, including a not-yet-migrated snapshot
+    /// (whose missing epoch table means "every collection at epoch 0").
+    fn catalog_of(conn: &Connection) -> DbResult<HashMap<String, u64>> {
         let mut catalog: HashMap<String, u64> = HashMap::new();
-        for collection in self.get_collections()? {
-            catalog.insert(collection, 0);
+        let mut names = conn.prepare("SELECT DISTINCT collection FROM records")?;
+        for name in names.query_map([], |row| row.get::<_, String>(0))? {
+            catalog.insert(name?, 0);
         }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT collection, epoch FROM collection_epochs")?;
-        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))? {
-            let (collection, epoch) = row?;
-            catalog.insert(collection, epoch.max(0) as u64);
+        if Self::table_names(conn)?.iter().any(|t| t == "collection_epochs") {
+            let mut stmt = conn.prepare("SELECT collection, epoch FROM collection_epochs")?;
+            for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))? {
+                let (collection, epoch) = row?;
+                catalog.insert(collection, epoch.max(0) as u64);
+            }
         }
         Ok(catalog)
+    }
+
+    /// The reset plan an authoritative restore of `source_path` WILL commit,
+    /// computed without touching the live database (R3-XD-02): the host
+    /// journals it (together with the pre-restore catalog and backup) before
+    /// any byte is replaced. `plan` is the epoch per collection over the union
+    /// of both catalogs; `prior` is the live catalog it was computed against.
+    pub fn plan_authoritative_restore(
+        &self,
+        source_path: &PathBuf,
+    ) -> DbResult<AuthoritativeRestorePlan> {
+        self.require_distinct_path(source_path)?;
+        let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let snapshot = Self::catalog_of(&source)?;
+        drop(source);
+        let before = self.catalog()?;
+        Ok(AuthoritativeRestorePlan {
+            plan: Self::reset_plan_over(&before, &snapshot),
+            prior: {
+                let mut prior: Vec<(String, u64)> = before.into_iter().collect();
+                prior.sort();
+                prior
+            },
+        })
+    }
+
+    fn reset_plan_over(live: &HashMap<String, u64>, snapshot: &HashMap<String, u64>) -> Vec<(String, u64)> {
+        let mut union: Vec<String> = live.keys().chain(snapshot.keys()).cloned().collect();
+        union.sort();
+        union.dedup();
+        union
+            .into_iter()
+            .map(|collection| {
+                let l = live.get(&collection).copied().unwrap_or(0);
+                let s = snapshot.get(&collection).copied().unwrap_or(0);
+                (collection, l.max(s) + 1)
+            })
+            .collect()
     }
 
     /// Restore a snapshot as the AUTHORITATIVE shared state (replace scope,
@@ -357,23 +421,87 @@ impl XdbDatabase {
         source_path: &PathBuf,
         origin: &str,
     ) -> DbResult<Vec<(String, u64)>> {
-        let before = self.catalog()?;
-        self.replace_from_file(source_path)?;
-        let restored = self.catalog()?;
-        let mut union: Vec<String> = before.keys().chain(restored.keys()).cloned().collect();
-        union.sort();
-        union.dedup();
-        let origin = origin.to_string();
-        self.with_transaction(|this| {
-            let mut plan = Vec::with_capacity(union.len());
-            for collection in &union {
-                let live = before.get(collection).copied().unwrap_or(0);
-                let snapshot = restored.get(collection).copied().unwrap_or(0);
-                let epoch = live.max(snapshot) + 1;
-                this.set_epoch(collection, epoch, &origin)?;
-                plan.push((collection.clone(), epoch));
+        let planned = self.plan_authoritative_restore(source_path)?;
+        self.apply_authoritative_restore(source_path, &planned.plan, origin)?;
+        Ok(planned.plan)
+    }
+
+    /// Activate `source_path` together with a journaled reset `plan` in ONE
+    /// step (R3-XD-02): the plan's epochs are written into the validated
+    /// staging copy, which then replaces the live database with a single
+    /// backup step. Data and reset metadata can never be observed apart. The
+    /// plan is checked against the CURRENT live and snapshot catalogs first:
+    /// an epoch that no longer exceeds both (the live database moved on after
+    /// the plan was journaled) is refused, and the live database is untouched.
+    pub fn apply_authoritative_restore(
+        &mut self,
+        source_path: &PathBuf,
+        plan: &[(String, u64)],
+        origin: &str,
+    ) -> DbResult<()> {
+        self.apply_authoritative_restore_with(source_path, plan, origin, |_| Ok(()))
+    }
+
+    pub(crate) fn apply_authoritative_restore_with(
+        &mut self,
+        source_path: &PathBuf,
+        plan: &[(String, u64)],
+        origin: &str,
+        before_activate: impl FnOnce(&Connection) -> DbResult<()>,
+    ) -> DbResult<()> {
+        let planned = self.plan_authoritative_restore(source_path)?;
+        let expected: HashMap<&str, u64> = plan.iter().map(|(c, e)| (c.as_str(), *e)).collect();
+        // A retry after a crash between activation and the journal update
+        // finds the live database already AT the plan (activation wrote data
+        // and epochs together): every planned collection sits exactly at its
+        // planned epoch and no other collection exists. That is idempotent.
+        let live_now: HashMap<String, u64> = planned.prior.iter().cloned().collect();
+        let already_applied = !plan.is_empty()
+            && live_now.len() == plan.len()
+            && plan.iter().all(|(c, e)| live_now.get(c) == Some(e));
+        if already_applied {
+            return Ok(());
+        }
+        for (collection, minimum) in &planned.plan {
+            match expected.get(collection.as_str()) {
+                Some(epoch) if *epoch >= *minimum => {}
+                Some(epoch) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Stale reset plan for '{collection}': planned epoch {epoch} no longer exceeds the live and snapshot generations (needs at least {minimum}); roll back or re-plan"
+                    )))
+                }
+                None => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Incomplete reset plan: collection '{collection}' is missing; roll back or re-plan"
+                    )))
+                }
             }
-            Ok(plan)
+        }
+        let origin = origin.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.replace_from_file_prepared(source_path, |staging| {
+            staging.execute_batch("BEGIN")?;
+            for (collection, epoch) in plan {
+                staging.execute(
+                    "INSERT OR REPLACE INTO collection_epochs (collection, epoch, origin, reset_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![collection, *epoch as i64, origin, now],
+                )?;
+            }
+            staging.execute_batch("COMMIT")?;
+            // Verify the staging copy carries exactly the plan before activation.
+            for (collection, epoch) in plan {
+                let stored: i64 = staging.query_row(
+                    "SELECT epoch FROM collection_epochs WHERE collection = ?1",
+                    params![collection],
+                    |row| row.get(0),
+                )?;
+                if stored != *epoch as i64 {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Staged epoch for '{collection}' is {stored}, expected {epoch}"
+                    )));
+                }
+            }
+            before_activate(staging)
         })
     }
 
@@ -1249,6 +1377,16 @@ pub struct DbStats {
 
 /// Thread-safe wrapper for the database
 pub type SharedDb = Arc<Mutex<XdbDatabase>>;
+
+/// What an authoritative restore will commit (R3-XD-02), journaled by the
+/// host before the live database is touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeRestorePlan {
+    /// The live catalog (collection, epoch) the plan was computed against.
+    pub prior: Vec<(String, u64)>,
+    /// The epoch every collection in the union of both catalogs will carry.
+    pub plan: Vec<(String, u64)>,
+}
 
 pub fn create_shared_db(path: PathBuf) -> DbResult<SharedDb> {
     Ok(Arc::new(Mutex::new(XdbDatabase::open(path)?)))
