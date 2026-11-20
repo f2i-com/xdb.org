@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xdb-core",
+    "crates/xdb-parser",
+    "crates/xdb-sql",
+    "crates/xdb-vfs-fs",
+    "crates/xdb-sqlite",
+]
+# Keep the WebAssembly embedding in its own Cargo workspace, matching zipp-wasm:
+# Cargo unifies features and profiles across a workspace, so keeping xdb-wasm
+# separate guarantees hardened WASM builds (opt-level = "z", overflow-checks,
+# panic = "abort", wasm-bindgen) stay isolated from native crates.
+exclude = ["crates/xdb-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+panic = "abort"

@@ -1,0 +1,14 @@
+[package]
+name = "xdb-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure safe Rust SQLite 3.54.1 + XDB SQL query engine (functions, expression evaluator, binder, planner, executor)"
+
+[dependencies]
+xdb-core = { path = "../xdb-core" }
+xdb-parser = { path = "../xdb-parser" }
+
+[lints]
+workspace = true

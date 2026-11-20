@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.92.0"
+  WASM_BINDGEN_CLI: "0.2.126"
+
+jobs:
+  native:
+    name: Native workspace tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.92.0
+        run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
+      - name: Run workspace tests (-Dwarnings)
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo +1.92.0 test --locked --workspace
+
+  wasm:
+    name: Hardened WebAssembly build & smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.92.0 + wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install wasm-bindgen-cli & Binaryen
+        run: |
+          cargo +1.92.0 install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          npm install --global binaryen@125.0.0
+      - name: Build and verify xdb-wasm
+        run: bash crates/xdb-wasm/build-wasm.sh

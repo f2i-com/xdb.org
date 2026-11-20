@@ -1,0 +1,12 @@
+[package]
+name = "xdb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core SQLite 3.54.1 value semantics, sandbox metering, and VFS abstractions for XDB."
+
+[lints]
+workspace = true
+
+[dependencies]

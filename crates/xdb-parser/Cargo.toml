@@ -1,0 +1,13 @@
+[package]
+name = "xdb-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite 3.54.1 and XDB dialect LALR(1) SQL parser and build.c schema model"
+
+[dependencies]
+xdb-core = { path = "../xdb-core" }
+
+[lints]
+workspace = true

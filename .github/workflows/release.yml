@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.92.0"
+  WASM_BINDGEN_CLI: "0.2.126"
+
+jobs:
+  release:
+    name: Test, build XDB WASM & publish release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          WS_VER="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          WASM_VER="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' crates/xdb-wasm/Cargo.toml | head -n 1)"
+          if [[ "$TAG" == v* ]]; then
+            test "$VERSION" = "$WS_VER"
+            test "$VERSION" = "$WASM_VER"
+          else
+            VERSION="$WS_VER"
+            TAG="v$VERSION"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust 1.92.0 + wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run full workspace tests (-Dwarnings)
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo +1.92.0 test --locked --workspace
+
+      - name: Install wasm-bindgen-cli & Binaryen
+        run: |
+          cargo +1.92.0 install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          npm install --global binaryen@125.0.0
+
+      - name: Build & verify xdb-wasm release artifacts
+        run: bash crates/xdb-wasm/build-wasm.sh crates/xdb-wasm/dist
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          DIST="crates/xdb-wasm/dist"
+          gh release create "$TAG" \
+            "$DIST/xdb-$V-wasm.wasm" \
+            "$DIST/xdb-$V-wasm.wasm.br" \
+            "$DIST/xdb-$V-wasm.js" \
+            "$DIST/xdb-$V-wasm.d.ts" \
+            "$DIST/xdb-$V-wasm.wasm.d.ts" \
+            "$DIST/SHA256SUMS" \
+            --title "XDB $TAG" \
+            --generate-notes

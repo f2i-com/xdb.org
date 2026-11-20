@@ -1,0 +1,19 @@
+[package]
+name = "xdb-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure safe Rust SQLite 3 file format, WAL/hot-journal snapshots, and B-tree reader for XDB."
+
+[lints]
+workspace = true
+
+[dependencies]
+xdb-core = { path = "../xdb-core" }
+xdb-parser = { path = "../xdb-parser" }
+xdb-sql = { path = "../xdb-sql" }
+
+[dev-dependencies]
+xdb-vfs-fs = { path = "../xdb-vfs-fs" }
+serde_json = "1.0"

@@ -1,0 +1,13 @@
+[package]
+name = "xdb-vfs-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Standard filesystem VFS (`std::fs`) for native XDB hosts."
+
+[lints]
+workspace = true
+
+[dependencies]
+xdb-core = { path = "../xdb-core" }

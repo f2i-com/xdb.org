@@ -1,0 +1,7 @@
+/target
+/crates/xdb-wasm/target
+/crates/xdb-wasm/pkg
+/crates/xdb-wasm/dist
+**/*.rs.bk
+.DS_Store
+Thumbs.db
