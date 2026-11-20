@@ -4,14 +4,19 @@
 # and emit SHA256SUMS into crates/xdb-wasm/dist/.
 set -euo pipefail
 
+caller_pwd="$(pwd)"
 here="$(cd "$(dirname "$0")" && pwd)"
+OUT_DIR="${1:-$here/dist}"
+case "$OUT_DIR" in
+  /*|[A-Za-z]:/*) ;;
+  *) OUT_DIR="$caller_pwd/$OUT_DIR" ;;
+esac
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 cd "$here"
 
 TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.92.0}"
 VERSION="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-OUT_DIR="${1:-$here/dist}"
-mkdir -p "$OUT_DIR"
-OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 echo "=== Building xdb-wasm v$VERSION (toolchain $TOOLCHAIN)"
 RUSTFLAGS="-Dwarnings" cargo +"$TOOLCHAIN" build --locked --release --target wasm32-unknown-unknown
