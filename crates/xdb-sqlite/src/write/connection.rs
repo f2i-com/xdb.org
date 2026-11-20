@@ -2686,8 +2686,34 @@ fn eval_returning(
 
 // ───────────────────────────── DDL SQL rewrite helpers ─────────────────────────────
 
-fn strip_if_not_exists(sql: &str, _prefix: &str) -> String {
-    // Preserve clean SQLite schema text (removing `IF NOT EXISTS` clause case-insensitively).
+fn strip_if_not_exists(raw_sql: &str, _prefix: &str) -> String {
+    // Match SQLite's `sqlite_schema.sql` normalization: strip leading whitespace & SQL
+    // comments (so stored DDL always starts at `CREATE`) and trailing whitespace/comments/`;`,
+    // then remove any `IF NOT EXISTS` clause case-insensitively.
+    let raw_tokens = xdb_parser::raw_tokens(raw_sql, Dialect::Sqlite);
+    let mut first_idx = 0;
+    while first_idx < raw_tokens.len()
+        && matches!(
+            raw_tokens[first_idx].kind,
+            xdb_parser::tk::SPACE | xdb_parser::tk::COMMENT
+        )
+    {
+        first_idx += 1;
+    }
+    let mut last_idx = raw_tokens.len();
+    while last_idx > first_idx
+        && matches!(
+            raw_tokens[last_idx - 1].kind,
+            xdb_parser::tk::SPACE | xdb_parser::tk::COMMENT | xdb_parser::tk::SEMI
+        )
+    {
+        last_idx -= 1;
+    }
+    let sql = if first_idx < last_idx {
+        &raw_sql[raw_tokens[first_idx].start..raw_tokens[last_idx - 1].end]
+    } else {
+        raw_sql.trim()
+    };
     let tokens = xdb_parser::raw_tokens(sql, Dialect::Sqlite);
     let mut i = 0;
     while i + 2 < tokens.len() {
