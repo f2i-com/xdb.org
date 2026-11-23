@@ -41,7 +41,7 @@ Designed to run standalone (native Rust library, browser/Node/Bun/Deno WebAssemb
 ### Native Rust
 
 ```rust
-use xdb_sqlite::{ConnectionOptions, QueryParams, SqliteConnection};
+use xdb_sqlite::{ConnectionOptions, QueryParams, SqliteConnection, SqlValue};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = SqliteConnection::open_in_memory(ConnectionOptions::default())?;
@@ -52,17 +52,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             title TEXT NOT NULL,
             done INTEGER NOT NULL DEFAULT 0
         );",
-        &QueryParams::empty(),
     )?;
 
     conn.execute(
-        "INSERT INTO tasks (title, done) VALUES ('Ship XDB 0.1.0', 1), ('Run in browser WASM', 0);",
-        &QueryParams::empty(),
+        "INSERT INTO tasks (title, done) VALUES ('Ship XDB 0.1.1', 1), ('Run in browser WASM', 0);",
     )?;
 
-    let res = conn.execute(
-        "SELECT id, title, done FROM tasks ORDER BY id;",
-        &QueryParams::empty(),
+    let res = conn.execute_with_params(
+        "SELECT id, title, done FROM tasks WHERE done = ? ORDER BY id;",
+        &QueryParams::positional(vec![SqlValue::Int(0)]),
     )?;
     println!("columns: {:?}, rows: {}", res.columns, res.rows.len());
 
@@ -78,9 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Download `xdb-<version>-wasm.wasm` (or `.wasm.br`) and `xdb-<version>-wasm.js` from the [GitHub Releases](https://github.com/f2i-com/xdb.org/releases) page, or build them locally from `crates/xdb-wasm`.
 
 ```js
-import initXdb, { WasmConnection, WasmDatabase } from './xdb_wasm.js';
+import initXdb, { WasmConnection, WasmDatabase } from './xdb-0.1.1-wasm.js';
 
-await initXdb('./xdb_wasm_bg.wasm');
+// In a browser, resolves sibling `xdb-0.1.1-wasm.wasm` automatically.
+// In Node.js, pass the bytes: `await initXdb({ module_or_path: fs.readFileSync('./xdb-0.1.1-wasm.wasm') })`.
+await initXdb();
 
 // Open an in-memory read-write SQLite database with explicit sandbox ceilings:
 // (initialBytes, walBytes, journalBytes, pageSize, maxSteps, maxMemoryBytes, maxPageReads)
@@ -125,7 +125,9 @@ console.log('Exported SQLite bytes:', dbBytes.byteLength);
 const ro = new WasmDatabase(dbBytes, undefined, undefined, 10_000_000n, 32n * 1024n * 1024n, 50_000n);
 console.log(JSON.parse(ro.query_xdb_json('FROM items SELECT name, price_cents / 100.0 AS price')));
 ro.close();
+ro.free();
 conn.close();
+conn.free();
 ```
 
 ---

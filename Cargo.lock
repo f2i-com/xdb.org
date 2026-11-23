@@ -93,18 +93,18 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "xdb-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "xdb-parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
 ]
 
 [[package]]
 name = "xdb-sql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
  "xdb-parser",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "xdb-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "xdb-core",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "xdb-vfs-fs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
 ]

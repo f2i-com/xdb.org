@@ -14,7 +14,7 @@ members = [
 exclude = ["crates/xdb-wasm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"

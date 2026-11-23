@@ -1,6 +1,6 @@
 [package]
 name = "xdb-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -11,6 +11,10 @@ resolver = "2"
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "warn"
 
 [profile.release]
 opt-level = "z"

@@ -108,18 +108,18 @@ dependencies = [
 
 [[package]]
 name = "xdb-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "xdb-parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
 ]
 
 [[package]]
 name = "xdb-sql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
  "xdb-parser",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "xdb-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "xdb-core",
  "xdb-parser",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "xdb-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "wasm-bindgen",
  "xdb-core",
