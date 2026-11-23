@@ -167,7 +167,7 @@ impl BudgetMeter {
     }
 
     fn check_not_exhausted(&self, kind: LimitKind) -> Result<(), ResourceLimitError> {
-        if self.exhausted.load(Ordering::Relaxed) {
+        if self.exhausted.load(Ordering::Acquire) {
             let (used, limit) = match kind {
                 LimitKind::Steps => (
                     self.steps.load(Ordering::Relaxed),
@@ -186,58 +186,62 @@ impl BudgetMeter {
         }
         Ok(())
     }
+
+    fn try_add_bounded(
+        &self,
+        counter: &AtomicU64,
+        delta: u64,
+        limit: Option<u64>,
+        kind: LimitKind,
+    ) -> Result<u64, ResourceLimitError> {
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            let next_wide = u128::from(cur) + u128::from(delta);
+            let next = next_wide.min(u128::from(u64::MAX)) as u64;
+            if let Some(lim) = limit {
+                if next_wide > u128::from(lim) {
+                    self.exhausted.store(true, Ordering::Release);
+                    return Err(ResourceLimitError {
+                        kind,
+                        used: next,
+                        limit: lim,
+                    });
+                }
+            }
+            match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Ok(next),
+                Err(v) => cur = v,
+            }
+        }
+    }
 }
 
 impl Meter for BudgetMeter {
     fn charge_steps(&self, cost: u64) -> Result<(), ResourceLimitError> {
         self.check_not_exhausted(LimitKind::Steps)?;
-        let prev = self.steps.fetch_add(cost, Ordering::Relaxed);
-        let used = prev.saturating_add(cost);
-        if let Some(limit) = self.limits.max_steps {
-            if used > limit {
-                self.exhausted.store(true, Ordering::Relaxed);
-                return Err(ResourceLimitError {
-                    kind: LimitKind::Steps,
-                    used,
-                    limit,
-                });
-            }
-        }
+        self.try_add_bounded(&self.steps, cost, self.limits.max_steps, LimitKind::Steps)?;
         Ok(())
     }
 
     fn charge_page_reads(&self, count: u64) -> Result<(), ResourceLimitError> {
         self.check_not_exhausted(LimitKind::PageReads)?;
-        let prev = self.page_reads.fetch_add(count, Ordering::Relaxed);
-        let used = prev.saturating_add(count);
-        if let Some(limit) = self.limits.max_page_reads {
-            if used > limit {
-                self.exhausted.store(true, Ordering::Relaxed);
-                return Err(ResourceLimitError {
-                    kind: LimitKind::PageReads,
-                    used,
-                    limit,
-                });
-            }
-        }
+        self.try_add_bounded(
+            &self.page_reads,
+            count,
+            self.limits.max_page_reads,
+            LimitKind::PageReads,
+        )?;
         self.charge_steps(count.saturating_mul(16))
     }
 
     fn reserve_memory(&self, bytes: u64) -> Result<(), ResourceLimitError> {
         self.check_not_exhausted(LimitKind::Memory)?;
-        let prev = self.memory_bytes.fetch_add(bytes, Ordering::Relaxed);
-        let used = prev.saturating_add(bytes);
-        if let Some(limit) = self.limits.max_memory_bytes {
-            if used > limit {
-                self.memory_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                self.exhausted.store(true, Ordering::Relaxed);
-                return Err(ResourceLimitError {
-                    kind: LimitKind::Memory,
-                    used,
-                    limit,
-                });
-            }
-        }
+        let used = self.try_add_bounded(
+            &self.memory_bytes,
+            bytes,
+            self.limits.max_memory_bytes,
+            LimitKind::Memory,
+        )?;
         let mut peak = self.peak_memory_bytes.load(Ordering::Relaxed);
         while used > peak {
             match self.peak_memory_bytes.compare_exchange_weak(

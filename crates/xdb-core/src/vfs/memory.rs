@@ -36,9 +36,12 @@ impl Default for MemoryVfsOptions {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemNode {
+    id: u64,
     data: Vec<u8>,
+    linked: bool,
+    open_handles: usize,
 }
 
 #[derive(Debug)]
@@ -47,9 +50,20 @@ struct MemFsState {
     total_bytes: usize,
     max_file_size: usize,
     max_total_bytes: Option<usize>,
+    next_node_id: u64,
 }
 
 impl MemFsState {
+    fn new_node(&mut self, data: Vec<u8>) -> Arc<Mutex<MemNode>> {
+        self.next_node_id += 1;
+        Arc::new(Mutex::new(MemNode {
+            id: self.next_node_id,
+            data,
+            linked: true,
+            open_handles: 0,
+        }))
+    }
+
     fn check_and_grow(
         &mut self,
         node: &mut MemNode,
@@ -86,8 +100,23 @@ impl MemFsState {
         let old_size = node.data.len();
         if new_size < old_size {
             let delta = old_size - new_size;
-            node.data.truncate(new_size);
+            if new_size == 0 {
+                node.data = Vec::new();
+            } else {
+                node.data.truncate(new_size);
+                if node.data.capacity() > new_size.saturating_mul(2).max(4096) {
+                    node.data.shrink_to_fit();
+                }
+            }
             self.total_bytes = self.total_bytes.saturating_sub(delta);
+        }
+    }
+
+    fn reclaim_if_dead(&mut self, node: &mut MemNode) {
+        if !node.linked && node.open_handles == 0 {
+            let len = node.data.len();
+            node.data = Vec::new();
+            self.total_bytes = self.total_bytes.saturating_sub(len);
         }
     }
 }
@@ -115,6 +144,7 @@ impl MemoryVfs {
                 total_bytes: 0,
                 max_file_size: options.max_file_size,
                 max_total_bytes: options.max_total_bytes,
+                next_node_id: 0,
             })),
             locks: options.lock_manager.unwrap_or_default(),
             key_prefix: format!("mem#{id}:"),
@@ -125,8 +155,20 @@ impl MemoryVfs {
         &self.locks
     }
 
+    /// Return the lock-table key currently associated with `path`.
+    /// If `path` exists in this VFS, returns the active node's lock key (matching [`Vfs::open`]);
+    /// otherwise returns the fallback path-based key.
     pub fn lock_key(&self, path: &str) -> String {
+        let st = self.state.lock().expect("vfs poisoned");
+        if let Some(node) = st.files.get(path) {
+            let nid = node.lock().expect("node poisoned").id;
+            return self.node_lock_key(nid);
+        }
         format!("{}{}", self.key_prefix, path)
+    }
+
+    fn node_lock_key(&self, node_id: u64) -> String {
+        format!("{}node#{node_id}", self.key_prefix)
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -153,13 +195,10 @@ impl MemoryVfs {
                 &path,
             ));
         }
-        let node = st
-            .files
-            .entry(path.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(MemNode::default())))
-            .clone();
-        let mut guard = node.lock().expect("node poisoned");
-        let old_len = guard.data.len();
+        let existing = st.files.get(&path).cloned();
+        let old_len = existing
+            .as_ref()
+            .map_or(0, |n| n.lock().expect("node poisoned").data.len());
         let new_len = bytes.len();
         let next_total = st.total_bytes.saturating_sub(old_len).saturating_add(new_len);
         if let Some(cap) = st.max_total_bytes {
@@ -171,7 +210,15 @@ impl MemoryVfs {
                 ));
             }
         }
-        guard.data = bytes;
+        match existing {
+            Some(node) => {
+                node.lock().expect("node poisoned").data = bytes;
+            }
+            None => {
+                let node = st.new_node(bytes);
+                st.files.insert(path, node);
+            }
+        }
         st.total_bytes = next_total;
         Ok(())
     }
@@ -195,7 +242,7 @@ impl Vfs for MemoryVfs {
             OpenMode::Create => match existing {
                 Some(n) => n,
                 None => {
-                    let n = Arc::new(Mutex::new(MemNode::default()));
+                    let n = st.new_node(Vec::new());
                     st.files.insert(path.to_string(), n.clone());
                     n
                 }
@@ -208,14 +255,19 @@ impl Vfs for MemoryVfs {
                         path,
                     ));
                 }
-                let n = Arc::new(Mutex::new(MemNode::default()));
+                let n = st.new_node(Vec::new());
                 st.files.insert(path.to_string(), n.clone());
                 n
             }
         };
+        let node_id = {
+            let mut guard = node.lock().expect("node poisoned");
+            guard.open_handles += 1;
+            guard.id
+        };
         drop(st);
 
-        let lock = self.locks.open_handle(self.lock_key(path));
+        let lock = self.locks.open_handle(self.node_lock_key(node_id));
         Ok(Box::new(MemoryFile {
             path: path.to_string(),
             readonly: flags.mode == OpenMode::ReadOnly,
@@ -231,8 +283,9 @@ impl Vfs for MemoryVfs {
         let mut st = self.state.lock().expect("vfs poisoned");
         match st.files.remove(path) {
             Some(node) => {
-                let len = node.lock().expect("node poisoned").data.len();
-                st.total_bytes = st.total_bytes.saturating_sub(len);
+                let mut guard = node.lock().expect("node poisoned");
+                guard.linked = false;
+                st.reclaim_if_dead(&mut guard);
                 Ok(())
             }
             None => Err(IoError::with_path(
@@ -386,18 +439,21 @@ impl VfsFile for MemoryFile {
             return Ok(());
         }
         self.closed = true;
-        self.lock.release();
-        if self.delete_on_close {
+        {
             let mut st = self.state.lock().expect("vfs poisoned");
-            if let Some(cur) = st.files.get(&self.path) {
-                if Arc::ptr_eq(cur, &self.node) {
-                    if let Some(removed) = st.files.remove(&self.path) {
-                        let len = removed.lock().expect("node poisoned").data.len();
-                        st.total_bytes = st.total_bytes.saturating_sub(len);
+            if self.delete_on_close {
+                if let Some(cur) = st.files.get(&self.path) {
+                    if Arc::ptr_eq(cur, &self.node) {
+                        st.files.remove(&self.path);
+                        self.node.lock().expect("node poisoned").linked = false;
                     }
                 }
             }
+            let mut guard = self.node.lock().expect("node poisoned");
+            guard.open_handles = guard.open_handles.saturating_sub(1);
+            st.reclaim_if_dead(&mut guard);
         }
+        self.lock.release();
         Ok(())
     }
 }

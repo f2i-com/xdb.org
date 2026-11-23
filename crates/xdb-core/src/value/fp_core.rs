@@ -131,7 +131,7 @@ pub fn fp10_convert2(d: u64, p: i32) -> f64 {
 
 /// Full port of `sqlite3Fp10Convert2` with no shortcuts.
 pub fn fp10_convert2_full(d: u64, p: i32) -> f64 {
-    if p < POWERSOF10_FIRST {
+    if d == 0 || p < POWERSOF10_FIRST {
         return 0.0;
     }
     if p > POWERSOF10_LAST {
@@ -220,6 +220,7 @@ pub struct FpDecoded {
 
 /// `sqlite3FpDecode` (`util.c:1392`): decode `r` into rounded decimal digits.
 pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
+    let mx_round = mx_round.max(1);
     let sign = if r < 0.0 {
         r = -r;
         '-'
@@ -290,7 +291,7 @@ pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
     let mut i_dp = (n as i32) + exp;
 
     if i_round <= 0 {
-        i_round = i_dp - i_round;
+        i_round = i_dp.saturating_sub(i_round);
         if i_round == 0 && buf[z] >= b'5' {
             i_round = 1;
             z -= 1;

@@ -192,7 +192,7 @@ impl Pager {
     ) -> SqliteResult<Arc<[u8]>> {
         inner.tick += 1;
         let tick = inner.tick;
-        let half_cap = (inner.capacity >> 1) as u64;
+        let half_cap = (inner.capacity >> 1).max(1) as u64;
         if let Some(entry) = inner.cache.get_mut(&pgno) {
             inner.meter.charge_steps(1)?;
             inner.stats.hits += 1;
@@ -200,6 +200,12 @@ impl Pager {
             if tick.saturating_sub(entry.tick) > half_cap {
                 entry.tick = tick;
                 inner.lru.push_back((pgno, tick));
+                if inner.lru.len() > inner.capacity.saturating_mul(2) {
+                    let cache = &inner.cache;
+                    inner
+                        .lru
+                        .retain(|(p, t)| cache.get(p).is_some_and(|e| e.tick == *t));
+                }
             }
             return Ok(data);
         }

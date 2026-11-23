@@ -1,6 +1,7 @@
 //! SQLite 3.54.1 expression evaluator with exact affinity, collation propagation,
 //! row-value vector comparisons, correlated subqueries, and `VIRTUAL` generated column support.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 
 use xdb_core::value::{
@@ -18,7 +19,8 @@ use crate::catalog::{QueryOptions, QueryParams, SqlCatalog};
 use crate::errors::{SqlError, SqlResult};
 use crate::functions::{
     date::{date_named, datetime_named, time_named},
-    eval_json_arrow, like_invoke, FunctionContext, GLOB_INFO, LIKE_CASE_SENSITIVE_INFO, LIKE_INFO,
+    json::eval_json_arrow_metered,
+    like_invoke, FunctionContext, GLOB_INFO, LIKE_CASE_SENSITIVE_INFO, LIKE_INFO,
 };
 use crate::utf8::text_bytes_of;
 
@@ -35,6 +37,9 @@ pub struct ScopeColumn {
     pub is_rowid_alias: bool,
 }
 
+/// Maximum recursive expression evaluation depth to prevent host stack overflow.
+const MAX_EVAL_DEPTH: u32 = 1000;
+
 /// Evaluation scope for one query level (a table row, join row, group row, or outer correlated row).
 #[derive(Debug, Clone)]
 pub struct EvalScope<'a> {
@@ -42,6 +47,10 @@ pub struct EvalScope<'a> {
     pub values: &'a [SqlValue],
     /// Pre-computed aggregate/window expression results keyed by AST byte span `(start, end)`.
     pub precomputed: Option<&'a [(usize, usize, SqlValue)]>,
+    /// Optional parallel JSON-subtype flags for `precomputed` entries.
+    pub precomputed_json: Option<&'a [bool]>,
+    /// Optional per-column flag hiding duplicate `USING`/`NATURAL JOIN` columns from unqualified lookup.
+    pub hidden_unqualified: Option<&'a [bool]>,
     /// Optional alias scope (e.g., `SELECT` result aliases visible to `GROUP BY` / `HAVING` / `ORDER BY`).
     pub aliases: Option<&'a [(String, SqlValue, Affinity, String)]>,
     /// True for generated column evaluation (disallows `rowid`/`_rowid_`/`oid` unless real column).
@@ -54,11 +63,30 @@ impl<'a> EvalScope<'a> {
             columns,
             values,
             precomputed: None,
+            precomputed_json: None,
+            hidden_unqualified: None,
             aliases: None,
             no_rowid_aliases: false,
         }
     }
 }
+
+/// Result of executing a subquery with column names, affinities, and rows.
+pub type SelectWithAffinities = (Vec<String>, Vec<Option<Affinity>>, Vec<Vec<SqlValue>>);
+
+/// Result of scanning an `IN table` target with column affinities and rows.
+pub type TableRowsWithAffinities = (Vec<Option<Affinity>>, Vec<Vec<SqlValue>>);
+
+/// Result of executing a subquery with column names, affinities, collations, and rows.
+pub type SelectWithMeta = (
+    Vec<String>,
+    Vec<Option<Affinity>>,
+    Vec<ExprCollation>,
+    Vec<Vec<SqlValue>>,
+);
+
+/// Result of scanning an `IN table` target with column affinities, collations, and rows.
+pub type TableRowsWithMeta = (Vec<Option<Affinity>>, Vec<ExprCollation>, Vec<Vec<SqlValue>>);
 
 /// Callback invoked by the expression evaluator to execute subqueries (`EXISTS`, scalar, `IN (SELECT ...)`).
 pub trait SubqueryRunner {
@@ -68,12 +96,54 @@ pub trait SubqueryRunner {
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<(Vec<String>, Vec<Vec<SqlValue>>)>;
 
+    fn run_select_with_affinities(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<SelectWithAffinities> {
+        let (cols, rows) = self.run_select(stmt, outer_scopes)?;
+        let affs = vec![None; cols.len()];
+        Ok((cols, affs, rows))
+    }
+
+    fn run_select_with_meta(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<SelectWithMeta> {
+        let (cols, affs, rows) = self.run_select_with_affinities(stmt, outer_scopes)?;
+        let colls = vec![ExprCollation::none(); cols.len()];
+        Ok((cols, affs, colls, rows))
+    }
+
     fn run_in_table(
         &self,
         schema: Option<&str>,
         table: &str,
         args: Option<&[SqlValue]>,
     ) -> SqlResult<Vec<Vec<SqlValue>>>;
+
+    fn run_in_table_with_affinities(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<TableRowsWithAffinities> {
+        let rows = self.run_in_table(schema, table, args)?;
+        let width = rows.first().map_or(0, Vec::len);
+        Ok((vec![None; width], rows))
+    }
+
+    fn run_in_table_with_meta(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<TableRowsWithMeta> {
+        let (affs, rows) = self.run_in_table_with_affinities(schema, table, args)?;
+        let colls = vec![ExprCollation::none(); affs.len()];
+        Ok((affs, colls, rows))
+    }
 }
 
 /// No-op subquery runner used for standalone expressions and `VIRTUAL` generated columns.
@@ -110,6 +180,15 @@ pub struct EvalEnv<'a> {
     pub fn_ctx: FunctionContext<'a>,
     pub subqueries: &'a dyn SubqueryRunner,
     pub dqs: bool,
+    eval_depth: Cell<u32>,
+}
+
+struct EvalDepthGuard<'a>(&'a Cell<u32>);
+
+impl Drop for EvalDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 impl std::fmt::Debug for EvalEnv<'_> {
@@ -142,6 +221,7 @@ impl<'a> EvalEnv<'a> {
             fn_ctx,
             subqueries,
             dqs: options.dqs,
+            eval_depth: Cell::new(0),
         }
     }
 
@@ -211,14 +291,34 @@ pub fn resolve_column(
     scopes: &[EvalScope<'_>],
     dqs: bool,
 ) -> SqlResult<ResolvedCol> {
+    let want_schema = col_ref.schema.as_ref().map(|n| n.name.as_str());
     let want_table = col_ref.table.as_ref().map(|n| n.name.as_str());
     let want_col = col_ref.column.name.as_str();
+
+    // Validate schema qualifier if present (only `main` exists in XDB single-DB catalogs).
+    if let Some(ws) = want_schema {
+        if !ws.eq_ignore_ascii_case("main") {
+            let full = match want_table {
+                Some(t) => format!("{ws}.{t}.{want_col}"),
+                None => format!("{ws}.{want_col}"),
+            };
+            return Err(SqlError::runtime(format!("no such column: {full}")));
+        }
+    }
 
     for scope in scopes.iter().rev() {
         let mut found_idx: Option<usize> = None;
         let mut ambiguous = false;
         for (idx, col) in scope.columns.iter().enumerate() {
             if col.is_rowid_alias && scope.no_rowid_aliases {
+                continue;
+            }
+            if want_table.is_none()
+                && scope
+                    .hidden_unqualified
+                    .and_then(|h| h.get(idx).copied())
+                    .unwrap_or(false)
+            {
                 continue;
             }
             if let Some(wt) = want_table {
@@ -274,6 +374,28 @@ pub fn resolve_column(
         }
     }
 
+    // SQLite 3.23+ boolean literal fallback: unquoted `true` / `false` evaluate to 1 / 0
+    // when no matching column exists in scope (e.g. `DEFAULT (true)`, `CHECK (x = true)`).
+    if want_table.is_none()
+        && want_schema.is_none()
+        && col_ref.column.quote == QuoteStyle::None
+    {
+        if want_col.eq_ignore_ascii_case("true") {
+            return Ok(ResolvedCol {
+                value: SqlValue::Int(1),
+                affinity: Affinity::None,
+                collation: "BINARY".to_string(),
+            });
+        }
+        if want_col.eq_ignore_ascii_case("false") {
+            return Ok(ResolvedCol {
+                value: SqlValue::Int(0),
+                affinity: Affinity::None,
+                collation: "BINARY".to_string(),
+            });
+        }
+    }
+
     // SQLite DQS fallback: double-quoted identifier becomes a string literal when `dqs` is true.
     if dqs && want_table.is_none() && col_ref.schema.is_none() && col_ref.column.quote == QuoteStyle::Double {
         return Ok(ResolvedCol {
@@ -283,9 +405,11 @@ pub fn resolve_column(
         });
     }
 
-    let full = match want_table {
-        Some(t) => format!("{t}.{want_col}"),
-        None => want_col.to_string(),
+    let full = match (want_schema, want_table) {
+        (Some(s), Some(t)) => format!("{s}.{t}.{want_col}"),
+        (None, Some(t)) => format!("{t}.{want_col}"),
+        (Some(s), None) => format!("{s}.{want_col}"),
+        (None, None) => want_col.to_string(),
     };
     Err(SqlError::runtime(format!("no such column: {full}")))
 }
@@ -305,7 +429,12 @@ pub fn expr_affinity(expr: &Expr, scopes: &[EvalScope<'_>]) -> Option<Affinity> 
         Expr::Subquery { select, .. } => {
             if let xdb_parser::SelectBody::Core(core) = &select.body {
                 if let Some(xdb_parser::ResultColumn::Expr(re)) = core.columns.first() {
-                    return expr_affinity(&re.expr, scopes);
+                    if let Expr::Cast { type_name, .. } = &re.expr {
+                        return Some(match type_name {
+                            Some(t) => affinity_of_decl_type(Some(t.text.as_bytes())),
+                            None => Affinity::Blob,
+                        });
+                    }
                 }
             }
             None
@@ -322,7 +451,11 @@ pub fn expr_collation(expr: &Expr, scopes: &[EvalScope<'_>]) -> ExprCollation {
             Ok(r) => ExprCollation::implicit(r.collation),
             Err(_) => ExprCollation::none(),
         },
-        Expr::Cast { operand, .. } => expr_collation(operand, scopes),
+        Expr::Unary {
+            op: UnaryOp::Pos,
+            operand,
+            ..
+        } => expr_collation(operand, scopes),
         _ => ExprCollation::none(),
     }
 }
@@ -333,15 +466,27 @@ pub fn eval_expr_tagged(
     scopes: &[EvalScope<'_>],
     env: &EvalEnv<'_>,
 ) -> SqlResult<(SqlValue, bool)> {
+    let next_depth = env.eval_depth.get() + 1;
+    if next_depth > MAX_EVAL_DEPTH {
+        return Err(SqlError::runtime(format!(
+            "Expression tree is too large (maximum depth {MAX_EVAL_DEPTH})"
+        )));
+    }
+    env.eval_depth.set(next_depth);
+    let _depth_guard = EvalDepthGuard(&env.eval_depth);
     env.fn_ctx.charge_steps(1)?;
 
     // Check precomputed aggregate/window slot on the innermost scope first.
     let span = expr.span();
     if let Some(inner) = scopes.last() {
         if let Some(pre) = inner.precomputed {
-            for (s, e, v) in pre {
+            for (i, (s, e, v)) in pre.iter().enumerate() {
                 if *s == span.start && *e == span.end {
-                    return Ok((v.clone(), false));
+                    let is_json = inner
+                        .precomputed_json
+                        .and_then(|fl| fl.get(i).copied())
+                        .unwrap_or(false);
+                    return Ok((v.clone(), is_json));
                 }
             }
         }
@@ -437,12 +582,43 @@ pub fn eval_expr_tagged(
                     };
                     like_invoke(&args, &env.fn_ctx, info)?
                 }
-                LikeOperator::Glob => like_invoke(&args, &env.fn_ctx, GLOB_INFO)?,
+                LikeOperator::Glob => {
+                    if escape.is_some() {
+                        return Err(SqlError::runtime(
+                            "wrong number of arguments to function glob()",
+                        ));
+                    }
+                    like_invoke(&args, &env.fn_ctx, GLOB_INFO)?
+                }
                 LikeOperator::Regexp => {
-                    return Err(SqlError::runtime("no such function: REGEXP"));
+                    if escape.is_some() {
+                        return Err(SqlError::runtime(
+                            "wrong number of arguments to function regexp()",
+                        ));
+                    }
+                    if env.options.functions.has_custom_scalar("regexp", args.len()) {
+                        env.options
+                            .functions
+                            .call_scalar("regexp", &args, &env.fn_ctx)?
+                            .0
+                    } else {
+                        return Err(SqlError::runtime("no such function: REGEXP"));
+                    }
                 }
                 LikeOperator::Match => {
-                    return Err(SqlError::runtime("no such function: MATCH"));
+                    if escape.is_some() {
+                        return Err(SqlError::runtime(
+                            "wrong number of arguments to function match()",
+                        ));
+                    }
+                    if env.options.functions.has_custom_scalar("match", args.len()) {
+                        env.options
+                            .functions
+                            .call_scalar("match", &args, &env.fn_ctx)?
+                            .0
+                    } else {
+                        return Err(SqlError::runtime("no such function: MATCH"));
+                    }
                 }
             };
             let out = if *not {
@@ -463,6 +639,44 @@ pub fn eval_expr_tagged(
             high,
             ..
         } => {
+            if is_row_value_expr(operand) || is_row_value_expr(low) || is_row_value_expr(high) {
+                let (xvals, xaffs, xcolls) = eval_row_vector(operand, scopes, env)?;
+                let (lvals, laffs, lcolls) = eval_row_vector(low, scopes, env)?;
+                let (hvals, haffs, hcolls) = eval_row_vector(high, scopes, env)?;
+                if xvals.len() != lvals.len() || xvals.len() != hvals.len() {
+                    return Err(SqlError::runtime("row value misused"));
+                }
+                let ge_lo = compare_row_tuples(
+                    CompareOp::Ge,
+                    &xvals,
+                    &xaffs,
+                    &xcolls,
+                    &lvals,
+                    &laffs,
+                    &lcolls,
+                    env,
+                )?;
+                let le_hi = compare_row_tuples(
+                    CompareOp::Le,
+                    &xvals,
+                    &xaffs,
+                    &xcolls,
+                    &hvals,
+                    &haffs,
+                    &hcolls,
+                    env,
+                )?;
+                let in_range = match (ge_lo, le_hi) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                };
+                let out = match in_range {
+                    None => SqlValue::Null,
+                    Some(b) => SqlValue::Int(i64::from(if *not { !b } else { b })),
+                };
+                return Ok((out, false));
+            }
             let (x, _) = eval_expr_tagged(operand, scopes, env)?;
             let (lo, _) = eval_expr_tagged(low, scopes, env)?;
             let (hi, _) = eval_expr_tagged(high, scopes, env)?;
@@ -528,12 +742,12 @@ pub fn eval_expr_tagged(
                 }
                 None => None,
             };
-            let rows = env.subqueries.run_in_table(
+            let (rhs_affs, rhs_colls, rows) = env.subqueries.run_in_table_with_meta(
                 schema.as_ref().map(|n| n.name.as_str()),
                 &table.name,
                 eval_args.as_deref(),
             )?;
-            eval_in_rows(*not, operand, &rows, scopes, env)
+            eval_in_rows(*not, operand, &rhs_affs, &rhs_colls, &rows, scopes, env)
         }
         Expr::Exists { select, .. } => {
             let (_, rows) = env.subqueries.run_select(select, scopes)?;
@@ -627,15 +841,77 @@ pub fn eval_expr_tagged(
                     f.name.name
                 )));
             }
+            // Short-circuit built-in conditional functions (SQLite evaluates only taken branches).
+            let lower_fn = f.name.name.to_ascii_lowercase();
+            if !env
+                .options
+                .functions
+                .has_custom_scalar(&lower_fn, f.args.len())
+            {
+                match lower_fn.as_str() {
+                    "coalesce" => {
+                        if f.args.len() < 2 {
+                            return Err(SqlError::runtime(
+                                "wrong number of arguments to function coalesce()",
+                            ));
+                        }
+                        for a in &f.args {
+                            let (v, is_j) = eval_expr_tagged(a, scopes, env)?;
+                            if !v.is_null() {
+                                return Ok((v, is_j));
+                            }
+                        }
+                        return Ok((SqlValue::Null, false));
+                    }
+                    "ifnull" => {
+                        if f.args.len() != 2 {
+                            return Err(SqlError::runtime(
+                                "wrong number of arguments to function ifnull()",
+                            ));
+                        }
+                        let (v0, j0) = eval_expr_tagged(&f.args[0], scopes, env)?;
+                        if !v0.is_null() {
+                            return Ok((v0, j0));
+                        }
+                        return eval_expr_tagged(&f.args[1], scopes, env);
+                    }
+                    "iif" | "if" => {
+                        if f.args.len() < 2 {
+                            return Err(SqlError::runtime(format!(
+                                "wrong number of arguments to function {}()",
+                                f.name.name
+                            )));
+                        }
+                        let mut idx = 0;
+                        while idx + 1 < f.args.len() {
+                            let (cond, _) = eval_expr_tagged(&f.args[idx], scopes, env)?;
+                            if boolean_value(&cond, false) {
+                                return eval_expr_tagged(&f.args[idx + 1], scopes, env);
+                            }
+                            idx += 2;
+                        }
+                        if idx < f.args.len() {
+                            return eval_expr_tagged(&f.args[idx], scopes, env);
+                        }
+                        return Ok((SqlValue::Null, false));
+                    }
+                    _ => {}
+                }
+            }
             let mut arg_vals = Vec::with_capacity(f.args.len());
             let mut json_mask: u64 = 0;
-            // For collation-sensitive scalar functions (min/max/nullif), derive collation from first arg with collation.
-            let mut coll_opt: Option<&Collation> = None;
+            // Explicit COLLATE on any arg overrides implicit collation (matching SQLite).
+            let mut explicit_coll: Option<&Collation> = None;
+            let mut implicit_coll: Option<&Collation> = None;
             for (idx, a) in f.args.iter().enumerate() {
-                if coll_opt.is_none() {
-                    let oc = expr_collation(a, scopes);
-                    if let Some(ref cname) = oc.name {
-                        coll_opt = Some(env.lookup_collation(cname)?);
+                let oc = expr_collation(a, scopes);
+                if let Some(ref cname) = oc.name {
+                    if oc.explicit {
+                        if explicit_coll.is_none() {
+                            explicit_coll = Some(env.lookup_collation(cname)?);
+                        }
+                    } else if implicit_coll.is_none() {
+                        implicit_coll = Some(env.lookup_collation(cname)?);
                     }
                 }
                 let (v, is_j) = eval_expr_tagged(a, scopes, env)?;
@@ -644,6 +920,7 @@ pub fn eval_expr_tagged(
                 }
                 arg_vals.push(v);
             }
+            let coll_opt = explicit_coll.or(implicit_coll);
             let call_ctx = env
                 .fn_ctx
                 .with_collation_and_json_mask(coll_opt, json_mask);
@@ -735,8 +1012,15 @@ fn eval_binary(
                 BinaryOp::IsNot => CompareOp::IsNot,
                 _ => unreachable!(),
             };
-            // Row-value vector comparisons: `(a, b) = (c, d)` or `(a, b) = (SELECT x, y ...)`
-            if is_row_value_expr(left) || is_row_value_expr(right) {
+            // Row-value vector comparisons: `(a, b) = (c, d)`, `(a, b) = (SELECT x, y)`,
+            // or `(SELECT 1, 2) = (SELECT 1, 2)`
+            if is_row_value_expr(left)
+                || is_row_value_expr(right)
+                || matches!(
+                    (left, right),
+                    (Expr::Subquery { .. }, Expr::Subquery { .. })
+                )
+            {
                 return eval_vector_compare(cop, left, right, scopes, env);
             }
             let (lv, _) = eval_expr_tagged(left, scopes, env)?;
@@ -779,18 +1063,23 @@ fn eval_binary(
             if total > env.fn_ctx.limits.max_length {
                 return Err(SqlError::too_big());
             }
+            env.fn_ctx.charge_steps((total / 256) as u64 + 1)?;
+            if let Some(m) = env.fn_ctx.meter {
+                m.reserve_memory(total as u64)?;
+                m.release_memory(total as u64);
+            }
             let mut buf = Vec::with_capacity(total);
             buf.extend_from_slice(&lb);
             buf.extend_from_slice(&rb);
             SqlValue::Text(buf.into_boxed_slice())
         }
         BinaryOp::Ptr => {
-            let v = eval_json_arrow(&lv, &rv, false)?;
+            let v = eval_json_arrow_metered(&lv, &rv, false, &env.fn_ctx)?;
             let is_j = !v.is_null();
             return Ok((v, is_j));
         }
         BinaryOp::Ptr2 => {
-            return Ok((eval_json_arrow(&lv, &rv, true)?, false));
+            return Ok((eval_json_arrow_metered(&lv, &rv, true, &env.fn_ctx)?, false));
         }
         _ => unreachable!(),
     };
@@ -821,14 +1110,12 @@ fn eval_row_vector(
             Ok((vals, affs, colls))
         }
         Expr::Subquery { select, .. } => {
-            let (cols, rows) = env.subqueries.run_select(select, scopes)?;
+            let (cols, affs, colls, rows) = env.subqueries.run_select_with_meta(select, scopes)?;
             let width = cols.len();
             let vals = rows
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| vec![SqlValue::Null; width]);
-            let affs = vec![None; width];
-            let colls = vec![ExprCollation::none(); width];
             Ok((vals, affs, colls))
         }
         other => Ok((
@@ -929,16 +1216,64 @@ fn eval_in_list(
     if items.is_empty() {
         return Ok((SqlValue::Int(i64::from(not)), false));
     }
+    // Row-value IN list: `(a, b) IN ((1, 2), (3, NULL))`
+    if is_row_value_expr(operand) {
+        let (lvals, laffs, lcolls) = eval_row_vector(operand, scopes, env)?;
+        let width = lvals.len();
+        let mut saw_null = false;
+        for item in items {
+            let (rvals, _raffs, rcolls) = eval_row_vector(item, scopes, env)?;
+            if rvals.len() != width {
+                return Err(SqlError::runtime(format!(
+                    "row value misused: {} vs {} columns",
+                    width,
+                    rvals.len()
+                )));
+            }
+            let mut row_null = false;
+            let mut row_match = true;
+            for i in 0..width {
+                let eff_aff = in_affinity(laffs[i], None);
+                let lv = apply_affinity(lvals[i].clone(), eff_aff);
+                let rv = apply_affinity(rvals[i].clone(), eff_aff);
+                if lv.is_null() || rv.is_null() {
+                    row_null = true;
+                    continue;
+                }
+                let cname =
+                    comparison_collation_name(lcolls[i].as_operand(), rcolls[i].as_operand());
+                let coll = env.lookup_opt_collation(cname)?;
+                if mem_compare(&lv, &rv, coll) != Ordering::Equal {
+                    row_match = false;
+                    break;
+                }
+            }
+            if row_match && !row_null {
+                return Ok((SqlValue::Int(i64::from(!not)), false));
+            }
+            if row_match && row_null {
+                saw_null = true;
+            }
+        }
+        return Ok((
+            if saw_null {
+                SqlValue::Null
+            } else {
+                SqlValue::Int(i64::from(not))
+            },
+            false,
+        ));
+    }
+
     let lhs_val = eval_expr(operand, scopes, env)?;
     let lhs_aff = expr_affinity(operand, scopes);
     let lhs_coll = expr_collation(operand, scopes);
-    let cname = comparison_collation_name(lhs_coll.as_operand(), None);
-    let coll = env.lookup_opt_collation(cname)?;
     let aff = in_affinity(lhs_aff, None);
 
     if lhs_val.is_null() {
         return Ok((SqlValue::Null, false));
     }
+    let lhs_coerced = apply_affinity(lhs_val, aff);
     let mut saw_null = false;
     for item in items {
         let rv = eval_expr(item, scopes, env)?;
@@ -946,8 +1281,10 @@ fn eval_in_list(
             saw_null = true;
             continue;
         }
+        let rcoll = expr_collation(item, scopes);
+        let cname = comparison_collation_name(lhs_coll.as_operand(), rcoll.as_operand());
+        let coll = env.lookup_opt_collation(cname)?;
         let rhs_coerced = apply_affinity(rv, aff);
-        let lhs_coerced = apply_affinity(lhs_val.clone(), aff);
         if mem_compare(&lhs_coerced, &rhs_coerced, coll) == Ordering::Equal {
             return Ok((SqlValue::Int(i64::from(!not)), false));
         }
@@ -966,7 +1303,7 @@ fn eval_in_select(
     scopes: &[EvalScope<'_>],
     env: &EvalEnv<'_>,
 ) -> SqlResult<(SqlValue, bool)> {
-    let (cols, rows) = env.subqueries.run_select(select, scopes)?;
+    let (cols, rhs_affs, rhs_colls, rows) = env.subqueries.run_select_with_meta(select, scopes)?;
     let width = if let Expr::Vector { items, .. } = operand {
         items.len()
     } else {
@@ -978,42 +1315,70 @@ fn eval_in_select(
             cols.len()
         )));
     }
-    eval_in_rows(not, operand, &rows, scopes, env)
+    eval_in_rows(not, operand, &rhs_affs, &rhs_colls, &rows, scopes, env)
 }
 
 fn eval_in_rows(
     not: bool,
     operand: &Expr,
+    rhs_affs: &[Option<Affinity>],
+    rhs_colls: &[ExprCollation],
     rows: &[Vec<SqlValue>],
     scopes: &[EvalScope<'_>],
     env: &EvalEnv<'_>,
 ) -> SqlResult<(SqlValue, bool)> {
+    let (lvals, laffs, lcolls) = eval_row_vector(operand, scopes, env)?;
+    let width = lvals.len();
+    if !rhs_affs.is_empty() && rhs_affs.len() != width {
+        return Err(SqlError::runtime(format!(
+            "sub-select returns {} columns - expected {width}",
+            rhs_affs.len()
+        )));
+    }
     if rows.is_empty() {
         return Ok((SqlValue::Int(i64::from(not)), false));
     }
-    let (lvals, laffs, lcolls) = eval_row_vector(operand, scopes, env)?;
-    let width = lvals.len();
-    let raffs: Vec<Option<Affinity>> = laffs.iter().map(|&a| Some(in_affinity(a, None))).collect();
-    let rcolls = vec![ExprCollation::none(); width];
+    let eff_affs: Vec<Affinity> = (0..width)
+        .map(|i| in_affinity(laffs[i], Some(rhs_affs.get(i).copied().flatten())))
+        .collect();
+    let eff_colls: Vec<Option<&Collation>> = (0..width)
+        .map(|i| {
+            let rcoll = rhs_colls.get(i).and_then(ExprCollation::as_operand);
+            let cname = comparison_collation_name(lcolls[i].as_operand(), rcoll);
+            env.lookup_opt_collation(cname)
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    let lvals_coerced: Vec<SqlValue> = lvals
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| apply_affinity(v, eff_affs[i]))
+        .collect();
 
     let mut saw_null = false;
     for row in rows {
-        if row.len() < width {
+        env.fn_ctx.charge_steps(1)?;
+        if row.len() != width {
             return Err(SqlError::runtime("row value width mismatch in IN"));
         }
-        match compare_row_tuples(
-            CompareOp::Eq,
-            &lvals,
-            &laffs,
-            &lcolls,
-            &row[..width],
-            &raffs,
-            &rcolls,
-            env,
-        )? {
-            Some(true) => return Ok((SqlValue::Int(i64::from(!not)), false)),
-            Some(false) => {}
-            None => saw_null = true,
+        let mut row_null = false;
+        let mut row_match = true;
+        for i in 0..width {
+            let lv = &lvals_coerced[i];
+            let rv = apply_affinity(row[i].clone(), eff_affs[i]);
+            if lv.is_null() || rv.is_null() {
+                row_null = true;
+                continue;
+            }
+            if mem_compare(lv, &rv, eff_colls[i]) != Ordering::Equal {
+                row_match = false;
+                break;
+            }
+        }
+        if row_match && !row_null {
+            return Ok((SqlValue::Int(i64::from(!not)), false));
+        }
+        if row_match && row_null {
+            saw_null = true;
         }
     }
     if saw_null {

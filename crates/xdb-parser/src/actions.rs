@@ -1091,6 +1091,14 @@ fn append_from_term(
             SemVal::FromSource(Box::new(term))
         }
         Some((left, operator)) => {
+            if (operator.flags & join_flag::NATURAL) != 0 && (on.is_some() || using.is_some()) {
+                p.error(
+                    "a NATURAL join may not have an ON or USING clause".to_string(),
+                    p.rs,
+                    p.re,
+                    SqlParseErrorKind::Syntax,
+                );
+            }
             let start = left.span().start;
             let end = p.re.max(0) as usize;
             SemVal::FromSource(Box::new(FromSource::Join {
@@ -1443,12 +1451,12 @@ fn binary_expr(p: &mut Parser<'_>, b: usize, op: BinaryOp) -> SemVal {
     let hr = p.h[b + 2];
     let fl = p.f[b];
     let fr = p.f[b + 2];
-    if op == BinaryOp::And && ((fl | fr) & (FALSE | FUNC)) == FALSE {
-        p.h[b] = 1;
-        p.f[b] = FALSE;
+    let f = if op == BinaryOp::And && ((fl | fr) & (FALSE | FUNC)) == FALSE {
+        FALSE
     } else {
-        set_pexpr(p, b, hl.max(hr) + 1, fl | fr);
-    }
+        fl | fr
+    };
+    set_pexpr(p, b, hl.max(hr) + 1, f);
     SemVal::Expr(Expr::Binary {
         span: p.rule_span(),
         op,
@@ -1469,12 +1477,12 @@ fn in_list_action(p: &mut Parser<'_>, b: usize) -> SemVal {
     let re = p.re;
     let span = p.rule_span();
     if items.is_empty() {
-        if (fa & FUNC) == 0 {
-            p.h[b] = 1;
-            p.f[b] = if not { 0 } else { FALSE };
+        let f = if (fa & FUNC) == 0 {
+            if not { 0 } else { FALSE }
         } else {
-            set_pexpr(p, b, ha.max(1) + 1, fa);
-        }
+            fa
+        };
+        set_pexpr(p, b, ha.max(1) + 1, f);
         return SemVal::Expr(Expr::InList {
             span,
             not,
@@ -3184,8 +3192,9 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             })
         }
         ActionId::ExprCast => {
-            p.h[b] = p.h[b + 2] + 1;
-            p.f[b] = p.f[b + 2] & FUNC;
+            let h = p.h[b + 2] + 1;
+            let f = p.f[b + 2] & FUNC;
+            set_pexpr(p, b, h, f);
             SemVal::Expr(Expr::Cast {
                 span: p.rule_span(),
                 operand: Box::new(take_expr(p, b + 2)),
@@ -4247,8 +4256,9 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
 
         // ── XDB dialect ──
         ActionId::XdbExprDcolonCast => {
-            p.h[b] += 1;
-            p.f[b] &= FUNC;
+            let h = p.h[b] + 1;
+            let f = p.f[b] & FUNC;
+            set_pexpr(p, b, h, f);
             SemVal::Expr(Expr::Cast {
                 span: p.rule_span(),
                 operand: Box::new(take_expr(p, b)),

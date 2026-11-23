@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use xdb_core::value::{
     apply_affinity, boolean_value, compare_op, comparison_affinity, comparison_collation_name,
-    int_value, mem_compare, Collation, CompareOp, OperandCollation,
+    mem_compare, must_be_int, real_to_exact_i64, Collation, CompareOp, OperandCollation,
 };
 use xdb_core::{Affinity, SqlValue};
 use xdb_parser::{
@@ -19,30 +19,63 @@ use crate::catalog::{Bound, QueryOptions, QueryParams, QueryResult, SqlCatalog, 
 use crate::errors::{SqlError, SqlResult};
 use crate::eval::{
     collect_aggregates, collect_windows, eval_expr, expr_affinity, expr_collation,
-    expr_contains_aggregate, expr_contains_window, is_valid_schema_name, EvalEnv, EvalScope,
-    ScopeColumn, SubqueryRunner,
+    expr_contains_aggregate, expr_contains_window, is_valid_schema_name, resolve_column, EvalEnv,
+    EvalScope, ExprCollation, ScopeColumn, SelectWithMeta, SubqueryRunner, TableRowsWithMeta,
 };
 use crate::functions::{
     call_builtin_tvf, compute_frame_rows, eval_window_only_partition, is_builtin_window_only,
     PartitionPeers, ResolvedFrame,
 };
+use crate::utf8::MemoryGuard;
+
+/// Maximum nested query/compound/join recursion depth to prevent host stack overflow.
+const MAX_QUERY_DEPTH: usize = 128;
 
 /// Materialized intermediate relation during query execution.
 #[derive(Debug, Clone)]
 struct Relation {
     columns: Vec<ScopeColumn>,
-    /// Columns hidden from `SELECT *` (such as hidden table columns or right-hand `USING`/`NATURAL` duplicates).
+    /// Columns hidden from both `*` and `t.*` (hidden table columns, synthetic rowid aliases).
     star_hidden: Vec<bool>,
+    /// Columns hidden from unqualified `*` and unqualified name lookup (e.g. `USING` duplicates),
+    /// while remaining visible to qualified `t.col` and `t.*`.
+    using_hidden: Vec<bool>,
     rows: Vec<Vec<SqlValue>>,
 }
 
-type PrecomputedSlots = Vec<(usize, usize, SqlValue)>;
+#[derive(Debug, Clone)]
+struct PrecomputedRow {
+    slots: Vec<(usize, usize, SqlValue)>,
+    is_json: Vec<bool>,
+}
+
+impl PrecomputedRow {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            is_json: Vec::new(),
+        }
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(cap),
+            is_json: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, start: usize, end: usize, val: SqlValue, json: bool) {
+        self.slots.push((start, end, val));
+        self.is_json.push(json);
+    }
+}
 
 impl Relation {
     fn single_empty_row() -> Self {
         Self {
             columns: Vec::new(),
             star_hidden: Vec::new(),
+            using_hidden: Vec::new(),
             rows: vec![Vec::new()],
         }
     }
@@ -51,7 +84,7 @@ impl Relation {
 /// Materialized CTE entry visible in the current query scope.
 #[derive(Debug, Clone)]
 struct CteTable {
-    columns: Vec<String>,
+    columns: Vec<ScopeColumn>,
     rows: Vec<Vec<SqlValue>>,
 }
 
@@ -77,6 +110,21 @@ impl<'a> CatalogSubqueryRunner<'a> {
             exec: QueryExec::new(catalog, options, params),
         }
     }
+
+    /// Build a [`CatalogSubqueryRunner`] pre-populated with any `WITH` CTEs (for `UPDATE`/`DELETE`).
+    pub fn with_ctes(
+        catalog: &'a dyn SqlCatalog,
+        options: &'a QueryOptions,
+        params: &'a QueryParams,
+        with: Option<&WithClause>,
+    ) -> SqlResult<Self> {
+        let base = QueryExec::new(catalog, options, params);
+        let exec = match with {
+            Some(w) => base.materialize_with(w, &[])?,
+            None => base,
+        };
+        Ok(Self { exec })
+    }
 }
 
 impl SubqueryRunner for CatalogSubqueryRunner<'_> {
@@ -88,6 +136,22 @@ impl SubqueryRunner for CatalogSubqueryRunner<'_> {
         self.exec.run_select(stmt, outer_scopes)
     }
 
+    fn run_select_with_affinities(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<(Vec<String>, Vec<Option<Affinity>>, Vec<Vec<SqlValue>>)> {
+        self.exec.run_select_with_affinities(stmt, outer_scopes)
+    }
+
+    fn run_select_with_meta(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<SelectWithMeta> {
+        self.exec.run_select_with_meta(stmt, outer_scopes)
+    }
+
     fn run_in_table(
         &self,
         schema: Option<&str>,
@@ -96,7 +160,28 @@ impl SubqueryRunner for CatalogSubqueryRunner<'_> {
     ) -> SqlResult<Vec<Vec<SqlValue>>> {
         self.exec.run_in_table(schema, table, args)
     }
+
+    fn run_in_table_with_affinities(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<(Vec<Option<Affinity>>, Vec<Vec<SqlValue>>)> {
+        self.exec.run_in_table_with_affinities(schema, table, args)
+    }
+
+    fn run_in_table_with_meta(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<TableRowsWithMeta> {
+        self.exec.run_in_table_with_meta(schema, table, args)
+    }
 }
+
+type SelectRowsMeta = (Vec<ScopeColumn>, Vec<bool>, Vec<Vec<SqlValue>>);
+type SelectCoreResult = (Vec<ScopeColumn>, Vec<bool>, Vec<Vec<SqlValue>>, OrderEvalContext);
 
 /// Execution context holding catalog, options, parameters, and active CTE bindings.
 struct QueryExec<'a> {
@@ -105,6 +190,7 @@ struct QueryExec<'a> {
     params: &'a QueryParams,
     ctes: HashMap<String, CteTable>,
     view_depth: usize,
+    query_depth: usize,
 }
 
 impl<'a> QueryExec<'a> {
@@ -119,6 +205,7 @@ impl<'a> QueryExec<'a> {
             params,
             ctes: HashMap::new(),
             view_depth: 0,
+            query_depth: 0,
         }
     }
 
@@ -129,7 +216,21 @@ impl<'a> QueryExec<'a> {
             params: self.params,
             ctes,
             view_depth: self.view_depth,
+            query_depth: self.query_depth + 1,
         }
+    }
+
+    fn check_depth(&self, depth: usize) -> SqlResult<()> {
+        if depth > MAX_QUERY_DEPTH {
+            return Err(SqlError::runtime(format!(
+                "query nesting too deep (maximum {MAX_QUERY_DEPTH})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn make_mem_guard(&self) -> MemoryGuard<'_> {
+        MemoryGuard::new(self.options.meter.as_deref())
     }
 
     fn charge_steps(&self, n: u64) -> SqlResult<()> {
@@ -148,6 +249,16 @@ impl<'a> QueryExec<'a> {
         stmt: &SelectStmt,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+        let (cols, _expl, rows) = self.execute_select_stmt_meta(stmt, outer_scopes)?;
+        Ok((cols, rows))
+    }
+
+    fn execute_select_stmt_meta(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<SelectRowsMeta> {
+        self.check_depth(self.query_depth)?;
         if let Some(ref with) = stmt.with {
             let child = self.materialize_with(with, outer_scopes)?;
             return child.execute_select_no_with(stmt, outer_scopes);
@@ -167,9 +278,9 @@ impl<'a> QueryExec<'a> {
             } else {
                 let runner = self.child_with_ctes(map.clone());
                 let (cols, rows) = runner.execute_select_stmt(&cte.select, outer_scopes)?;
-                let col_names = apply_cte_column_names(cte, &cols)?;
+                let cte_cols = apply_cte_column_names(cte, &cols)?;
                 CteTable {
-                    columns: col_names,
+                    columns: cte_cols,
                     rows,
                 }
             };
@@ -184,81 +295,150 @@ impl<'a> QueryExec<'a> {
         existing: &HashMap<String, CteTable>,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<CteTable> {
-        // Check if body is `base UNION [ALL] recursive_step`.
-        if let SelectBody::Compound {
-            op, left, right, ..
-        } = &cte.select.body
-        {
-            if matches!(op, CompoundOperator::Union | CompoundOperator::UnionAll) {
-                let is_distinct = *op == CompoundOperator::Union;
-                let base_stmt = SelectStmt {
-                    span: left.span(),
-                    with: None,
-                    body: (**left).clone(),
-                    order_by: None,
-                    order_by_all: None,
-                    limit: None,
-                };
-                let step_stmt = SelectStmt {
-                    span: right.span(),
-                    with: None,
-                    body: (**right).clone(),
-                    order_by: None,
-                    order_by_all: None,
-                    limit: None,
-                };
-                let base_runner = self.child_with_ctes(existing.clone());
-                let (base_cols, base_rows) =
-                    base_runner.execute_select_stmt(&base_stmt, outer_scopes)?;
-                let col_names = apply_cte_column_names(cte, &base_cols)?;
-                let width = col_names.len();
+        // Flatten left-associative compound branches so we handle BOTH single and multiple
+        // recursive terms (`base UNION ALL rec1 UNION ALL rec2`), while treating non-self-referencing
+        // compound CTEs as normal non-recursive queries!
+        let mut flat: Vec<(Option<CompoundOperator>, &SelectBody)> = Vec::new();
+        flatten_compound_branches(&cte.select.body, &mut flat);
 
-                let mut all_rows: Vec<Vec<SqlValue>> = Vec::new();
-                let mut seen: Vec<Vec<SqlValue>> = Vec::new();
-                let mut frontier: Vec<Vec<SqlValue>> = Vec::new();
+        let first_rec = flat
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, (op, b))| {
+                matches!(
+                    op,
+                    Some(CompoundOperator::Union | CompoundOperator::UnionAll)
+                ) && select_body_references_table(b, &cte.name.name)
+            })
+            .map(|(i, _)| i);
 
+        if let Some(rec_start) = first_rec {
+            let mut base_body = flat[0].1.clone();
+            for (op, b) in &flat[1..rec_start] {
+                base_body = SelectBody::Compound {
+                    span: base_body.span(),
+                    op: op.unwrap(),
+                    left: Box::new(base_body),
+                    right: Box::new((*b).clone()),
+                };
+            }
+            let base_stmt = SelectStmt {
+                span: base_body.span(),
+                with: None,
+                body: base_body,
+                order_by: None,
+                order_by_all: None,
+                limit: None,
+            };
+            let rec_branches: Vec<(bool, SelectStmt)> = flat[rec_start..]
+                .iter()
+                .map(|(op, b)| {
+                    (
+                        *op == Some(CompoundOperator::Union),
+                        SelectStmt {
+                            span: b.span(),
+                            with: None,
+                            body: (*b).clone(),
+                            order_by: None,
+                            order_by_all: None,
+                            limit: None,
+                        },
+                    )
+                })
+                .collect();
+            let any_distinct = rec_branches.iter().any(|(d, _)| *d);
+
+            let base_runner = self.child_with_ctes(existing.clone());
+            let (base_cols, base_rows) =
+                base_runner.execute_select_stmt(&base_stmt, outer_scopes)?;
+            let cte_cols = apply_cte_column_names(cte, &base_cols)?;
+            let width = cte_cols.len();
+            let env = self.make_env();
+            let colls: Vec<&Collation> = cte_cols
+                .iter()
+                .map(|c| env.lookup_collation(&c.collation))
+                .collect::<SqlResult<Vec<_>>>()?;
+            let coll_names: Vec<&str> = cte_cols.iter().map(|c| c.collation.as_str()).collect();
+            let mut dedup = RowDedup::new(&coll_names, &colls);
+            let mut mem = self.make_mem_guard();
+
+            let mut all_rows: Vec<Vec<SqlValue>> = Vec::new();
+            let mut frontier: Vec<Vec<SqlValue>> = Vec::new();
+
+            let early_stop_rows = if let Some(ref lim) = cte.select.limit {
+                let count = eval_limit_int(&lim.count, outer_scopes, &env)?;
+                let offset = match &lim.offset {
+                    Some(o) => eval_limit_int(o, outer_scopes, &env)?.max(0),
+                    None => 0,
+                };
+                if count >= 0 {
+                    Some(usize::try_from(count.saturating_add(offset)).unwrap_or(usize::MAX))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let key = cte.name.name.to_ascii_lowercase();
+
+            if let Some(ref ord_terms) = cte.select.order_by {
+                // SQLite recursive CTE `ORDER BY`: priority-queue traversal popping the single
+                // minimum frontier row per step (enabling bounded `ORDER BY ... LIMIT` on infinite
+                // recursive CTEs and matching SQLite's exact priority-queue output order!).
+                let mut term_colls: Vec<&Collation> = Vec::with_capacity(ord_terms.len());
+                for (tidx, term) in ord_terms.iter().enumerate() {
+                    if let Some((ord, ov_coll)) = integer_ordinal_with_collation(&term.expr) {
+                        if ord < 1 || ord > width {
+                            return Err(SqlError::runtime(format!(
+                                "{} ORDER BY term out of range - should be between 1 and {width}",
+                                ordinal_label(tidx + 1)
+                            )));
+                        }
+                        let cname = ov_coll.unwrap_or(&cte_cols[ord - 1].collation);
+                        term_colls.push(env.lookup_collation(cname)?);
+                    } else {
+                        let mut sc_vec = outer_scopes.to_vec();
+                        sc_vec.push(EvalScope::simple(&cte_cols, &[]));
+                        let cname = expr_collation(&term.expr, &sc_vec)
+                            .name
+                            .unwrap_or_else(|| "BINARY".to_string());
+                        term_colls.push(env.lookup_collation(&cname)?);
+                    }
+                }
+                let compute_keys = |row: &[SqlValue]| -> SqlResult<Vec<SqlValue>> {
+                    let mut ks = Vec::with_capacity(ord_terms.len());
+                    let mut sc_vec = outer_scopes.to_vec();
+                    sc_vec.push(EvalScope::simple(&cte_cols, row));
+                    for term in ord_terms {
+                        if let Some((ord, _)) = integer_ordinal_with_collation(&term.expr) {
+                            ks.push(row[ord - 1].clone());
+                        } else {
+                            ks.push(eval_expr(&term.expr, &sc_vec, &env)?);
+                        }
+                    }
+                    Ok(ks)
+                };
+
+                let mut pq: Vec<(Vec<SqlValue>, Vec<SqlValue>)> = Vec::new();
                 for row in base_rows {
+                    self.charge_steps(1)?;
                     if row.len() != width {
                         return Err(SqlError::runtime(
                             "SELECTs to the left and right of UNION do not have the same number of result columns",
                         ));
                     }
-                    if is_distinct && contains_row_binary(&seen, &row) {
+                    if any_distinct && !dedup.insert(&row, self)? {
                         continue;
                     }
-                    if is_distinct {
-                        seen.push(row.clone());
-                    }
-                    frontier.push(row.clone());
-                    all_rows.push(row);
+                    mem.reserve(estimate_row_bytes(&row))?;
+                    let ks = compute_keys(&row)?;
+                    pq.push((ks, row));
                 }
 
-                // Determine optional LIMIT/OFFSET cap on the recursive CTE itself when no ORDER BY.
-                let early_stop_rows = if cte.select.order_by.is_none()
-                    && cte.select.order_by_all.is_none()
-                {
-                    if let Some(ref lim) = cte.select.limit {
-                        let env = self.make_env();
-                        let count = int_value(&eval_expr(&lim.count, outer_scopes, &env)?);
-                        let offset = match &lim.offset {
-                            Some(o) => int_value(&eval_expr(o, outer_scopes, &env)?).max(0),
-                            None => 0,
-                        };
-                        if count >= 0 {
-                            Some((count.saturating_add(offset)) as usize)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let key = cte.name.name.to_ascii_lowercase();
                 let mut iter = 0usize;
-                while !frontier.is_empty() {
+                while !pq.is_empty() {
                     if let Some(cap) = early_stop_rows {
                         if all_rows.len() >= cap {
                             break;
@@ -269,32 +449,116 @@ impl<'a> QueryExec<'a> {
                         return Err(SqlError::runtime("recursive CTE iteration limit exceeded"));
                     }
                     self.charge_steps(1)?;
-
+                    let mut best_i = 0usize;
+                    for i in 1..pq.len() {
+                        if compare_sort_keys(&pq[i].0, &pq[best_i].0, ord_terms, &term_colls)
+                            == Ordering::Less
+                        {
+                            best_i = i;
+                        }
+                    }
+                    let (_, popped) = pq.swap_remove(best_i);
+                    all_rows.push(popped.clone());
+                    if let Some(cap) = early_stop_rows {
+                        if all_rows.len() >= cap {
+                            break;
+                        }
+                    }
                     let mut step_map = existing.clone();
                     step_map.insert(
                         key.clone(),
                         CteTable {
-                            columns: col_names.clone(),
-                            rows: std::mem::take(&mut frontier),
+                            columns: cte_cols.clone(),
+                            rows: vec![popped],
                         },
                     );
                     let step_runner = self.child_with_ctes(step_map);
-                    let (_, new_rows) =
-                        step_runner.execute_select_stmt(&step_stmt, outer_scopes)?;
-
-                    for row in new_rows {
-                        self.charge_steps(1)?;
-                        if row.len() != width {
+                    for (is_dist, step_stmt) in &rec_branches {
+                        let (new_cols, new_rows) =
+                            step_runner.execute_select_stmt(step_stmt, outer_scopes)?;
+                        if new_cols.len() != width {
                             return Err(SqlError::runtime(
                                 "SELECTs to the left and right of UNION do not have the same number of result columns",
                             ));
                         }
-                        if is_distinct && contains_row_binary(&seen, &row) {
+                        for row in new_rows {
+                            self.charge_steps(1)?;
+                            if *is_dist && !dedup.insert(&row, self)? {
+                                continue;
+                            }
+                            mem.reserve(estimate_row_bytes(&row))?;
+                            let ks = compute_keys(&row)?;
+                            pq.push((ks, row));
+                        }
+                    }
+                }
+                let final_rows = self.apply_order_and_limit(
+                    &cte_cols,
+                    all_rows,
+                    None,
+                    None,
+                    None,
+                    cte.select.limit.as_ref(),
+                    outer_scopes,
+                )?;
+                return Ok(CteTable {
+                    columns: cte_cols,
+                    rows: final_rows,
+                });
+            }
+
+            // Standard breadth-first recursive evaluation (no ORDER BY on CTE).
+            for row in base_rows {
+                self.charge_steps(1)?;
+                if row.len() != width {
+                    return Err(SqlError::runtime(
+                        "SELECTs to the left and right of UNION do not have the same number of result columns",
+                    ));
+                }
+                if any_distinct && !dedup.insert(&row, self)? {
+                    continue;
+                }
+                mem.reserve(estimate_row_bytes(&row))?;
+                frontier.push(row.clone());
+                all_rows.push(row);
+            }
+
+            let mut iter = 0usize;
+            while !frontier.is_empty() {
+                if let Some(cap) = early_stop_rows {
+                    if all_rows.len() >= cap {
+                        break;
+                    }
+                }
+                iter += 1;
+                if iter > self.options.max_cte_iterations {
+                    return Err(SqlError::runtime("recursive CTE iteration limit exceeded"));
+                }
+                self.charge_steps(1)?;
+
+                let mut step_map = existing.clone();
+                step_map.insert(
+                    key.clone(),
+                    CteTable {
+                        columns: cte_cols.clone(),
+                        rows: std::mem::take(&mut frontier),
+                    },
+                );
+                let step_runner = self.child_with_ctes(step_map);
+                for (is_dist, step_stmt) in &rec_branches {
+                    let (new_cols, new_rows) =
+                        step_runner.execute_select_stmt(step_stmt, outer_scopes)?;
+                    if new_cols.len() != width {
+                        return Err(SqlError::runtime(
+                            "SELECTs to the left and right of UNION do not have the same number of result columns",
+                        ));
+                    }
+                    for row in new_rows {
+                        self.charge_steps(1)?;
+                        if *is_dist && !dedup.insert(&row, self)? {
                             continue;
                         }
-                        if is_distinct {
-                            seen.push(row.clone());
-                        }
+                        mem.reserve(estimate_row_bytes(&row))?;
                         frontier.push(row.clone());
                         all_rows.push(row);
                         if let Some(cap) = early_stop_rows {
@@ -303,41 +567,35 @@ impl<'a> QueryExec<'a> {
                             }
                         }
                     }
+                    if let Some(cap) = early_stop_rows {
+                        if all_rows.len() >= cap {
+                            break;
+                        }
+                    }
                 }
-
-                // Apply CTE's ORDER BY / LIMIT if present.
-                let scope_cols: Vec<ScopeColumn> = col_names
-                    .iter()
-                    .map(|n| ScopeColumn {
-                        table: None,
-                        name: n.clone(),
-                        affinity: Affinity::Blob,
-                        collation: "BINARY".to_string(),
-                        is_rowid_alias: false,
-                    })
-                    .collect();
-                let final_rows = self.apply_order_and_limit(
-                    &scope_cols,
-                    all_rows,
-                    None,
-                    cte.select.order_by.as_deref(),
-                    cte.select.order_by_all.as_ref(),
-                    cte.select.limit.as_ref(),
-                    outer_scopes,
-                )?;
-                return Ok(CteTable {
-                    columns: col_names,
-                    rows: final_rows,
-                });
             }
+
+            let final_rows = self.apply_order_and_limit(
+                &cte_cols,
+                all_rows,
+                None,
+                None,
+                cte.select.order_by_all.as_ref(),
+                cte.select.limit.as_ref(),
+                outer_scopes,
+            )?;
+            return Ok(CteTable {
+                columns: cte_cols,
+                rows: final_rows,
+            });
         }
 
-        // Non-compound CTE under WITH RECURSIVE: execute normally.
+        // Non-recursive CTE under WITH RECURSIVE: execute normally.
         let runner = self.child_with_ctes(existing.clone());
         let (cols, rows) = runner.execute_select_stmt(&cte.select, outer_scopes)?;
-        let col_names = apply_cte_column_names(cte, &cols)?;
+        let cte_cols = apply_cte_column_names(cte, &cols)?;
         Ok(CteTable {
-            columns: col_names,
+            columns: cte_cols,
             rows,
         })
     }
@@ -346,11 +604,11 @@ impl<'a> QueryExec<'a> {
         &self,
         stmt: &SelectStmt,
         outer_scopes: &[EvalScope<'_>],
-    ) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+    ) -> SqlResult<SelectRowsMeta> {
         match &stmt.body {
             SelectBody::Core(core) => {
                 // Keep FROM-scope info available for ORDER BY resolution in single-core queries.
-                let (out_cols, out_rows, order_ctx) =
+                let (out_cols, out_expl, out_rows, order_ctx) =
                     self.execute_select_core(core, outer_scopes, stmt.order_by.as_deref())?;
                 let final_rows = self.apply_order_and_limit(
                     &out_cols,
@@ -361,10 +619,11 @@ impl<'a> QueryExec<'a> {
                     stmt.limit.as_ref(),
                     outer_scopes,
                 )?;
-                Ok((out_cols, final_rows))
+                Ok((out_cols, out_expl, final_rows))
             }
             SelectBody::Values(_) | SelectBody::Compound { .. } => {
-                let (out_cols, out_rows) = self.execute_select_body(&stmt.body, outer_scopes)?;
+                let (out_cols, out_expl, out_rows) =
+                    self.execute_select_body(&stmt.body, outer_scopes)?;
                 let final_rows = self.apply_order_and_limit(
                     &out_cols,
                     out_rows,
@@ -374,7 +633,7 @@ impl<'a> QueryExec<'a> {
                     stmt.limit.as_ref(),
                     outer_scopes,
                 )?;
-                Ok((out_cols, final_rows))
+                Ok((out_cols, out_expl, final_rows))
             }
         }
     }
@@ -383,15 +642,26 @@ impl<'a> QueryExec<'a> {
         &self,
         body: &SelectBody,
         outer_scopes: &[EvalScope<'_>],
-    ) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+    ) -> SqlResult<SelectRowsMeta> {
+        self.execute_select_body_depth(body, outer_scopes, self.query_depth)
+    }
+
+    fn execute_select_body_depth(
+        &self,
+        body: &SelectBody,
+        outer_scopes: &[EvalScope<'_>],
+        depth: usize,
+    ) -> SqlResult<SelectRowsMeta> {
+        self.check_depth(depth)?;
         match body {
             SelectBody::Core(core) => {
-                let (cols, rows, _) = self.execute_select_core(core, outer_scopes, None)?;
-                Ok((cols, rows))
+                let (cols, expl, rows, _) = self.execute_select_core(core, outer_scopes, None)?;
+                Ok((cols, expl, rows))
             }
             SelectBody::Values(values) => {
                 let env = self.make_env();
                 let mut rows = Vec::with_capacity(values.rows.len());
+                let mut mem = self.make_mem_guard();
                 let mut width: Option<usize> = None;
                 for vrow in &values.rows {
                     self.charge_steps(1)?;
@@ -408,6 +678,7 @@ impl<'a> QueryExec<'a> {
                     for item in &vrow.items {
                         vals.push(eval_expr(item, outer_scopes, &env)?);
                     }
+                    mem.reserve(estimate_row_bytes(&vals))?;
                     rows.push(vals);
                 }
                 let w = width.unwrap_or(0);
@@ -415,62 +686,106 @@ impl<'a> QueryExec<'a> {
                     .map(|i| ScopeColumn {
                         table: None,
                         name: format!("column{i}"),
-                        affinity: Affinity::Blob,
+                        affinity: Affinity::None,
                         collation: "BINARY".to_string(),
                         is_rowid_alias: false,
                     })
                     .collect();
-                Ok((cols, rows))
+                Ok((cols, vec![false; w], rows))
             }
             SelectBody::Compound {
                 op, left, right, ..
             } => {
-                let (lcols, lrows) = self.execute_select_body(left, outer_scopes)?;
-                let (rcols, rrows) = self.execute_select_body(right, outer_scopes)?;
+                let (mut lcols, mut lexpl, lrows) =
+                    self.execute_select_body_depth(left, outer_scopes, depth + 1)?;
+                let (rcols, rexpl, rrows) =
+                    self.execute_select_body_depth(right, outer_scopes, depth + 1)?;
                 if lcols.len() != rcols.len() {
                     return Err(SqlError::runtime(format!(
                         "SELECTs to the left and right of {} do not have the same number of result columns",
                         op.as_str()
                     )));
                 }
+                // Merge collations across compound branches (explicit COLLATE on RHS overrides
+                // implicit collation on LHS, matching SQLite `SELECT 'a' UNION SELECT 'A' COLLATE NOCASE`).
+                for i in 0..lcols.len() {
+                    let lc = OperandCollation {
+                        name: Some(&lcols[i].collation),
+                        explicit: lexpl[i],
+                    };
+                    let rc = OperandCollation {
+                        name: Some(&rcols[i].collation),
+                        explicit: rexpl[i],
+                    };
+                    if let Some(eff) = comparison_collation_name(Some(lc), Some(rc)) {
+                        lcols[i].collation = eff.to_string();
+                    }
+                    lexpl[i] = lexpl[i] || rexpl[i];
+                }
+                let env = self.make_env();
+                let colls: Vec<&Collation> = lcols
+                    .iter()
+                    .map(|c| env.lookup_collation(&c.collation))
+                    .collect::<SqlResult<Vec<_>>>()?;
+                let coll_names: Vec<&str> = lcols.iter().map(|c| c.collation.as_str()).collect();
+                let mut mem = self.make_mem_guard();
                 let out_rows = match op {
                     CompoundOperator::UnionAll => {
                         let mut out = lrows;
-                        out.extend(rrows);
+                        for r in rrows {
+                            mem.reserve(estimate_row_bytes(&r))?;
+                            out.push(r);
+                        }
                         out
                     }
                     CompoundOperator::Union => {
+                        let mut dedup = RowDedup::new(&coll_names, &colls);
                         let mut out = Vec::new();
                         for r in lrows.into_iter().chain(rrows) {
                             self.charge_steps(1)?;
-                            if !contains_row_binary(&out, &r) {
+                            if dedup.insert(&r, self)? {
+                                mem.reserve(estimate_row_bytes(&r))?;
                                 out.push(r);
                             }
                         }
                         out
                     }
                     CompoundOperator::Intersect => {
+                        let mut rset = RowDedup::new(&coll_names, &colls);
+                        for r in &rrows {
+                            self.charge_steps(1)?;
+                            let _ = rset.insert(r, self)?;
+                        }
+                        let mut out_set = RowDedup::new(&coll_names, &colls);
                         let mut out = Vec::new();
                         for r in lrows {
                             self.charge_steps(1)?;
-                            if contains_row_binary(&rrows, &r) && !contains_row_binary(&out, &r) {
+                            if rset.contains(&r, self)? && out_set.insert(&r, self)? {
+                                mem.reserve(estimate_row_bytes(&r))?;
                                 out.push(r);
                             }
                         }
                         out
                     }
                     CompoundOperator::Except => {
+                        let mut rset = RowDedup::new(&coll_names, &colls);
+                        for r in &rrows {
+                            self.charge_steps(1)?;
+                            let _ = rset.insert(r, self)?;
+                        }
+                        let mut out_set = RowDedup::new(&coll_names, &colls);
                         let mut out = Vec::new();
                         for r in lrows {
                             self.charge_steps(1)?;
-                            if !contains_row_binary(&rrows, &r) && !contains_row_binary(&out, &r) {
+                            if !rset.contains(&r, self)? && out_set.insert(&r, self)? {
+                                mem.reserve(estimate_row_bytes(&r))?;
                                 out.push(r);
                             }
                         }
                         out
                     }
                 };
-                Ok((lcols, out_rows))
+                Ok((lcols, lexpl, out_rows))
             }
         }
     }
@@ -480,36 +795,60 @@ impl<'a> QueryExec<'a> {
         core: &SelectCore,
         outer_scopes: &[EvalScope<'_>],
         outer_order_by: Option<&[OrderingTerm]>,
-    ) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>, OrderEvalContext)> {
+    ) -> SqlResult<SelectCoreResult> {
         let env = self.make_env();
 
         // 1. Evaluate FROM clause (with optional single-table WHERE pushdown)
         let mut rel = match &core.from {
             None => Relation::single_empty_row(),
-            Some(from_src) => {
-                self.eval_from(from_src, core.where_clause.as_ref(), outer_scopes)?
-            }
+            Some(from_src) => self.eval_from_depth(
+                from_src,
+                core.where_clause.as_ref(),
+                outer_scopes,
+                self.query_depth,
+            )?,
         };
 
-        // 2. Apply WHERE filter
+        // 2. Apply WHERE filter (and validate WHERE column references even on 0-row tables!)
         if let Some(ref where_expr) = core.where_clause {
-            let mut filtered = Vec::with_capacity(rel.rows.len());
-            for row in rel.rows {
-                self.charge_steps(1)?;
+            if rel.rows.is_empty() {
                 let mut scopes = outer_scopes.to_vec();
-                scopes.push(EvalScope::simple(&rel.columns, &row));
-                let cond = eval_expr(where_expr, &scopes, &env)?;
-                if boolean_value(&cond, false) {
-                    filtered.push(row);
+                let mut sc = EvalScope::simple(&rel.columns, &[]);
+                sc.hidden_unqualified = Some(&rel.using_hidden);
+                scopes.push(sc);
+                validate_expr_columns(where_expr, &scopes, env.dqs)?;
+            } else {
+                let mut filtered = Vec::with_capacity(rel.rows.len());
+                for row in rel.rows {
+                    self.charge_steps(1)?;
+                    let mut scopes = outer_scopes.to_vec();
+                    let mut sc = EvalScope::simple(&rel.columns, &row);
+                    sc.hidden_unqualified = Some(&rel.using_hidden);
+                    scopes.push(sc);
+                    let cond = eval_expr(where_expr, &scopes, &env)?;
+                    if boolean_value(&cond, false) {
+                        filtered.push(row);
+                    }
                 }
+                rel.rows = filtered;
             }
-            rel.rows = filtered;
         }
 
         // 3. Expand SELECT list (*, t.*, * EXCLUDE/REPLACE, FROM-first empty columns -> *)
         let expanded = expand_result_columns(core, &rel)?;
 
-        // 4. Determine if this is an aggregate query
+        // Validate SELECT expression column references even when 0 rows survive WHERE!
+        if rel.rows.is_empty() {
+            let mut scopes = outer_scopes.to_vec();
+            let mut sc = EvalScope::simple(&rel.columns, &[]);
+            sc.hidden_unqualified = Some(&rel.using_hidden);
+            scopes.push(sc);
+            for p in &expanded {
+                validate_expr_columns(&p.expr, &scopes, env.dqs)?;
+            }
+        }
+
+        // 4. Determine if this is an aggregate query (including aggregates inside named WINDOWs!)
         let has_agg_in_select = expanded
             .iter()
             .any(|p| expr_contains_aggregate(&p.expr, self.options));
@@ -517,27 +856,54 @@ impl<'a> QueryExec<'a> {
             ob.iter()
                 .any(|t| expr_contains_aggregate(&t.expr, self.options))
         });
+        let has_agg_in_named_windows = core.windows.as_deref().unwrap_or(&[]).iter().any(|wd| {
+            wd.window
+                .partition_by
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|e| expr_contains_aggregate(e, self.options))
+                || wd
+                    .window
+                    .order_by
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|o| expr_contains_aggregate(&o.expr, self.options))
+        });
+        let has_agg_in_having = core
+            .having
+            .as_ref()
+            .is_some_and(|h| expr_contains_aggregate(h, self.options));
         let is_aggregate = core.group_by.is_some()
             || core.group_by_all
-            || core.having.is_some()
             || has_agg_in_select
-            || has_agg_in_order;
+            || has_agg_in_order
+            || has_agg_in_named_windows
+            || has_agg_in_having;
+
+        if core.having.is_some() && !is_aggregate {
+            return Err(SqlError::runtime(
+                "HAVING clause on a non-aggregate query",
+            ));
+        }
 
         // 5. Grouping & Aggregation (produces working rows + per-row precomputed aggregate slots)
         let (work_rows, mut precomputed_per_row) = if is_aggregate {
             self.eval_aggregation(core, &rel, &expanded, outer_order_by, outer_scopes)?
         } else {
-            let empty_pre = vec![Vec::new(); rel.rows.len()];
+            let empty_pre = vec![PrecomputedRow::new(); rel.rows.len()];
             (rel.rows, empty_pre)
         };
 
-        // 6. Window Functions (evaluated over post-GROUP BY / HAVING rows!)
+        // 6. Window Functions (evaluated over post-GROUP BY / HAVING rows; validated even on 0 rows!)
         let has_windows = expanded.iter().any(|p| expr_contains_window(&p.expr))
             || outer_order_by.is_some_and(|ob| ob.iter().any(|t| expr_contains_window(&t.expr)));
         if has_windows {
             self.eval_windows(
                 core,
                 &rel.columns,
+                &rel.using_hidden,
                 &work_rows,
                 &mut precomputed_per_row,
                 &expanded,
@@ -546,31 +912,60 @@ impl<'a> QueryExec<'a> {
             )?;
         }
 
-        // 7. Evaluate SELECT projections
-        let out_cols: Vec<ScopeColumn> = expanded
-            .iter()
-            .map(|p| {
-                let sample_scope = EvalScope::simple(&rel.columns, &[]);
-                let mut scopes = outer_scopes.to_vec();
-                scopes.push(sample_scope);
-                let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
-                let coll = expr_collation(&p.expr, &scopes)
-                    .name
-                    .unwrap_or_else(|| "BINARY".to_string());
-                ScopeColumn {
-                    table: None,
-                    name: p.output_name.clone(),
-                    affinity: aff,
-                    collation: coll,
-                    is_rowid_alias: false,
+        // 7. Evaluate SELECT projections (preserving source table qualifier + explicit COLLATE flag)
+        let mut out_cols = Vec::with_capacity(expanded.len());
+        let mut out_expl = Vec::with_capacity(expanded.len());
+        for p in &expanded {
+            let mut sample_scope = EvalScope::simple(&rel.columns, &[]);
+            sample_scope.hidden_unqualified = Some(&rel.using_hidden);
+            let mut scopes = outer_scopes.to_vec();
+            scopes.push(sample_scope);
+            let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
+            let ec = expr_collation(&p.expr, &scopes);
+            let coll = ec.name.unwrap_or_else(|| "BINARY".to_string());
+            let source_table = if p.explicit_alias.is_none() {
+                if let Expr::Column(c) = &p.expr {
+                    c.table.as_ref().map(|t| t.name.clone()).or_else(|| {
+                        rel.columns
+                            .iter()
+                            .find(|rc| rc.name.eq_ignore_ascii_case(&c.column.name))
+                            .and_then(|rc| rc.table.clone())
+                    })
+                } else {
+                    None
                 }
-            })
-            .collect();
+            } else {
+                None
+            };
+            out_cols.push(ScopeColumn {
+                table: source_table,
+                name: p.output_name.clone(),
+                affinity: aff,
+                collation: coll,
+                is_rowid_alias: false,
+            });
+            out_expl.push(ec.explicit);
+        }
 
         let mut projected_rows = Vec::with_capacity(work_rows.len());
         let mut kept_work_rows = Vec::with_capacity(work_rows.len());
         let mut kept_pre = Vec::with_capacity(work_rows.len());
         let is_distinct = core.distinct == Some(DistinctKind::Distinct);
+        let dist_colls: Vec<&Collation> = if is_distinct {
+            out_cols
+                .iter()
+                .map(|c| env.lookup_collation(&c.collation))
+                .collect::<SqlResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let dist_coll_names: Vec<&str> = if is_distinct {
+            out_cols.iter().map(|c| c.collation.as_str()).collect()
+        } else {
+            Vec::new()
+        };
+        let mut dist_dedup = RowDedup::new(&dist_coll_names, &dist_colls);
+        let mut mem = self.make_mem_guard();
 
         for (ridx, row) in work_rows.into_iter().enumerate() {
             self.charge_steps(1)?;
@@ -579,7 +974,9 @@ impl<'a> QueryExec<'a> {
             scopes.push(EvalScope {
                 columns: &rel.columns,
                 values: &row,
-                precomputed: Some(pre),
+                precomputed: Some(&pre.slots),
+                precomputed_json: Some(&pre.is_json),
+                hidden_unqualified: Some(&rel.using_hidden),
                 aliases: None,
                 no_rowid_aliases: false,
             });
@@ -587,9 +984,10 @@ impl<'a> QueryExec<'a> {
             for p in &expanded {
                 out_row.push(eval_expr(&p.expr, &scopes, &env)?);
             }
-            if is_distinct && contains_row_binary(&projected_rows, &out_row) {
+            if is_distinct && !dist_dedup.insert(&out_row, self)? {
                 continue;
             }
+            mem.reserve(estimate_row_bytes(&out_row))?;
             projected_rows.push(out_row);
             kept_work_rows.push(row);
             kept_pre.push(pre.clone());
@@ -597,20 +995,24 @@ impl<'a> QueryExec<'a> {
 
         let order_ctx = OrderEvalContext {
             from_columns: rel.columns,
+            from_using_hidden: rel.using_hidden,
             from_rows: kept_work_rows,
             precomputed: kept_pre,
+            explicit_aliases: expanded.iter().map(|p| p.explicit_alias.is_some()).collect(),
         };
-        Ok((out_cols, projected_rows, order_ctx))
+        Ok((out_cols, out_expl, projected_rows, order_ctx))
     }
 
     // ───────────────────────────── FROM / JOINS ─────────────────────────────
 
-    fn eval_from(
+    fn eval_from_depth(
         &self,
         source: &FromSource,
         where_hint_expr: Option<&Expr>,
         outer_scopes: &[EvalScope<'_>],
+        depth: usize,
     ) -> SqlResult<Relation> {
+        self.check_depth(depth)?;
         match source {
             FromSource::Table(ft) => {
                 let schema = ft.schema.as_ref().map(|n| n.name.as_str());
@@ -619,21 +1021,23 @@ impl<'a> QueryExec<'a> {
                 // 1. Check CTEs first (only when unqualified)
                 if schema.is_none() {
                     if let Some(cte) = self.ctes.get(&ft.name.name.to_ascii_lowercase()) {
-                        let columns = cte
+                        let columns: Vec<ScopeColumn> = cte
                             .columns
                             .iter()
                             .map(|c| ScopeColumn {
                                 table: Some(alias.clone()),
-                                name: c.clone(),
-                                affinity: Affinity::Blob,
-                                collation: "BINARY".to_string(),
+                                name: c.name.clone(),
+                                affinity: c.affinity,
+                                collation: c.collation.clone(),
                                 is_rowid_alias: false,
                             })
                             .collect();
-                        let star_hidden = vec![false; cte.columns.len()];
+                        let star_hidden = vec![false; columns.len()];
+                        let using_hidden = vec![false; columns.len()];
                         return Ok(Relation {
                             columns,
                             star_hidden,
+                            using_hidden,
                             rows: cte.rows.clone(),
                         });
                     }
@@ -648,6 +1052,18 @@ impl<'a> QueryExec<'a> {
                     )));
                 }
                 if let Some(tmeta) = self.catalog.get_table(schema, &ft.name.name)? {
+                    if let Some(ref idx_name) = ft.indexed_by {
+                        let exists = tmeta
+                            .indexes
+                            .iter()
+                            .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
+                        if !exists {
+                            return Err(SqlError::runtime(format!(
+                                "no such index: {}",
+                                idx_name.name
+                            )));
+                        }
+                    }
                     let hint = if ft.not_indexed {
                         TableScanHint::FullScan
                     } else if let Some(we) = where_hint_expr {
@@ -708,9 +1124,11 @@ impl<'a> QueryExec<'a> {
                         }
                         rows.push(vals);
                     }
+                    let using_hidden = vec![false; columns.len()];
                     return Ok(Relation {
                         columns,
                         star_hidden,
+                        using_hidden,
                         rows,
                     });
                 }
@@ -761,9 +1179,11 @@ impl<'a> QueryExec<'a> {
                         c.table = Some(alias.clone());
                     }
                     let star_hidden = vec![false; vcols.len()];
+                    let using_hidden = vec![false; vcols.len()];
                     return Ok(Relation {
                         columns: vcols,
                         star_hidden,
+                        using_hidden,
                         rows: vrows,
                     });
                 }
@@ -815,14 +1235,16 @@ impl<'a> QueryExec<'a> {
                     c.table = alias.clone();
                 }
                 let star_hidden = vec![false; cols.len()];
+                let using_hidden = vec![false; cols.len()];
                 Ok(Relation {
                     columns: cols,
                     star_hidden,
+                    using_hidden,
                     rows,
                 })
             }
             FromSource::Group(fg) => {
-                let mut rel = self.eval_from(&fg.source, None, outer_scopes)?;
+                let mut rel = self.eval_from_depth(&fg.source, None, outer_scopes, depth + 1)?;
                 if let Some(ref alias) = fg.alias {
                     for c in &mut rel.columns {
                         c.table = Some(alias.name.clone());
@@ -838,22 +1260,28 @@ impl<'a> QueryExec<'a> {
                 using,
                 ..
             } => {
-                // Support correlated table-valued function on RHS (e.g. `FROM t, json_each(t.j)` or `LEFT JOIN json_each(t.j)`)
+                // Support correlated table-valued function on RHS (e.g. `FROM t, json_each(t.j)` or
+                // `LEFT JOIN json_each(t.j) ON ...`)
                 if let FromSource::Function(ff) = right.as_ref() {
-                    if on.is_none()
-                        && using.is_none()
+                    if using.is_none()
                         && (operator.flags & join_flag::RIGHT) == 0
                         && (operator.flags & join_flag::NATURAL) == 0
                         && ff.args.iter().any(expr_has_column_ref)
                     {
-                        let lrel = self.eval_from(left, None, outer_scopes)?;
+                        let lrel = self.eval_from_depth(left, None, outer_scopes, depth + 1)?;
                         let is_left = (operator.flags & join_flag::LEFT) != 0;
-                        return self.eval_correlated_tvf_join(lrel, ff, is_left, outer_scopes);
+                        return self.eval_correlated_tvf_join(
+                            lrel,
+                            ff,
+                            is_left,
+                            on.as_deref(),
+                            outer_scopes,
+                        );
                     }
                 }
 
-                let lrel = self.eval_from(left, None, outer_scopes)?;
-                let rrel = self.eval_from(right, None, outer_scopes)?;
+                let lrel = self.eval_from_depth(left, None, outer_scopes, depth + 1)?;
+                let rrel = self.eval_from_depth(right, None, outer_scopes, depth + 1)?;
                 self.eval_join(lrel, rrel, *operator, on.as_deref(), using.as_deref(), outer_scopes)
             }
         }
@@ -864,6 +1292,7 @@ impl<'a> QueryExec<'a> {
         lrel: Relation,
         ff: &xdb_parser::FromFunction,
         is_left: bool,
+        on: Option<&Expr>,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<Relation> {
         let env = self.make_env();
@@ -871,15 +1300,19 @@ impl<'a> QueryExec<'a> {
         let alias = ff.alias.as_ref().unwrap_or(&ff.name).name.clone();
         let lower = ff.name.name.to_ascii_lowercase();
 
-        // Determine TVF output schema by evaluating a dummy or first call.
         let mut tvf_cols: Option<Vec<String>> = None;
+        let mut combined_cols_cache: Option<Vec<ScopeColumn>> = None;
+        let mut combined_using_hidden_cache: Vec<bool> = Vec::new();
         let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut mem = self.make_mem_guard();
         let lwidth = lrel.columns.len();
 
         for lrow in &lrel.rows {
             self.charge_steps(1)?;
             let mut scopes = outer_scopes.to_vec();
-            scopes.push(EvalScope::simple(&lrel.columns, lrow));
+            let mut sc = EvalScope::simple(&lrel.columns, lrow);
+            sc.hidden_unqualified = Some(&lrel.using_hidden);
+            scopes.push(sc);
             let mut arg_vals = Vec::with_capacity(ff.args.len());
             for a in &ff.args {
                 arg_vals.push(eval_expr(a, &scopes, &env)?);
@@ -898,22 +1331,49 @@ impl<'a> QueryExec<'a> {
             };
             let rwidth = tvf.columns.len();
             if tvf_cols.is_none() {
+                let mut cc = lrel.columns.clone();
+                let mut uh = lrel.using_hidden.clone();
+                for cname in &tvf.columns {
+                    cc.push(ScopeColumn {
+                        table: Some(alias.clone()),
+                        name: cname.clone(),
+                        affinity: Affinity::None,
+                        collation: "BINARY".to_string(),
+                        is_rowid_alias: false,
+                    });
+                    uh.push(false);
+                }
+                combined_cols_cache = Some(cc);
+                combined_using_hidden_cache = uh;
                 tvf_cols = Some(tvf.columns);
             }
-            if tvf.rows.is_empty() {
-                if is_left {
-                    let mut combined = Vec::with_capacity(lwidth + rwidth);
-                    combined.extend_from_slice(lrow);
-                    combined.resize(lwidth + rwidth, SqlValue::Null);
-                    out_rows.push(combined);
+            let mut matched_any = false;
+            for rrow in tvf.rows {
+                self.charge_steps(1)?;
+                let mut combined = Vec::with_capacity(lwidth + rwidth);
+                combined.extend_from_slice(lrow);
+                combined.extend(rrow);
+                if let Some(on_expr) = on {
+                    let cc = combined_cols_cache.as_ref().expect("tvf cols built");
+                    let mut on_scopes = outer_scopes.to_vec();
+                    let mut on_sc = EvalScope::simple(cc, &combined);
+                    on_sc.hidden_unqualified = Some(&combined_using_hidden_cache);
+                    on_scopes.push(on_sc);
+                    let cond = eval_expr(on_expr, &on_scopes, &env)?;
+                    if !boolean_value(&cond, false) {
+                        continue;
+                    }
                 }
-            } else {
-                for rrow in tvf.rows {
-                    let mut combined = Vec::with_capacity(lwidth + rwidth);
-                    combined.extend_from_slice(lrow);
-                    combined.extend(rrow);
-                    out_rows.push(combined);
-                }
+                matched_any = true;
+                mem.reserve(estimate_row_bytes(&combined))?;
+                out_rows.push(combined);
+            }
+            if is_left && !matched_any {
+                let mut combined = Vec::with_capacity(lwidth + rwidth);
+                combined.extend_from_slice(lrow);
+                combined.resize(lwidth + rwidth, SqlValue::Null);
+                mem.reserve(estimate_row_bytes(&combined))?;
+                out_rows.push(combined);
             }
         }
 
@@ -934,6 +1394,7 @@ impl<'a> QueryExec<'a> {
 
         let mut columns = lrel.columns;
         let mut star_hidden = lrel.star_hidden;
+        let mut using_hidden = lrel.using_hidden;
         for c in r_col_names {
             columns.push(ScopeColumn {
                 table: Some(alias.clone()),
@@ -943,10 +1404,12 @@ impl<'a> QueryExec<'a> {
                 is_rowid_alias: false,
             });
             star_hidden.push(false);
+            using_hidden.push(false);
         }
         Ok(Relation {
             columns,
             star_hidden,
+            using_hidden,
             rows: out_rows,
         })
     }
@@ -971,12 +1434,13 @@ impl<'a> QueryExec<'a> {
 
         if is_natural {
             for (li, lc) in lrel.columns.iter().enumerate() {
-                if lc.is_rowid_alias || lrel.star_hidden[li] {
+                if lc.is_rowid_alias || lrel.star_hidden[li] || lrel.using_hidden[li] {
                     continue;
                 }
                 if let Some((ri, _)) = rrel.columns.iter().enumerate().find(|(ri, rc)| {
                     !rc.is_rowid_alias
                         && !rrel.star_hidden[*ri]
+                        && !rrel.using_hidden[*ri]
                         && rc.name.eq_ignore_ascii_case(&lc.name)
                 }) {
                     using_pairs.push((li, ri));
@@ -989,7 +1453,11 @@ impl<'a> QueryExec<'a> {
                     .columns
                     .iter()
                     .enumerate()
-                    .find(|(_, c)| !c.is_rowid_alias && c.name.eq_ignore_ascii_case(&uname.name))
+                    .find(|(i, c)| {
+                        !c.is_rowid_alias
+                            && !lrel.using_hidden[*i]
+                            && c.name.eq_ignore_ascii_case(&uname.name)
+                    })
                     .map(|(i, _)| i)
                     .ok_or_else(|| {
                         SqlError::runtime(format!(
@@ -1001,7 +1469,11 @@ impl<'a> QueryExec<'a> {
                     .columns
                     .iter()
                     .enumerate()
-                    .find(|(_, c)| !c.is_rowid_alias && c.name.eq_ignore_ascii_case(&uname.name))
+                    .find(|(i, c)| {
+                        !c.is_rowid_alias
+                            && !rrel.using_hidden[*i]
+                            && c.name.eq_ignore_ascii_case(&uname.name)
+                    })
                     .map(|(i, _)| i)
                     .ok_or_else(|| {
                         SqlError::runtime(format!(
@@ -1014,17 +1486,68 @@ impl<'a> QueryExec<'a> {
             }
         }
 
+        let coalesce_using = is_right && !using_pairs.is_empty();
         let lwidth = lrel.columns.len();
         let rwidth = rrel.columns.len();
-        let mut combined_cols = Vec::with_capacity(lwidth + rwidth);
-        combined_cols.extend_from_slice(&lrel.columns);
-        combined_cols.extend_from_slice(&rrel.columns);
 
-        let mut combined_hidden = Vec::with_capacity(lwidth + rwidth);
-        combined_hidden.extend_from_slice(&lrel.star_hidden);
-        for (ri, &h) in rrel.star_hidden.iter().enumerate() {
-            combined_hidden.push(h || hidden_rhs.contains(&ri));
+        // Build output schema. For RIGHT/FULL OUTER JOIN USING, prepend a coalesced
+        // unqualified column right before each left USING column and mark both `t1.a` and
+        // `t2.a` as `using_hidden`, so `a`/`*` return `coalesce(t1.a, t2.a)` while `t1.a`
+        // remains NULL on unmatched right rows and `t1.*`/`t2.*` stay intact!
+        let mut combined_cols = Vec::with_capacity(lwidth + rwidth + using_pairs.len());
+        let mut combined_star_hidden = Vec::with_capacity(lwidth + rwidth + using_pairs.len());
+        let mut combined_using_hidden = Vec::with_capacity(lwidth + rwidth + using_pairs.len());
+        let mut using_by_left: HashMap<usize, usize> = HashMap::new();
+        for &(li, ri) in &using_pairs {
+            using_by_left.insert(li, ri);
         }
+
+        for (li, lc) in lrel.columns.iter().enumerate() {
+            if coalesce_using && using_by_left.contains_key(&li) {
+                combined_cols.push(ScopeColumn {
+                    table: None,
+                    name: lc.name.clone(),
+                    affinity: lc.affinity,
+                    collation: lc.collation.clone(),
+                    is_rowid_alias: false,
+                });
+                combined_star_hidden.push(false);
+                combined_using_hidden.push(false);
+                combined_cols.push(lc.clone());
+                combined_star_hidden.push(lrel.star_hidden[li]);
+                combined_using_hidden.push(true);
+            } else {
+                combined_cols.push(lc.clone());
+                combined_star_hidden.push(lrel.star_hidden[li]);
+                combined_using_hidden.push(lrel.using_hidden[li]);
+            }
+        }
+        for (ri, rc) in rrel.columns.iter().enumerate() {
+            combined_cols.push(rc.clone());
+            combined_star_hidden.push(rrel.star_hidden[ri]);
+            combined_using_hidden.push(rrel.using_hidden[ri] || hidden_rhs.contains(&ri));
+        }
+
+        let assemble_row = |lrow: Option<&[SqlValue]>, rrow: Option<&[SqlValue]>| -> Vec<SqlValue> {
+            let mut row = Vec::with_capacity(combined_cols.len());
+            for li in 0..lwidth {
+                let lv = lrow.map_or(SqlValue::Null, |r| r[li].clone());
+                if coalesce_using {
+                    if let Some(&ri) = using_by_left.get(&li) {
+                        let rv = rrow.map_or(SqlValue::Null, |r| r[ri].clone());
+                        let coalesced = if lv.is_null() { rv } else { lv.clone() };
+                        row.push(coalesced);
+                    }
+                }
+                row.push(lv);
+            }
+            if let Some(rr) = rrow {
+                row.extend_from_slice(rr);
+            } else {
+                row.resize(row.len() + rwidth, SqlValue::Null);
+            }
+            row
+        };
 
         // Fast hash-join path for simple equi-joins (no outer correlation, single equality key
         // with BINARY collation and compatible affinities, or single USING column).
@@ -1036,19 +1559,22 @@ impl<'a> QueryExec<'a> {
                     lrel,
                     rrel,
                     combined_cols,
-                    combined_hidden,
+                    combined_star_hidden,
+                    combined_using_hidden,
                     lk,
                     rk,
                     aff,
                     is_left,
                     is_right,
-                    &using_pairs,
+                    coalesce_using,
+                    &using_by_left,
                 );
             }
         }
 
         // General nested-loop join (handles arbitrary ON expressions, collations, FULL OUTER, etc.)
         let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let mut mem = self.make_mem_guard();
         let mut rhs_matched = if is_right {
             vec![false; rrel.rows.len()]
         } else {
@@ -1091,13 +1617,13 @@ impl<'a> QueryExec<'a> {
                 if !ok {
                     continue;
                 }
-                let mut combined = Vec::with_capacity(lwidth + rwidth);
-                combined.extend_from_slice(lrow);
-                combined.extend_from_slice(rrow);
+                let combined = assemble_row(Some(lrow), Some(rrow));
 
                 if let Some(on_expr) = on {
                     let mut scopes = outer_scopes.to_vec();
-                    scopes.push(EvalScope::simple(&combined_cols, &combined));
+                    let mut sc = EvalScope::simple(&combined_cols, &combined);
+                    sc.hidden_unqualified = Some(&combined_using_hidden);
+                    scopes.push(sc);
                     let cond = eval_expr(on_expr, &scopes, &env)?;
                     if !boolean_value(&cond, false) {
                         continue;
@@ -1108,12 +1634,12 @@ impl<'a> QueryExec<'a> {
                 if is_right {
                     rhs_matched[ridx] = true;
                 }
+                mem.reserve(estimate_row_bytes(&combined))?;
                 out_rows.push(combined);
             }
             if is_left && !matched_any {
-                let mut combined = Vec::with_capacity(lwidth + rwidth);
-                combined.extend_from_slice(lrow);
-                combined.resize(lwidth + rwidth, SqlValue::Null);
+                let combined = assemble_row(Some(lrow), None);
+                mem.reserve(estimate_row_bytes(&combined))?;
                 out_rows.push(combined);
             }
         }
@@ -1122,12 +1648,8 @@ impl<'a> QueryExec<'a> {
             for (ridx, rrow) in rrel.rows.iter().enumerate() {
                 if !rhs_matched[ridx] {
                     self.charge_steps(1)?;
-                    let mut combined = vec![SqlValue::Null; lwidth + rwidth];
-                    combined[lwidth..].clone_from_slice(rrow);
-                    // For RIGHT/FULL OUTER JOIN USING, populate the coalesced left USING column!
-                    for &(li, ri) in &using_pairs {
-                        combined[li] = rrow[ri].clone();
-                    }
+                    let combined = assemble_row(None, Some(rrow));
+                    mem.reserve(estimate_row_bytes(&combined))?;
                     out_rows.push(combined);
                 }
             }
@@ -1135,7 +1657,8 @@ impl<'a> QueryExec<'a> {
 
         Ok(Relation {
             columns: combined_cols,
-            star_hidden: combined_hidden,
+            star_hidden: combined_star_hidden,
+            using_hidden: combined_using_hidden,
             rows: out_rows,
         })
     }
@@ -1146,16 +1669,39 @@ impl<'a> QueryExec<'a> {
         lrel: Relation,
         rrel: Relation,
         combined_cols: Vec<ScopeColumn>,
-        combined_hidden: Vec<bool>,
+        combined_star_hidden: Vec<bool>,
+        combined_using_hidden: Vec<bool>,
         lk: usize,
         rk: usize,
         aff: Affinity,
         is_left: bool,
         is_right: bool,
-        using_pairs: &[(usize, usize)],
+        coalesce_using: bool,
+        using_by_left: &HashMap<usize, usize>,
     ) -> SqlResult<Relation> {
         let lwidth = lrel.columns.len();
         let rwidth = rrel.columns.len();
+        let assemble_row = |lrow: Option<&[SqlValue]>, rrow: Option<&[SqlValue]>| -> Vec<SqlValue> {
+            let mut row = Vec::with_capacity(combined_cols.len());
+            for li in 0..lwidth {
+                let lv = lrow.map_or(SqlValue::Null, |r| r[li].clone());
+                if coalesce_using {
+                    if let Some(&ri) = using_by_left.get(&li) {
+                        let rv = rrow.map_or(SqlValue::Null, |r| r[ri].clone());
+                        let coalesced = if lv.is_null() { rv } else { lv.clone() };
+                        row.push(coalesced);
+                    }
+                }
+                row.push(lv);
+            }
+            if let Some(rr) = rrow {
+                row.extend_from_slice(rr);
+            } else {
+                row.resize(row.len() + rwidth, SqlValue::Null);
+            }
+            row
+        };
+
         let mut buckets: HashMap<HashKey, Vec<usize>> = HashMap::with_capacity(rrel.rows.len());
         for (ridx, rrow) in rrel.rows.iter().enumerate() {
             self.charge_steps(1)?;
@@ -1166,6 +1712,7 @@ impl<'a> QueryExec<'a> {
         }
 
         let mut out_rows = Vec::new();
+        let mut mem = self.make_mem_guard();
         let mut rhs_matched = if is_right {
             vec![false; rrel.rows.len()]
         } else {
@@ -1193,18 +1740,16 @@ impl<'a> QueryExec<'a> {
                             if is_right {
                                 rhs_matched[ridx] = true;
                             }
-                            let mut combined = Vec::with_capacity(lwidth + rwidth);
-                            combined.extend_from_slice(lrow);
-                            combined.extend_from_slice(rrow);
+                            let combined = assemble_row(Some(lrow), Some(rrow));
+                            mem.reserve(estimate_row_bytes(&combined))?;
                             out_rows.push(combined);
                         }
                     }
                 }
             }
             if is_left && !matched_any {
-                let mut combined = Vec::with_capacity(lwidth + rwidth);
-                combined.extend_from_slice(lrow);
-                combined.resize(lwidth + rwidth, SqlValue::Null);
+                let combined = assemble_row(Some(lrow), None);
+                mem.reserve(estimate_row_bytes(&combined))?;
                 out_rows.push(combined);
             }
         }
@@ -1212,11 +1757,9 @@ impl<'a> QueryExec<'a> {
         if is_right {
             for (ridx, rrow) in rrel.rows.iter().enumerate() {
                 if !rhs_matched[ridx] {
-                    let mut combined = vec![SqlValue::Null; lwidth + rwidth];
-                    combined[lwidth..].clone_from_slice(rrow);
-                    for &(li, ri) in using_pairs {
-                        combined[li] = rrow[ri].clone();
-                    }
+                    self.charge_steps(1)?;
+                    let combined = assemble_row(None, Some(rrow));
+                    mem.reserve(estimate_row_bytes(&combined))?;
                     out_rows.push(combined);
                 }
             }
@@ -1224,7 +1767,8 @@ impl<'a> QueryExec<'a> {
 
         Ok(Relation {
             columns: combined_cols,
-            star_hidden: combined_hidden,
+            star_hidden: combined_star_hidden,
+            using_hidden: combined_using_hidden,
             rows: out_rows,
         })
     }
@@ -1259,10 +1803,12 @@ impl<'a> QueryExec<'a> {
                         continue;
                     }
                     let (col_is_rid, val_expr, eff_op) =
-                        if is_rowid_column_ref(left, tmeta, alias) && !expr_has_column_ref(right) {
+                        if is_rowid_column_ref(left, tmeta, alias)
+                            && expr_is_pushdown_const(right, self.options)
+                        {
                             (true, right.as_ref(), *op)
                         } else if is_rowid_column_ref(right, tmeta, alias)
-                            && !expr_has_column_ref(left)
+                            && expr_is_pushdown_const(left, self.options)
                         {
                             (true, left.as_ref(), flip_cmp(*op))
                         } else {
@@ -1294,8 +1840,11 @@ impl<'a> QueryExec<'a> {
             }
         }
 
-        // 2. Check secondary index equality prefix on non-partial indexes
-        let mut eq_by_col: HashMap<usize, SqlValue> = HashMap::new();
+        // 2. Check secondary index equality prefix on non-partial indexes.
+        // Store `(value, val_affinity, val_collation, col_on_left)` so we verify both
+        // `comparison_affinity` and `comparison_collation_name` match the index!
+        let mut eq_by_col: HashMap<usize, (SqlValue, Option<Affinity>, crate::eval::ExprCollation, bool)> =
+            HashMap::new();
         for conj in &conjuncts {
             if let Expr::Binary {
                 op: BinaryOp::Eq,
@@ -1305,24 +1854,28 @@ impl<'a> QueryExec<'a> {
             } = conj
             {
                 let pair = if let Some(cid) = match_table_col_ref(left, tmeta, alias) {
-                    if !expr_has_column_ref(right) {
-                        Some((cid, right.as_ref()))
+                    if expr_is_pushdown_const(right, self.options) {
+                        Some((cid, right.as_ref(), true))
                     } else {
                         None
                     }
                 } else if let Some(cid) = match_table_col_ref(right, tmeta, alias) {
-                    if !expr_has_column_ref(left) {
-                        Some((cid, left.as_ref()))
+                    if expr_is_pushdown_const(left, self.options) {
+                        Some((cid, left.as_ref(), false))
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                if let Some((cid, val_expr)) = pair {
+                if let Some((cid, val_expr, col_on_left)) = pair {
+                    let val_aff = expr_affinity(val_expr, outer_scopes);
+                    let val_coll = expr_collation(val_expr, outer_scopes);
                     if let Ok(v) = eval_expr(val_expr, outer_scopes, &env) {
                         if !v.is_null() {
-                            eq_by_col.entry(cid).or_insert(v);
+                            eq_by_col
+                                .entry(cid)
+                                .or_insert((v, val_aff, val_coll, col_on_left));
                         }
                     }
                 }
@@ -1337,17 +1890,32 @@ impl<'a> QueryExec<'a> {
                 let mut prefix_vals = Vec::new();
                 for (kpos, maybe_cid) in idx.key_columns.iter().enumerate() {
                     let Some(cid) = maybe_cid else { break };
-                    // Only push down when index key collation matches column collation
-                    if !idx.key_collations[kpos]
-                        .eq_ignore_ascii_case(&tmeta.columns[*cid].collation)
-                    {
+                    let Some((v, val_aff, val_coll, col_on_left)) = eq_by_col.get(cid) else {
                         break;
-                    }
-                    if let Some(v) = eq_by_col.get(cid) {
-                        prefix_vals.push(apply_affinity(v.clone(), tmeta.columns[*cid].affinity));
+                    };
+                    let col_meta = &tmeta.columns[*cid];
+                    // Verify effective comparison collation matches the index key collation!
+                    let col_op_coll = Some(OperandCollation {
+                        name: Some(&col_meta.collation),
+                        explicit: false,
+                    });
+                    let eff_coll = if *col_on_left {
+                        comparison_collation_name(col_op_coll, val_coll.as_operand())
                     } else {
+                        comparison_collation_name(val_coll.as_operand(), col_op_coll)
+                    }
+                    .unwrap_or("BINARY");
+                    if !idx.key_collations[kpos].eq_ignore_ascii_case(eff_coll) {
                         break;
                     }
+                    // Verify comparison_affinity does not override the column's index affinity!
+                    // (e.g., `TEXT` col compared with `CAST(1 AS REAL)` uses NUMERIC affinity,
+                    // which matches `'01'` and `'1'` and cannot be answered by a single TEXT seek).
+                    let comp_aff = comparison_affinity(Some(col_meta.affinity), *val_aff);
+                    if comp_aff != col_meta.affinity {
+                        break;
+                    }
+                    prefix_vals.push(apply_affinity(v.clone(), col_meta.affinity));
                 }
                 if !prefix_vals.is_empty()
                     && best
@@ -1374,14 +1942,15 @@ impl<'a> QueryExec<'a> {
         expanded: &[ProjectedItem],
         outer_order_by: Option<&[OrderingTerm]>,
         outer_scopes: &[EvalScope<'_>],
-    ) -> SqlResult<(Vec<Vec<SqlValue>>, Vec<PrecomputedSlots>)> {
+    ) -> SqlResult<(Vec<Vec<SqlValue>>, Vec<PrecomputedRow>)> {
         let env = self.make_env();
 
-        // Collect all aggregate calls from SELECT, HAVING, and ORDER BY.
+        // Collect all aggregate calls from SELECT, HAVING, ORDER BY, and named WINDOW clauses.
         let mut agg_calls: Vec<&FunctionExpr> = Vec::new();
         for p in expanded {
             collect_aggregates(&p.expr, self.options, &mut agg_calls);
         }
+        let select_agg_count = agg_calls.len();
         if let Some(ref hav) = core.having {
             collect_aggregates(hav, self.options, &mut agg_calls);
         }
@@ -1390,8 +1959,16 @@ impl<'a> QueryExec<'a> {
                 collect_aggregates(&t.expr, self.options, &mut agg_calls);
             }
         }
+        for wd in core.windows.as_deref().unwrap_or(&[]) {
+            for e in wd.window.partition_by.as_deref().unwrap_or(&[]) {
+                collect_aggregates(e, self.options, &mut agg_calls);
+            }
+            for o in wd.window.order_by.as_deref().unwrap_or(&[]) {
+                collect_aggregates(&o.expr, self.options, &mut agg_calls);
+            }
+        }
 
-        // Resolve GROUP BY expressions (including XDB `GROUP BY ALL`, ordinals, and aliases).
+        // Resolve GROUP BY expressions (including XDB `GROUP BY ALL`, ordinals + COLLATE, and aliases).
         let mut group_exprs: Vec<Expr> = Vec::new();
         if core.group_by_all {
             for p in expanded {
@@ -1400,15 +1977,29 @@ impl<'a> QueryExec<'a> {
                 }
             }
         } else if let Some(ref gb) = core.group_by {
-            for g in gb {
-                if let Some(ord) = integer_ordinal(g) {
+            for (gidx, g) in gb.iter().enumerate() {
+                if let Some((ord, ov_coll)) = integer_ordinal_with_collation(g) {
                     if ord < 1 || ord > expanded.len() {
                         return Err(SqlError::runtime(format!(
-                            "1st GROUP BY term out of range - should be between 1 and {}",
+                            "{} GROUP BY term out of range - should be between 1 and {}",
+                            ordinal_label(gidx + 1),
                             expanded.len()
                         )));
                     }
-                    group_exprs.push(expanded[ord - 1].expr.clone());
+                    let base = expanded[ord - 1].expr.clone();
+                    if let Some(cn) = ov_coll {
+                        group_exprs.push(Expr::Collate {
+                            span: g.span(),
+                            operand: Box::new(base),
+                            collation: xdb_parser::Name {
+                                span: g.span(),
+                                name: cn.to_string(),
+                                quote: xdb_parser::QuoteStyle::None,
+                            },
+                        });
+                    } else {
+                        group_exprs.push(base);
+                    }
                 } else {
                     group_exprs.push(g.clone());
                 }
@@ -1417,10 +2008,40 @@ impl<'a> QueryExec<'a> {
 
         // Partition rows into groups.
         let mut groups: Vec<(Vec<SqlValue>, Vec<usize>)> = Vec::new();
-        let group_colls: Vec<String> = {
-            let sample_scope = EvalScope::simple(&rel.columns, &[]);
+        let sample_aliases: Vec<(String, SqlValue, Affinity, String)> = {
+            let mut sample_scope = EvalScope::simple(&rel.columns, &[]);
+            sample_scope.hidden_unqualified = Some(&rel.using_hidden);
             let mut scopes = outer_scopes.to_vec();
             scopes.push(sample_scope);
+            expanded
+                .iter()
+                .filter_map(|p| {
+                    let alias = p.explicit_alias.as_ref()?;
+                    if expr_contains_aggregate(&p.expr, self.options) {
+                        return None;
+                    }
+                    let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
+                    let coll = expr_collation(&p.expr, &scopes)
+                        .name
+                        .unwrap_or_else(|| "BINARY".to_string());
+                    Some((alias.clone(), SqlValue::Null, aff, coll))
+                })
+                .collect()
+        };
+        let group_colls: Vec<String> = {
+            let mut sample_scope = EvalScope::simple(&rel.columns, &[]);
+            sample_scope.hidden_unqualified = Some(&rel.using_hidden);
+            sample_scope.aliases = Some(&sample_aliases);
+            let mut scopes = outer_scopes.to_vec();
+            scopes.push(sample_scope);
+            if rel.rows.is_empty() {
+                for g in &group_exprs {
+                    validate_expr_columns(g, &scopes, env.dqs)?;
+                }
+                if let Some(ref hav) = core.having {
+                    validate_expr_columns(hav, &scopes, env.dqs)?;
+                }
+            }
             group_exprs
                 .iter()
                 .map(|g| {
@@ -1431,39 +2052,61 @@ impl<'a> QueryExec<'a> {
                 .collect()
         };
 
+        // Only evaluate SELECT aliases that are actually referenced in GROUP BY / HAVING
+        // so we never swallow runtime errors or double-evaluate non-deterministic expressions.
+        let gb_needed_aliases: HashSet<String> = {
+            let mut names = HashSet::new();
+            for g in &group_exprs {
+                collect_unqualified_col_names(g, &mut names);
+            }
+            names
+        };
+        let hav_needed_aliases: HashSet<String> = {
+            let mut names = HashSet::new();
+            if let Some(ref hav) = core.having {
+                collect_unqualified_col_names(hav, &mut names);
+            }
+            names
+        };
+
+        let mut mem = self.make_mem_guard();
         if group_exprs.is_empty() {
             // Single global group (always 1 group even if 0 input rows, unless HAVING filters it!).
             let indices: Vec<usize> = (0..rel.rows.len()).collect();
             groups.push((Vec::new(), indices));
         } else {
-            let all_binary = group_colls
-                .iter()
-                .all(|c| c.eq_ignore_ascii_case("BINARY"));
+            let all_hashable = group_colls.iter().all(|c| is_hashable_collation(c));
             let mut group_index: HashMap<Vec<GroupKey>, usize> = HashMap::new();
 
             for (ridx, row) in rel.rows.iter().enumerate() {
                 self.charge_steps(1)?;
                 let mut scopes = outer_scopes.to_vec();
-                scopes.push(EvalScope::simple(&rel.columns, row));
+                let mut sc = EvalScope::simple(&rel.columns, row);
+                sc.hidden_unqualified = Some(&rel.using_hidden);
+                scopes.push(sc);
 
-                // Also expose SELECT aliases for GROUP BY expressions that reference an alias!
-                let alias_vals: Vec<(String, SqlValue, Affinity, String)> = expanded
-                    .iter()
-                    .filter_map(|p| {
-                        let alias = p.explicit_alias.as_ref()?;
-                        if expr_contains_aggregate(&p.expr, self.options) {
-                            return None;
+                // Expose referenced SELECT aliases for GROUP BY expressions!
+                let mut alias_vals: Vec<(String, SqlValue, Affinity, String)> = Vec::new();
+                if !gb_needed_aliases.is_empty() {
+                    for p in expanded {
+                        let Some(alias) = p.explicit_alias.as_ref() else {
+                            continue;
+                        };
+                        if !gb_needed_aliases.contains(&alias.to_ascii_lowercase())
+                            || expr_contains_aggregate(&p.expr, self.options)
+                        {
+                            continue;
                         }
-                        let v = eval_expr(&p.expr, &scopes, &env).ok()?;
+                        let v = eval_expr(&p.expr, &scopes, &env)?;
                         let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
                         let coll = expr_collation(&p.expr, &scopes)
                             .name
                             .unwrap_or_else(|| "BINARY".to_string());
-                        Some((alias.clone(), v, aff, coll))
-                    })
-                    .collect();
-                if let Some(last) = scopes.last_mut() {
-                    last.aliases = Some(&alias_vals);
+                        alias_vals.push((alias.clone(), v, aff, coll));
+                    }
+                    if let Some(last) = scopes.last_mut() {
+                        last.aliases = Some(&alias_vals);
+                    }
                 }
 
                 let mut key_vals = Vec::with_capacity(group_exprs.len());
@@ -1471,11 +2114,16 @@ impl<'a> QueryExec<'a> {
                     key_vals.push(eval_expr(g, &scopes, &env)?);
                 }
 
-                if all_binary {
-                    let hkey: Vec<GroupKey> = key_vals.iter().map(GroupKey::from_sql).collect();
+                if all_hashable {
+                    let hkey: Vec<GroupKey> = key_vals
+                        .iter()
+                        .enumerate()
+                        .map(|(k, v)| GroupKey::from_sql_with_coll(v, &group_colls[k]))
+                        .collect();
                     if let Some(&gid) = group_index.get(&hkey) {
                         groups[gid].1.push(ridx);
                     } else {
+                        mem.reserve(estimate_row_bytes(&key_vals) + 64)?;
                         let gid = groups.len();
                         group_index.insert(hkey, gid);
                         groups.push((key_vals, vec![ridx]));
@@ -1483,6 +2131,7 @@ impl<'a> QueryExec<'a> {
                 } else {
                     let mut found = None;
                     for (gid, (gvals, _)) in groups.iter().enumerate() {
+                        self.charge_steps(1)?;
                         let mut eq = true;
                         for (k, (a, b)) in gvals.iter().zip(key_vals.iter()).enumerate() {
                             let coll = env.lookup_collation(&group_colls[k])?;
@@ -1499,6 +2148,7 @@ impl<'a> QueryExec<'a> {
                     if let Some(gid) = found {
                         groups[gid].1.push(ridx);
                     } else {
+                        mem.reserve(estimate_row_bytes(&key_vals) + 64)?;
                         groups.push((key_vals, vec![ridx]));
                     }
                 }
@@ -1506,9 +2156,10 @@ impl<'a> QueryExec<'a> {
         }
 
         // Check SQLite single min()/max() bare-column rule:
-        // If there is exactly 1 aggregate call and it is 1-arg `min` or `max`, non-aggregated
-        // bare columns in SELECT/HAVING come from the row that produced the min/max!
-        let single_minmax = agg_calls.len() == 1
+        // If there is exactly 1 aggregate call in SELECT and it is 1-arg `min` or `max`
+        // (even if HAVING/ORDER BY repeats that same aggregate!), non-aggregated bare columns
+        // in SELECT/HAVING come from the row that produced the min/max!
+        let single_minmax = select_agg_count == 1
             && (agg_calls[0].name.name.eq_ignore_ascii_case("min")
                 || agg_calls[0].name.name.eq_ignore_ascii_case("max"))
             && agg_calls[0].args.len() == 1
@@ -1519,13 +2170,14 @@ impl<'a> QueryExec<'a> {
 
         for (_, row_indices) in groups {
             self.charge_steps(1)?;
-            let mut pre: Vec<(usize, usize, SqlValue)> = Vec::with_capacity(agg_calls.len());
+            let mut pre = PrecomputedRow::with_capacity(agg_calls.len());
             let mut chosen_row_idx: Option<usize> = row_indices.first().copied();
 
             for (aidx, fcall) in agg_calls.iter().enumerate() {
                 let (val, winner) = self.eval_single_aggregate(
                     fcall,
                     &rel.columns,
+                    &rel.using_hidden,
                     &rel.rows,
                     &row_indices,
                     outer_scopes,
@@ -1533,7 +2185,8 @@ impl<'a> QueryExec<'a> {
                 if single_minmax && aidx == 0 && winner.is_some() {
                     chosen_row_idx = winner;
                 }
-                pre.push((fcall.span.start, fcall.span.end, val));
+                let is_j = is_json_aggregate_name(&fcall.name.name);
+                pre.push(fcall.span.start, fcall.span.end, val, is_j);
             }
 
             let rep_row = match chosen_row_idx {
@@ -1547,24 +2200,31 @@ impl<'a> QueryExec<'a> {
                 scopes.push(EvalScope {
                     columns: &rel.columns,
                     values: &rep_row,
-                    precomputed: Some(&pre),
+                    precomputed: Some(&pre.slots),
+                    precomputed_json: Some(&pre.is_json),
+                    hidden_unqualified: Some(&rel.using_hidden),
                     aliases: None,
                     no_rowid_aliases: false,
                 });
-                let alias_vals: Vec<(String, SqlValue, Affinity, String)> = expanded
-                    .iter()
-                    .filter_map(|p| {
-                        let alias = p.explicit_alias.as_ref()?;
-                        let v = eval_expr(&p.expr, &scopes, &env).ok()?;
+                let mut alias_vals: Vec<(String, SqlValue, Affinity, String)> = Vec::new();
+                if !hav_needed_aliases.is_empty() {
+                    for p in expanded {
+                        let Some(alias) = p.explicit_alias.as_ref() else {
+                            continue;
+                        };
+                        if !hav_needed_aliases.contains(&alias.to_ascii_lowercase()) {
+                            continue;
+                        }
+                        let v = eval_expr(&p.expr, &scopes, &env)?;
                         let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
                         let coll = expr_collation(&p.expr, &scopes)
                             .name
                             .unwrap_or_else(|| "BINARY".to_string());
-                        Some((alias.clone(), v, aff, coll))
-                    })
-                    .collect();
-                if let Some(last) = scopes.last_mut() {
-                    last.aliases = Some(&alias_vals);
+                        alias_vals.push((alias.clone(), v, aff, coll));
+                    }
+                    if let Some(last) = scopes.last_mut() {
+                        last.aliases = Some(&alias_vals);
+                    }
                 }
                 let cond = eval_expr(hav, &scopes, &env)?;
                 if !boolean_value(&cond, false) {
@@ -1572,6 +2232,7 @@ impl<'a> QueryExec<'a> {
                 }
             }
 
+            mem.reserve(estimate_row_bytes(&rep_row))?;
             out_rows.push(rep_row);
             out_pre.push(pre);
         }
@@ -1583,6 +2244,7 @@ impl<'a> QueryExec<'a> {
         &self,
         fcall: &FunctionExpr,
         columns: &[ScopeColumn],
+        using_hidden: &[bool],
         all_rows: &[Vec<SqlValue>],
         row_indices: &[usize],
         outer_scopes: &[EvalScope<'_>],
@@ -1594,13 +2256,18 @@ impl<'a> QueryExec<'a> {
             .create_aggregate(&fcall.name.name, fcall.args.len(), fcall.star)?;
 
         // Determine collation from first argument if any.
+        let mut agg_coll_name = "BINARY".to_string();
         let agg_coll: Option<&Collation> = if let Some(first_arg) = fcall.args.first() {
-            let sample_scope = EvalScope::simple(columns, &[]);
+            let mut sample_scope = EvalScope::simple(columns, &[]);
+            sample_scope.hidden_unqualified = Some(using_hidden);
             let mut scopes = outer_scopes.to_vec();
             scopes.push(sample_scope);
             let oc = expr_collation(first_arg, &scopes);
             match oc.name {
-                Some(ref cname) => Some(env.lookup_collation(cname)?),
+                Some(ref cname) => {
+                    agg_coll_name = cname.clone();
+                    Some(env.lookup_collation(cname)?)
+                }
                 None => None,
             }
         } else {
@@ -1616,7 +2283,9 @@ impl<'a> QueryExec<'a> {
             self.charge_steps(1)?;
             let row = &all_rows[ridx];
             let mut scopes = outer_scopes.to_vec();
-            scopes.push(EvalScope::simple(columns, row));
+            let mut sc = EvalScope::simple(columns, row);
+            sc.hidden_unqualified = Some(using_hidden);
+            scopes.push(sc);
 
             if let Some(ref flt) = fcall.filter {
                 let cond = eval_expr(flt, &scopes, &env)?;
@@ -1643,7 +2312,8 @@ impl<'a> QueryExec<'a> {
         // 2. Apply aggregate ORDER BY if present
         if !ob_terms.is_empty() {
             let ob_colls: Vec<&Collation> = {
-                let sample_scope = EvalScope::simple(columns, &[]);
+                let mut sample_scope = EvalScope::simple(columns, &[]);
+                sample_scope.hidden_unqualified = Some(using_hidden);
                 let mut scopes = outer_scopes.to_vec();
                 scopes.push(sample_scope);
                 let mut v = Vec::with_capacity(ob_terms.len());
@@ -1665,19 +2335,41 @@ impl<'a> QueryExec<'a> {
                     "DISTINCT aggregates must have exactly one argument",
                 ));
             }
+            let keep_null = fcall.name.name.eq_ignore_ascii_case("json_group_array");
             let mut deduped = Vec::with_capacity(surviving.len());
-            let mut seen_vals: Vec<SqlValue> = Vec::new();
-            for item in surviving {
-                let v = &item.1[0];
-                if v.is_null() {
-                    continue;
+            if is_hashable_collation(&agg_coll_name) {
+                let mut seen: HashSet<GroupKey> = HashSet::new();
+                for item in surviving {
+                    self.charge_steps(1)?;
+                    let v = &item.1[0];
+                    if v.is_null() && !keep_null {
+                        continue;
+                    }
+                    let gk = GroupKey::from_sql_with_coll(v, &agg_coll_name);
+                    if seen.insert(gk) {
+                        deduped.push(item);
+                    }
                 }
-                let dup = seen_vals
-                    .iter()
-                    .any(|s| mem_compare(s, v, agg_coll) == Ordering::Equal);
-                if !dup {
-                    seen_vals.push(v.clone());
-                    deduped.push(item);
+            } else {
+                let mut seen_vals: Vec<SqlValue> = Vec::new();
+                for item in surviving {
+                    self.charge_steps(1)?;
+                    let v = &item.1[0];
+                    if v.is_null() && !keep_null {
+                        continue;
+                    }
+                    let mut dup = false;
+                    for s in &seen_vals {
+                        self.charge_steps(1)?;
+                        if mem_compare(s, v, agg_coll) == Ordering::Equal {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if !dup {
+                        seen_vals.push(v.clone());
+                        deduped.push(item);
+                    }
                 }
             }
             surviving = deduped;
@@ -1706,15 +2398,13 @@ impl<'a> QueryExec<'a> {
         &self,
         core: &SelectCore,
         columns: &[ScopeColumn],
+        using_hidden: &[bool],
         rows: &[Vec<SqlValue>],
-        precomputed: &mut [Vec<(usize, usize, SqlValue)>],
+        precomputed: &mut [PrecomputedRow],
         expanded: &[ProjectedItem],
         outer_order_by: Option<&[OrderingTerm]>,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
         let env = self.make_env();
 
         let mut win_calls: Vec<&FunctionExpr> = Vec::new();
@@ -1733,26 +2423,78 @@ impl<'a> QueryExec<'a> {
             let Some(ref wref) = wcall.over else {
                 continue;
             };
+            if wcall.quantifier == Some(DistinctKind::Distinct) {
+                return Err(SqlError::runtime(
+                    "DISTINCT is not supported for window functions",
+                ));
+            }
+            let lower_name = wcall.name.name.to_ascii_lowercase();
+            let is_win_only = is_builtin_window_only(&lower_name);
+            if is_win_only && wcall.filter.is_some() {
+                return Err(SqlError::runtime(format!(
+                    "FILTER clause may only be used with aggregate window functions: {lower_name}()"
+                )));
+            }
             let spec = resolve_window_ref(wref, named_windows)?;
             let part_exprs = spec.partition_by.as_deref().unwrap_or(&[]);
             let ord_terms = spec.order_by.as_deref().unwrap_or(&[]);
 
-            let part_colls: Vec<&Collation> = {
-                let sample = EvalScope::simple(columns, &[]);
+            if let Some(ref fspec) = spec.frame {
+                let needs_range_order = fspec.units == xdb_parser::FrameUnits::Range
+                    && (matches!(
+                        fspec.from.kind,
+                        xdb_parser::FrameBoundType::Preceding
+                            | xdb_parser::FrameBoundType::Following
+                    ) || fspec.to.as_ref().is_some_and(|t| {
+                        matches!(
+                            t.kind,
+                            xdb_parser::FrameBoundType::Preceding
+                                | xdb_parser::FrameBoundType::Following
+                        )
+                    }));
+                if needs_range_order && ord_terms.len() != 1 {
+                    return Err(SqlError::runtime(
+                        "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression",
+                    ));
+                }
+            }
+
+            if rows.is_empty() {
+                let mut sample = EvalScope::simple(columns, &[]);
+                sample.hidden_unqualified = Some(using_hidden);
                 let mut scopes = outer_scopes.to_vec();
                 scopes.push(sample);
-                let mut v = Vec::with_capacity(part_exprs.len());
                 for pe in part_exprs {
-                    let cname = expr_collation(pe, &scopes)
-                        .name
-                        .unwrap_or_else(|| "BINARY".to_string());
-                    v.push(env.lookup_collation(&cname)?);
+                    validate_expr_columns(pe, &scopes, env.dqs)?;
                 }
-                v
+                for ot in ord_terms {
+                    validate_expr_columns(&ot.expr, &scopes, env.dqs)?;
+                }
+                continue;
+            }
+
+            let part_coll_names: Vec<String> = {
+                let mut sample = EvalScope::simple(columns, &[]);
+                sample.hidden_unqualified = Some(using_hidden);
+                let mut scopes = outer_scopes.to_vec();
+                scopes.push(sample);
+                part_exprs
+                    .iter()
+                    .map(|pe| {
+                        expr_collation(pe, &scopes)
+                            .name
+                            .unwrap_or_else(|| "BINARY".to_string())
+                    })
+                    .collect()
             };
+            let part_colls: Vec<&Collation> = part_coll_names
+                .iter()
+                .map(|c| env.lookup_collation(c))
+                .collect::<SqlResult<Vec<_>>>()?;
 
             let ord_colls: Vec<&Collation> = {
-                let sample = EvalScope::simple(columns, &[]);
+                let mut sample = EvalScope::simple(columns, &[]);
+                sample.hidden_unqualified = Some(using_hidden);
                 let mut scopes = outer_scopes.to_vec();
                 scopes.push(sample);
                 let mut v = Vec::with_capacity(ord_terms.len());
@@ -1774,7 +2516,9 @@ impl<'a> QueryExec<'a> {
                 scopes.push(EvalScope {
                     columns,
                     values: row,
-                    precomputed: Some(&precomputed[ridx]),
+                    precomputed: Some(&precomputed[ridx].slots),
+                    precomputed_json: Some(&precomputed[ridx].is_json),
+                    hidden_unqualified: Some(using_hidden),
                     aliases: None,
                     no_rowid_aliases: false,
                 });
@@ -1790,16 +2534,34 @@ impl<'a> QueryExec<'a> {
                 row_okeys.push(ok);
             }
 
-            // Group row indices into partitions.
+            // Group row indices into partitions (hash-based for built-in collations, metered otherwise).
             let mut partitions: Vec<Vec<usize>> = Vec::new();
             if part_exprs.is_empty() {
                 partitions.push((0..rows.len()).collect());
+            } else if part_coll_names.iter().all(|c| is_hashable_collation(c)) {
+                let mut pmap: HashMap<Vec<GroupKey>, usize> = HashMap::new();
+                for (ridx, pkey) in row_pkeys.iter().enumerate() {
+                    self.charge_steps(1)?;
+                    let hkey: Vec<GroupKey> = pkey
+                        .iter()
+                        .enumerate()
+                        .map(|(k, v)| GroupKey::from_sql_with_coll(v, &part_coll_names[k]))
+                        .collect();
+                    if let Some(&pid) = pmap.get(&hkey) {
+                        partitions[pid].push(ridx);
+                    } else {
+                        let pid = partitions.len();
+                        pmap.insert(hkey, pid);
+                        partitions.push(vec![ridx]);
+                    }
+                }
             } else {
                 let mut p_rep_keys: Vec<usize> = Vec::new();
                 for ridx in 0..rows.len() {
                     self.charge_steps(1)?;
                     let mut found = None;
                     for (pid, &rep) in p_rep_keys.iter().enumerate() {
+                        self.charge_steps(1)?;
                         let same = row_pkeys[rep]
                             .iter()
                             .zip(row_pkeys[ridx].iter())
@@ -1830,12 +2592,12 @@ impl<'a> QueryExec<'a> {
                 None => ResolvedFrame::default_for(!ord_terms.is_empty()),
             };
 
-            let lower_name = wcall.name.name.to_ascii_lowercase();
             let first_ord_dir = ord_terms
                 .first()
                 .and_then(|o| o.order)
                 .unwrap_or(SortOrder::Asc);
             let first_ord_coll = ord_colls.first().copied();
+            let is_json_win = !is_win_only && is_json_aggregate_name(&wcall.name.name);
 
             // Evaluate window function on each partition
             for mut part in partitions {
@@ -1873,7 +2635,9 @@ impl<'a> QueryExec<'a> {
                     scopes.push(EvalScope {
                         columns,
                         values: &rows[ridx],
-                        precomputed: Some(&precomputed[ridx]),
+                        precomputed: Some(&precomputed[ridx].slots),
+                        precomputed_json: Some(&precomputed[ridx].is_json),
+                        hidden_unqualified: Some(using_hidden),
                         aliases: None,
                         no_rowid_aliases: false,
                     });
@@ -1895,9 +2659,9 @@ impl<'a> QueryExec<'a> {
                     part_jmasks.push(jmask);
                 }
 
-                let results: Vec<SqlValue> = if is_builtin_window_only(&lower_name) {
+                let results: Vec<SqlValue> = if is_win_only {
                     eval_window_only_partition(&lower_name, &part_args, &peers, |i| {
-                        compute_frame_rows(
+                        let frows = compute_frame_rows(
                             &resolved_frame,
                             i,
                             plen,
@@ -1905,7 +2669,9 @@ impl<'a> QueryExec<'a> {
                             &first_order_vals,
                             first_ord_dir,
                             first_ord_coll,
-                        )
+                        )?;
+                        self.charge_steps((frows.len() as u64 / 32) + 1)?;
+                        Ok(frows)
                     })?
                 } else if self
                     .options
@@ -1913,7 +2679,8 @@ impl<'a> QueryExec<'a> {
                     .is_aggregate(&wcall.name.name, wcall.args.len(), wcall.star)
                 {
                     let agg_coll: Option<&Collation> = if let Some(first_arg) = wcall.args.first() {
-                        let sample = EvalScope::simple(columns, &[]);
+                        let mut sample = EvalScope::simple(columns, &[]);
+                        sample.hidden_unqualified = Some(using_hidden);
                         let mut scopes = outer_scopes.to_vec();
                         scopes.push(sample);
                         match expr_collation(first_arg, &scopes).name {
@@ -1942,6 +2709,7 @@ impl<'a> QueryExec<'a> {
                             wcall.star,
                         )?;
                         for r in frows {
+                            self.charge_steps(1)?;
                             if !part_filter[r] {
                                 continue;
                             }
@@ -1962,11 +2730,12 @@ impl<'a> QueryExec<'a> {
                 };
 
                 for (ppos, &ridx) in part.iter().enumerate() {
-                    precomputed[ridx].push((
+                    precomputed[ridx].push(
                         wcall.span.start,
                         wcall.span.end,
                         results[ppos].clone(),
-                    ));
+                        is_json_win,
+                    );
                 }
             }
         }
@@ -2006,75 +2775,142 @@ impl<'a> QueryExec<'a> {
                 Ordering::Equal
             });
         } else if let Some(terms) = order_by {
-            if !terms.is_empty() && rows.len() > 1 {
-                let mut key_rows: Vec<(usize, Vec<SqlValue>)> = Vec::with_capacity(rows.len());
+            if !terms.is_empty() {
                 let mut term_colls: Vec<&Collation> = Vec::with_capacity(terms.len());
 
-                // Pre-resolve collations for each ORDER BY term
-                for term in terms {
-                    if let Some(ord) = integer_ordinal(&term.expr) {
+                // Always validate ORDER BY ordinals & expressions even when `rows.len() <= 1`!
+                let sample_aliases: Vec<(String, SqlValue, Affinity, String)> = out_cols
+                    .iter()
+                    .map(|c| (c.name.clone(), SqlValue::Null, c.affinity, c.collation.clone()))
+                    .collect();
+                for (tidx, term) in terms.iter().enumerate() {
+                    if let Some((ord, ov_coll)) = integer_ordinal_with_collation(&term.expr) {
                         if ord < 1 || ord > out_cols.len() {
                             return Err(SqlError::runtime(format!(
-                                "1st ORDER BY term out of range - should be between 1 and {}",
+                                "{} ORDER BY term out of range - should be between 1 and {}",
+                                ordinal_label(tidx + 1),
                                 out_cols.len()
                             )));
                         }
-                        term_colls.push(env.lookup_collation(&out_cols[ord - 1].collation)?);
+                        let cname = ov_coll.unwrap_or(&out_cols[ord - 1].collation);
+                        term_colls.push(env.lookup_collation(cname)?);
                     } else {
-                        let sample_out = EvalScope::simple(out_cols, &[]);
-                        let mut scopes = outer_scopes.to_vec();
-                        if let Some(ctx) = order_ctx {
-                            scopes.push(EvalScope::simple(&ctx.from_columns, &[]));
+                        // Use SQLite's exact `resolveAsName` precedence:
+                        // 1. Bare unqualified name matching an EXPLICIT `AS` alias in SELECT wins first.
+                        // 2. Otherwise FROM scope (with output aliases as fallback), then output scope.
+                        let mut cname_opt = None;
+                        if let Some((col_name, ov_coll)) = bare_unqualified_col_and_coll(&term.expr)
+                        {
+                            if let Some(ctx) = order_ctx {
+                                if let Some(pos) = out_cols.iter().enumerate().position(|(i, c)| {
+                                    ctx.explicit_aliases.get(i).copied().unwrap_or(false)
+                                        && c.name.eq_ignore_ascii_case(col_name)
+                                }) {
+                                    cname_opt = Some(
+                                        ov_coll
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| out_cols[pos].collation.clone()),
+                                    );
+                                }
+                            }
                         }
-                        scopes.push(sample_out);
-                        let cname = expr_collation(&term.expr, &scopes)
-                            .name
-                            .unwrap_or_else(|| "BINARY".to_string());
+                        if cname_opt.is_none() {
+                            if let Some(ctx) = order_ctx {
+                                let mut scopes = outer_scopes.to_vec();
+                                scopes.push(EvalScope {
+                                    columns: &ctx.from_columns,
+                                    values: &[],
+                                    precomputed: None,
+                                    precomputed_json: None,
+                                    hidden_unqualified: Some(&ctx.from_using_hidden),
+                                    aliases: Some(&sample_aliases),
+                                    no_rowid_aliases: false,
+                                });
+                                cname_opt = expr_collation(&term.expr, &scopes).name;
+                            }
+                        }
+                        if cname_opt.is_none() {
+                            let mut scopes = outer_scopes.to_vec();
+                            scopes.push(EvalScope::simple(out_cols, &[]));
+                            cname_opt = expr_collation(&term.expr, &scopes).name;
+                        }
+                        let cname = cname_opt.unwrap_or_else(|| "BINARY".to_string());
                         term_colls.push(env.lookup_collation(&cname)?);
-                    }
-                }
-
-                for (ridx, row) in rows.iter().enumerate() {
-                    self.charge_steps(1)?;
-                    let mut keys = Vec::with_capacity(terms.len());
-                    for term in terms {
-                        if let Some(ord) = integer_ordinal(&term.expr) {
-                            keys.push(row[ord - 1].clone());
-                        } else {
-                            let val = self.eval_order_term(
+                        // Validate column resolution on 0/1-row results too!
+                        if rows.len() == 1 {
+                            let _ = self.eval_order_term(
                                 &term.expr,
                                 out_cols,
-                                row,
+                                &rows[0],
                                 order_ctx,
-                                ridx,
+                                0,
                                 outer_scopes,
                                 &env,
                             )?;
-                            keys.push(val);
+                        } else if rows.is_empty() {
+                            let dummy_row = vec![SqlValue::Null; out_cols.len()];
+                            self.eval_order_term_validate(
+                                &term.expr,
+                                out_cols,
+                                &dummy_row,
+                                order_ctx,
+                                outer_scopes,
+                                &env,
+                            )?;
                         }
                     }
-                    key_rows.push((ridx, keys));
                 }
 
-                key_rows.sort_by(|(_, ka), (_, kb)| {
-                    compare_sort_keys(ka, kb, terms, &term_colls)
-                });
-
-                let mut sorted = Vec::with_capacity(rows.len());
-                let mut slots: Vec<Option<Vec<SqlValue>>> = rows.into_iter().map(Some).collect();
-                for (ridx, _) in key_rows {
-                    if let Some(r) = slots[ridx].take() {
-                        sorted.push(r);
+                if rows.len() > 1 {
+                    let mut mem = self.make_mem_guard();
+                    let mut key_rows: Vec<(usize, Vec<SqlValue>)> = Vec::with_capacity(rows.len());
+                    for (ridx, row) in rows.iter().enumerate() {
+                        self.charge_steps(1)?;
+                        let mut keys = Vec::with_capacity(terms.len());
+                        for term in terms {
+                            if let Some((ord, _)) = integer_ordinal_with_collation(&term.expr) {
+                                keys.push(row[ord - 1].clone());
+                            } else {
+                                let val = self.eval_order_term(
+                                    &term.expr,
+                                    out_cols,
+                                    row,
+                                    order_ctx,
+                                    ridx,
+                                    outer_scopes,
+                                    &env,
+                                )?;
+                                keys.push(val);
+                            }
+                        }
+                        mem.reserve(estimate_row_bytes(&keys) + 16)?;
+                        key_rows.push((ridx, keys));
                     }
+
+                    key_rows.sort_by(|(_, ka), (_, kb)| {
+                        compare_sort_keys(ka, kb, terms, &term_colls)
+                    });
+
+                    let mut sorted = Vec::with_capacity(rows.len());
+                    let mut slots: Vec<Option<Vec<SqlValue>>> =
+                        rows.into_iter().map(Some).collect();
+                    for (ridx, _) in key_rows {
+                        if let Some(r) = slots[ridx].take() {
+                            sorted.push(r);
+                        }
+                    }
+                    rows = sorted;
                 }
-                rows = sorted;
             }
         }
 
         if let Some(lim) = limit {
-            let count = int_value(&eval_expr(&lim.count, outer_scopes, &env)?);
+            let count = eval_limit_int(&lim.count, outer_scopes, &env)?;
             let offset = match &lim.offset {
-                Some(off_expr) => int_value(&eval_expr(off_expr, outer_scopes, &env)?).max(0) as usize,
+                Some(off_expr) => {
+                    let o = eval_limit_int(off_expr, outer_scopes, &env)?.max(0);
+                    usize::try_from(o).unwrap_or(usize::MAX)
+                }
                 None => 0,
             };
             if offset >= rows.len() {
@@ -2083,13 +2919,52 @@ impl<'a> QueryExec<'a> {
                 if offset > 0 {
                     rows.drain(..offset);
                 }
-                if count >= 0 && (count as usize) < rows.len() {
-                    rows.truncate(count as usize);
+                if count >= 0 {
+                    let lim_n = usize::try_from(count).unwrap_or(usize::MAX);
+                    if lim_n < rows.len() {
+                        rows.truncate(lim_n);
+                    }
                 }
             }
         }
 
         Ok(rows)
+    }
+
+    fn eval_order_term_validate(
+        &self,
+        expr: &Expr,
+        out_cols: &[ScopeColumn],
+        dummy_out_row: &[SqlValue],
+        order_ctx: Option<&OrderEvalContext>,
+        outer_scopes: &[EvalScope<'_>],
+        env: &EvalEnv<'_>,
+    ) -> SqlResult<()> {
+        // Validate ALL column references inside `expr` on 0-row results without evaluating runtime errors.
+        let aliases: Vec<(String, SqlValue, Affinity, String)> = out_cols
+            .iter()
+            .zip(dummy_out_row.iter())
+            .map(|(c, v)| (c.name.clone(), v.clone(), c.affinity, c.collation.clone()))
+            .collect();
+        if let Some(ctx) = order_ctx {
+            let dummy_from = vec![SqlValue::Null; ctx.from_columns.len()];
+            let mut scopes = outer_scopes.to_vec();
+            scopes.push(EvalScope {
+                columns: &ctx.from_columns,
+                values: &dummy_from,
+                precomputed: None,
+                precomputed_json: None,
+                hidden_unqualified: Some(&ctx.from_using_hidden),
+                aliases: Some(&aliases),
+                no_rowid_aliases: false,
+            });
+            if validate_expr_columns(expr, &scopes, env.dqs).is_ok() {
+                return Ok(());
+            }
+        }
+        let mut scopes = outer_scopes.to_vec();
+        scopes.push(EvalScope::simple(out_cols, dummy_out_row));
+        validate_expr_columns(expr, &scopes, env.dqs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2103,9 +2978,27 @@ impl<'a> QueryExec<'a> {
         outer_scopes: &[EvalScope<'_>],
         env: &EvalEnv<'_>,
     ) -> SqlResult<SqlValue> {
-        // SQLite ORDER BY name resolution:
-        // 1. Try FROM-scope with output aliases as fallback (matches SQLite's rule where
-        //    unqualified bare aliases resolve to SELECT alias, while table.col resolves in FROM).
+        // SQLite ORDER BY resolution precedence (`resolve.c:resolveAsName`):
+        // - For a bare unqualified column name (`ORDER BY b` or `ORDER BY b COLLATE ...`),
+        //   an explicit `AS b` alias in the SELECT list wins first (left-to-right, no ambiguity).
+        // - Otherwise check FROM columns (with SELECT aliases as fallback).
+        // - Finally check `out_cols` directly (for compound SELECTs).
+        if let Some((col_name, _)) = bare_unqualified_col_and_coll(expr) {
+            if let Some(ctx) = order_ctx {
+                if let Some(pos) = out_cols.iter().enumerate().position(|(i, c)| {
+                    ctx.explicit_aliases.get(i).copied().unwrap_or(false)
+                        && c.name.eq_ignore_ascii_case(col_name)
+                }) {
+                    return Ok(out_row[pos].clone());
+                }
+            } else if let Some(pos) = out_cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            {
+                return Ok(out_row[pos].clone());
+            }
+        }
+
         if let Some(ctx) = order_ctx {
             let aliases: Vec<(String, SqlValue, Affinity, String)> = out_cols
                 .iter()
@@ -2116,15 +3009,22 @@ impl<'a> QueryExec<'a> {
             scopes.push(EvalScope {
                 columns: &ctx.from_columns,
                 values: &ctx.from_rows[ridx],
-                precomputed: Some(&ctx.precomputed[ridx]),
+                precomputed: Some(&ctx.precomputed[ridx].slots),
+                precomputed_json: Some(&ctx.precomputed[ridx].is_json),
+                hidden_unqualified: Some(&ctx.from_using_hidden),
                 aliases: Some(&aliases),
                 no_rowid_aliases: false,
             });
-            if let Ok(v) = eval_expr(expr, &scopes, env) {
-                return Ok(v);
+            match eval_expr(expr, &scopes, env) {
+                Ok(v) => return Ok(v),
+                // Only fall back to output scope when a column name wasn't found in FROM;
+                // never swallow real runtime errors (like BudgetMeter exhaustion or bad JSON)!
+                Err(SqlError::Runtime(ref msg)) if msg.starts_with("no such column:") => {}
+                Err(e) => return Err(e),
             }
         }
-        // 2. Output columns directly (for compound SELECT or alias-only expressions).
+
+        // Output columns directly (for compound SELECT or alias-only expressions).
         let mut scopes = outer_scopes.to_vec();
         scopes.push(EvalScope::simple(out_cols, out_row));
         eval_expr(expr, &scopes, env)
@@ -2141,12 +3041,73 @@ impl SubqueryRunner for QueryExec<'_> {
         Ok((cols.into_iter().map(|c| c.name).collect(), rows))
     }
 
+    fn run_select_with_affinities(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<(Vec<String>, Vec<Option<Affinity>>, Vec<Vec<SqlValue>>)> {
+        let (names, affs, _, rows) = self.run_select_with_meta(stmt, outer_scopes)?;
+        Ok((names, affs, rows))
+    }
+
+    fn run_select_with_meta(
+        &self,
+        stmt: &SelectStmt,
+        outer_scopes: &[EvalScope<'_>],
+    ) -> SqlResult<SelectWithMeta> {
+        let (cols, expl, rows) = self.execute_select_stmt_meta(stmt, outer_scopes)?;
+        let names = cols.iter().map(|c| c.name.clone()).collect();
+        let affs = cols
+            .iter()
+            .map(|c| {
+                if c.affinity == Affinity::None {
+                    None
+                } else {
+                    Some(c.affinity)
+                }
+            })
+            .collect();
+        let colls = cols
+            .iter()
+            .zip(expl.iter())
+            .map(|(c, &is_explicit)| {
+                if is_explicit {
+                    ExprCollation::explicit(c.collation.clone())
+                } else if !c.collation.eq_ignore_ascii_case("BINARY") {
+                    ExprCollation::implicit(c.collation.clone())
+                } else {
+                    ExprCollation::none()
+                }
+            })
+            .collect();
+        Ok((names, affs, colls, rows))
+    }
+
     fn run_in_table(
         &self,
         schema: Option<&str>,
         table: &str,
         args: Option<&[SqlValue]>,
     ) -> SqlResult<Vec<Vec<SqlValue>>> {
+        Ok(self.run_in_table_with_affinities(schema, table, args)?.1)
+    }
+
+    fn run_in_table_with_affinities(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<(Vec<Option<Affinity>>, Vec<Vec<SqlValue>>)> {
+        let (affs, _, rows) = self.run_in_table_with_meta(schema, table, args)?;
+        Ok((affs, rows))
+    }
+
+    fn run_in_table_with_meta(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        args: Option<&[SqlValue]>,
+    ) -> SqlResult<TableRowsWithMeta> {
         if let Some(arg_vals) = args {
             let env = self.make_env();
             if let Some(tvf) = self.catalog.call_tvf(
@@ -2155,20 +3116,64 @@ impl SubqueryRunner for QueryExec<'_> {
                 arg_vals,
                 self.options.meter.as_deref(),
             )? {
-                return Ok(tvf.rows);
+                let n = tvf.columns.len();
+                return Ok((vec![None; n], vec![ExprCollation::none(); n], tvf.rows));
             }
             if let Some(tvf) =
                 call_builtin_tvf(&table.to_ascii_lowercase(), arg_vals, &env.fn_ctx)?
             {
-                return Ok(tvf.rows);
+                let n = tvf.columns.len();
+                return Ok((vec![None; n], vec![ExprCollation::none(); n], tvf.rows));
             }
             return Err(SqlError::runtime(format!("no such table: {table}")));
         }
         if schema.is_none() {
             if let Some(cte) = self.ctes.get(&table.to_ascii_lowercase()) {
-                return Ok(cte.rows.clone());
+                let affs = cte
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        if c.affinity == Affinity::None {
+                            None
+                        } else {
+                            Some(c.affinity)
+                        }
+                    })
+                    .collect();
+                let colls = cte
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        if c.collation.eq_ignore_ascii_case("BINARY") {
+                            ExprCollation::none()
+                        } else {
+                            ExprCollation::implicit(c.collation.clone())
+                        }
+                    })
+                    .collect();
+                return Ok((affs, colls, cte.rows.clone()));
             }
         }
+        let tmeta = self.catalog.get_table(schema, table)?;
+        let affs: Vec<Option<Affinity>> = tmeta
+            .as_ref()
+            .map(|m| m.columns.iter().map(|c| Some(c.affinity)).collect())
+            .unwrap_or_default();
+        let colls: Vec<ExprCollation> = tmeta
+            .as_ref()
+            .map(|m| {
+                m.columns
+                    .iter()
+                    .map(|c| {
+                        if c.collation.eq_ignore_ascii_case("BINARY") {
+                            ExprCollation::none()
+                        } else {
+                            ExprCollation::implicit(c.collation.clone())
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let scanned = self.catalog.scan_table(
             schema,
             table,
@@ -2176,7 +3181,7 @@ impl SubqueryRunner for QueryExec<'_> {
             None,
             self.options.meter.as_deref(),
         )?;
-        Ok(scanned.into_iter().map(|r| r.values).collect())
+        Ok((affs, colls, scanned.into_iter().map(|r| r.values).collect()))
     }
 }
 
@@ -2184,8 +3189,10 @@ impl SubqueryRunner for QueryExec<'_> {
 
 struct OrderEvalContext {
     from_columns: Vec<ScopeColumn>,
+    from_using_hidden: Vec<bool>,
     from_rows: Vec<Vec<SqlValue>>,
-    precomputed: Vec<Vec<(usize, usize, SqlValue)>>,
+    precomputed: Vec<PrecomputedRow>,
+    explicit_aliases: Vec<bool>,
 }
 
 struct ProjectedItem {
@@ -2241,6 +3248,10 @@ fn expand_star(
 
     for (idx, col) in rel.columns.iter().enumerate() {
         if rel.star_hidden[idx] || col.is_rowid_alias {
+            continue;
+        }
+        // Duplicate `USING`/`NATURAL` columns are hidden only for unqualified `*`, not `t.*`.
+        if table_filter.is_none() && rel.using_hidden[idx] {
             continue;
         }
         if let Some(tf) = table_filter {
@@ -2305,7 +3316,10 @@ fn derive_column_name(expr: &Expr, raw_text: &str) -> String {
     }
 }
 
-fn apply_cte_column_names(cte: &CommonTableExpr, cols: &[ScopeColumn]) -> SqlResult<Vec<String>> {
+fn apply_cte_column_names(
+    cte: &CommonTableExpr,
+    cols: &[ScopeColumn],
+) -> SqlResult<Vec<ScopeColumn>> {
     if let Some(ref explicit) = cte.columns {
         if explicit.len() != cols.len() {
             return Err(SqlError::runtime(format!(
@@ -2315,9 +3329,28 @@ fn apply_cte_column_names(cte: &CommonTableExpr, cols: &[ScopeColumn]) -> SqlRes
                 explicit.len()
             )));
         }
-        Ok(explicit.iter().map(|i| i.name.name.clone()).collect())
+        Ok(cols
+            .iter()
+            .zip(explicit.iter())
+            .map(|(c, i)| ScopeColumn {
+                table: None,
+                name: i.name.name.clone(),
+                affinity: c.affinity,
+                collation: c.collation.clone(),
+                is_rowid_alias: false,
+            })
+            .collect())
     } else {
-        Ok(cols.iter().map(|c| c.name.clone()).collect())
+        Ok(cols
+            .iter()
+            .map(|c| ScopeColumn {
+                table: None,
+                name: c.name.clone(),
+                affinity: c.affinity,
+                collation: c.collation.clone(),
+                is_rowid_alias: false,
+            })
+            .collect())
     }
 }
 
@@ -2334,30 +3367,521 @@ fn relation_from_tvf(alias: &str, tvf: crate::functions::TableValuedResult) -> R
         })
         .collect::<Vec<_>>();
     let star_hidden = vec![false; columns.len()];
+    let using_hidden = vec![false; columns.len()];
     Relation {
         columns,
         star_hidden,
+        using_hidden,
         rows: tvf.rows,
     }
 }
 
-fn integer_ordinal(expr: &Expr) -> Option<usize> {
-    if let Expr::Number(n) = expr {
-        if !n.is_float && !n.is_hex {
-            return n.text.parse::<usize>().ok();
+/// Parse an integer ordinal term (`1`, `2`, `1 COLLATE NOCASE`).
+/// Overflowing integer literals return `Some((usize::MAX, coll))` so the caller emits
+/// SQLite's exact `"Nth ORDER BY/GROUP BY term out of range"` error instead of evaluating a constant!
+fn integer_ordinal_with_collation(expr: &Expr) -> Option<(usize, Option<&str>)> {
+    match expr {
+        Expr::Number(n) if !n.is_float && !n.is_hex => {
+            let ord = n.text.parse::<usize>().unwrap_or(usize::MAX);
+            Some((ord, None))
         }
+        Expr::Collate {
+            operand, collation, ..
+        } => {
+            if let Expr::Number(n) = operand.as_ref() {
+                if !n.is_float && !n.is_hex {
+                    let ord = n.text.parse::<usize>().unwrap_or(usize::MAX);
+                    return Some((ord, Some(collation.name.as_str())));
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
 
-fn contains_row_binary(haystack: &[Vec<SqlValue>], needle: &[SqlValue]) -> bool {
-    haystack.iter().any(|row| {
-        row.len() == needle.len()
-            && row
-                .iter()
-                .zip(needle.iter())
-                .all(|(a, b)| mem_compare(a, b, None) == Ordering::Equal)
-    })
+fn bare_unqualified_col_and_coll(expr: &Expr) -> Option<(&str, Option<&str>)> {
+    match expr {
+        Expr::Column(c) if c.schema.is_none() && c.table.is_none() => {
+            Some((c.column.name.as_str(), None))
+        }
+        Expr::Collate {
+            operand, collation, ..
+        } => bare_unqualified_col_and_coll(operand)
+            .map(|(name, _)| (name, Some(collation.name.as_str()))),
+        _ => None,
+    }
+}
+
+/// Evaluate a `LIMIT` or `OFFSET` expression strictly matching SQLite's `OP_MustBeInt`.
+fn eval_limit_int(
+    expr: &Expr,
+    outer_scopes: &[EvalScope<'_>],
+    env: &EvalEnv<'_>,
+) -> SqlResult<i64> {
+    let v = eval_expr(expr, outer_scopes, env)?;
+    must_be_int(&v).ok_or_else(|| SqlError::runtime("datatype mismatch"))
+}
+
+fn flatten_compound_branches<'a>(
+    body: &'a SelectBody,
+    out: &mut Vec<(Option<CompoundOperator>, &'a SelectBody)>,
+) {
+    match body {
+        SelectBody::Compound {
+            op, left, right, ..
+        } => {
+            flatten_compound_branches(left, out);
+            out.push((Some(*op), right));
+        }
+        other => {
+            out.push((None, other));
+        }
+    }
+}
+
+fn collect_unqualified_col_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Column(c) => {
+            if c.table.is_none() && c.schema.is_none() {
+                out.insert(c.column.name.to_ascii_lowercase());
+            }
+        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => collect_unqualified_col_names(operand, out),
+        Expr::Binary { left, right, .. } => {
+            collect_unqualified_col_names(left, out);
+            collect_unqualified_col_names(right, out);
+        }
+        Expr::Like {
+            left,
+            right,
+            escape,
+            ..
+        } => {
+            collect_unqualified_col_names(left, out);
+            collect_unqualified_col_names(right, out);
+            if let Some(e) = escape {
+                collect_unqualified_col_names(e, out);
+            }
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            collect_unqualified_col_names(operand, out);
+            collect_unqualified_col_names(low, out);
+            collect_unqualified_col_names(high, out);
+        }
+        Expr::InList { operand, items, .. } => {
+            collect_unqualified_col_names(operand, out);
+            for i in items {
+                collect_unqualified_col_names(i, out);
+            }
+        }
+        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+            collect_unqualified_col_names(operand, out);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(o) = operand {
+                collect_unqualified_col_names(o, out);
+            }
+            for w in whens {
+                collect_unqualified_col_names(&w.when, out);
+                collect_unqualified_col_names(&w.then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_unqualified_col_names(e, out);
+            }
+        }
+        Expr::Function(f) => {
+            for a in &f.args {
+                collect_unqualified_col_names(a, out);
+            }
+            if let Some(ref flt) = f.filter {
+                collect_unqualified_col_names(flt, out);
+            }
+        }
+        Expr::Vector { items, .. } => {
+            for i in items {
+                collect_unqualified_col_names(i, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Dry-run validation of all column references inside `expr` for 0-row queries so
+/// `SELECT nonexistent FROM empty_t`, `WHERE nonexistent = 1`, `GROUP BY nonexistent`, etc.
+/// still raise SQLite's exact `"no such column"` / `"ambiguous column name"` errors.
+fn validate_expr_columns(expr: &Expr, scopes: &[EvalScope<'_>], dqs: bool) -> SqlResult<()> {
+    match expr {
+        Expr::Column(c) => {
+            let _ = resolve_column(c, scopes, dqs)?;
+            Ok(())
+        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => validate_expr_columns(operand, scopes, dqs),
+        Expr::Binary { left, right, .. } => {
+            validate_expr_columns(left, scopes, dqs)?;
+            validate_expr_columns(right, scopes, dqs)
+        }
+        Expr::Like {
+            left,
+            right,
+            escape,
+            ..
+        } => {
+            validate_expr_columns(left, scopes, dqs)?;
+            validate_expr_columns(right, scopes, dqs)?;
+            if let Some(e) = escape {
+                validate_expr_columns(e, scopes, dqs)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            validate_expr_columns(operand, scopes, dqs)?;
+            validate_expr_columns(low, scopes, dqs)?;
+            validate_expr_columns(high, scopes, dqs)
+        }
+        Expr::InList { operand, items, .. } => {
+            validate_expr_columns(operand, scopes, dqs)?;
+            for i in items {
+                validate_expr_columns(i, scopes, dqs)?;
+            }
+            Ok(())
+        }
+        Expr::InSelect { operand, .. } => validate_expr_columns(operand, scopes, dqs),
+        Expr::InTable { operand, args, .. } => {
+            validate_expr_columns(operand, scopes, dqs)?;
+            if let Some(list) = args {
+                for a in list {
+                    validate_expr_columns(a, scopes, dqs)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(o) = operand {
+                validate_expr_columns(o, scopes, dqs)?;
+            }
+            for w in whens {
+                validate_expr_columns(&w.when, scopes, dqs)?;
+                validate_expr_columns(&w.then, scopes, dqs)?;
+            }
+            if let Some(e) = else_expr {
+                validate_expr_columns(e, scopes, dqs)?;
+            }
+            Ok(())
+        }
+        Expr::Function(f) => {
+            for a in &f.args {
+                validate_expr_columns(a, scopes, dqs)?;
+            }
+            if let Some(ref flt) = f.filter {
+                validate_expr_columns(flt, scopes, dqs)?;
+            }
+            if let Some(ref ob) = f.order_by {
+                for o in ob {
+                    validate_expr_columns(&o.expr, scopes, dqs)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Vector { items, .. } => {
+            for i in items {
+                validate_expr_columns(i, scopes, dqs)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn ordinal_label(n: usize) -> String {
+    match n % 100 {
+        11..=13 => format!("{n}th"),
+        _ => match n % 10 {
+            1 => format!("{n}st"),
+            2 => format!("{n}nd"),
+            3 => format!("{n}rd"),
+            _ => format!("{n}th"),
+        },
+    }
+}
+
+fn is_json_aggregate_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("json_group_array")
+        || name.eq_ignore_ascii_case("json_group_object")
+}
+
+fn is_hashable_collation(name: &str) -> bool {
+    name.eq_ignore_ascii_case("BINARY")
+        || name.eq_ignore_ascii_case("NOCASE")
+        || name.eq_ignore_ascii_case("RTRIM")
+}
+
+fn estimate_row_bytes(row: &[SqlValue]) -> u64 {
+    let mut total = (row.len() as u64).saturating_mul(24);
+    for v in row {
+        match v {
+            SqlValue::Text(b) | SqlValue::Blob(b) => {
+                total = total.saturating_add(b.len() as u64);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Collation-aware row deduplication set: O(1) hashed for BINARY/NOCASE/RTRIM,
+/// metered linear comparison for custom user collations.
+struct RowDedup<'a> {
+    coll_names: Vec<&'a str>,
+    colls: Vec<&'a Collation>,
+    hashable: bool,
+    hashed: HashSet<Vec<GroupKey>>,
+    linear: Vec<Vec<SqlValue>>,
+}
+
+impl<'a> RowDedup<'a> {
+    fn new(coll_names: &[&'a str], colls: &[&'a Collation]) -> Self {
+        let hashable = coll_names.iter().all(|c| is_hashable_collation(c));
+        Self {
+            coll_names: coll_names.to_vec(),
+            colls: colls.to_vec(),
+            hashable,
+            hashed: HashSet::new(),
+            linear: Vec::new(),
+        }
+    }
+
+    fn key_for(&self, row: &[SqlValue]) -> Vec<GroupKey> {
+        row.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let cn = self.coll_names.get(i).copied().unwrap_or("BINARY");
+                GroupKey::from_sql_with_coll(v, cn)
+            })
+            .collect()
+    }
+
+    fn contains(&self, row: &[SqlValue], exec: &QueryExec<'_>) -> SqlResult<bool> {
+        if self.hashable {
+            return Ok(self.hashed.contains(&self.key_for(row)));
+        }
+        for prev in &self.linear {
+            exec.charge_steps(1)?;
+            if prev.len() == row.len()
+                && prev
+                    .iter()
+                    .zip(row.iter())
+                    .enumerate()
+                    .all(|(i, (a, b))| mem_compare(a, b, self.colls.get(i).copied()) == Ordering::Equal)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns `true` if `row` was newly inserted (not already present).
+    fn insert(&mut self, row: &[SqlValue], exec: &QueryExec<'_>) -> SqlResult<bool> {
+        if self.hashable {
+            return Ok(self.hashed.insert(self.key_for(row)));
+        }
+        if self.contains(row, exec)? {
+            return Ok(false);
+        }
+        self.linear.push(row.to_vec());
+        Ok(true)
+    }
+}
+
+fn select_body_references_table(body: &SelectBody, name: &str) -> bool {
+    match body {
+        SelectBody::Core(core) => {
+            core.from
+                .as_ref()
+                .is_some_and(|f| from_source_references_table(f, name))
+                || core
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|e| expr_references_table(e, name))
+                || core
+                    .having
+                    .as_ref()
+                    .is_some_and(|e| expr_references_table(e, name))
+                || core.columns.iter().any(|rc| match rc {
+                    ResultColumn::Expr(re) => expr_references_table(&re.expr, name),
+                    ResultColumn::Star(_) => false,
+                })
+        }
+        SelectBody::Values(v) => v
+            .rows
+            .iter()
+            .any(|r| r.items.iter().any(|e| expr_references_table(e, name))),
+        SelectBody::Compound { left, right, .. } => {
+            select_body_references_table(left, name) || select_body_references_table(right, name)
+        }
+    }
+}
+
+fn from_source_references_table(src: &FromSource, name: &str) -> bool {
+    match src {
+        FromSource::Table(ft) => ft.schema.is_none() && ft.name.name.eq_ignore_ascii_case(name),
+        FromSource::Function(ff) => ff.args.iter().any(|a| expr_references_table(a, name)),
+        FromSource::Subquery(fs) => select_body_references_table(&fs.select.body, name),
+        FromSource::Group(fg) => from_source_references_table(&fg.source, name),
+        FromSource::Join {
+            left, right, on, ..
+        } => {
+            from_source_references_table(left, name)
+                || from_source_references_table(right, name)
+                || on.as_deref().is_some_and(|e| expr_references_table(e, name))
+        }
+    }
+}
+
+fn expr_references_table(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Subquery { select, .. } | Expr::Exists { select, .. } => {
+            select_body_references_table(&select.body, name)
+        }
+        Expr::InSelect { operand, select, .. } => {
+            expr_references_table(operand, name)
+                || select_body_references_table(&select.body, name)
+        }
+        Expr::InTable {
+            operand,
+            schema,
+            table,
+            ..
+        } => {
+            expr_references_table(operand, name)
+                || (schema.is_none() && table.name.eq_ignore_ascii_case(name))
+        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => expr_references_table(operand, name),
+        Expr::Binary { left, right, .. } => {
+            expr_references_table(left, name) || expr_references_table(right, name)
+        }
+        Expr::Like {
+            left,
+            right,
+            escape,
+            ..
+        } => {
+            expr_references_table(left, name)
+                || expr_references_table(right, name)
+                || escape
+                    .as_deref()
+                    .is_some_and(|e| expr_references_table(e, name))
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            expr_references_table(operand, name)
+                || expr_references_table(low, name)
+                || expr_references_table(high, name)
+        }
+        Expr::InList { operand, items, .. } => {
+            expr_references_table(operand, name)
+                || items.iter().any(|e| expr_references_table(e, name))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|e| expr_references_table(e, name))
+                || whens.iter().any(|w| {
+                    expr_references_table(&w.when, name) || expr_references_table(&w.then, name)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|e| expr_references_table(e, name))
+        }
+        Expr::Function(f) => f.args.iter().any(|a| expr_references_table(a, name)),
+        Expr::Vector { items, .. } => items.iter().any(|e| expr_references_table(e, name)),
+        _ => false,
+    }
+}
+
+fn expr_is_pushdown_const(expr: &Expr, options: &QueryOptions) -> bool {
+    match expr {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::Null { .. }
+        | Expr::Boolean { .. }
+        | Expr::Variable(_) => true,
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => expr_is_pushdown_const(operand, options),
+        Expr::Binary { left, right, .. } => {
+            expr_is_pushdown_const(left, options) && expr_is_pushdown_const(right, options)
+        }
+        Expr::Function(f) => {
+            let lower = f.name.name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "random"
+                    | "randomblob"
+                    | "changes"
+                    | "total_changes"
+                    | "last_insert_rowid"
+                    | "sqlite_offset"
+            ) || options.functions.has_custom_scalar(&lower, f.args.len())
+            {
+                return false;
+            }
+            f.over.is_none()
+                && !options
+                    .functions
+                    .is_aggregate(&f.name.name, f.args.len(), f.star)
+                && f.args.iter().all(|a| expr_is_pushdown_const(a, options))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|e| expr_is_pushdown_const(e, options))
+                && whens.iter().all(|w| {
+                    expr_is_pushdown_const(&w.when, options)
+                        && expr_is_pushdown_const(&w.then, options)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|e| expr_is_pushdown_const(e, options))
+        }
+        _ => false,
+    }
 }
 
 fn compare_ordered_val(
@@ -2436,8 +3960,27 @@ fn resolve_window_chain(
         .find(|d| d.name.name.eq_ignore_ascii_case(&base_name.name))
         .ok_or_else(|| SqlError::runtime(format!("no such window: {}", base_name.name)))?;
     let mut merged = resolve_window_chain(&base_def.window, defs, depth + 1)?;
+    // SQLite window inheritance validation (`window.c:sqlite3WindowChain`):
+    // 1. Derived window may NEVER specify a PARTITION BY clause.
+    // 2. Derived window may NOT specify ORDER BY if base already has ORDER BY.
+    // 3. Base window may NOT have an explicit frame specification.
     if spec.partition_by.is_some() {
-        merged.partition_by = spec.partition_by.clone();
+        return Err(SqlError::runtime(format!(
+            "cannot override PARTITION clause of window: {}",
+            base_name.name
+        )));
+    }
+    if merged.order_by.is_some() && spec.order_by.is_some() {
+        return Err(SqlError::runtime(format!(
+            "cannot override ORDER BY clause of window: {}",
+            base_name.name
+        )));
+    }
+    if merged.frame.is_some() {
+        return Err(SqlError::runtime(format!(
+            "cannot override frame specification of window: {}",
+            base_name.name
+        )));
     }
     if spec.order_by.is_some() {
         merged.order_by = spec.order_by.clone();
@@ -2628,36 +4171,39 @@ fn detect_simple_equijoin(
         }
         found
     };
-    let pair = match (
+    let (li, ri, swapped) = match (
         find_in(lrel, lc),
         find_in(rrel, rc),
         find_in(rrel, lc),
         find_in(lrel, rc),
     ) {
-        (Some(li), Some(ri), None, None) => (li, ri),
-        (None, None, Some(ri), Some(li)) => (li, ri),
+        (Some(li), Some(ri), None, None) => (li, ri, false),
+        (None, None, Some(ri), Some(li)) => (li, ri, true),
         _ => return None,
     };
-    let (li, ri) = pair;
     let aff = comparison_affinity(
         Some(lrel.columns[li].affinity),
         Some(rrel.columns[ri].affinity),
     );
-    let cname = comparison_collation_name(
-        Some(OperandCollation {
-            name: Some(&lrel.columns[li].collation),
-            explicit: false,
-        }),
-        Some(OperandCollation {
-            name: Some(&rrel.columns[ri].collation),
-            explicit: false,
-        }),
-    )
+    let l_op = Some(OperandCollation {
+        name: Some(&lrel.columns[li].collation),
+        explicit: false,
+    });
+    let r_op = Some(OperandCollation {
+        name: Some(&rrel.columns[ri].collation),
+        explicit: false,
+    });
+    // Preserve ON clause operand order: `ON r.k = l.k` uses `r.k`'s collation first!
+    let cname = if swapped {
+        comparison_collation_name(r_op, l_op)
+    } else {
+        comparison_collation_name(l_op, r_op)
+    }
     .unwrap_or("BINARY");
     Some((li, ri, aff, cname.to_string()))
 }
 
-/// Hash key for BINARY equi-joins (normalizing integer/real numeric equality where exact).
+/// Hash key for BINARY equi-joins (normalizing integer/real numeric equality across `[-2^63, 2^63)`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum HashKey {
     Num(i64),
@@ -2672,8 +4218,7 @@ impl HashKey {
             SqlValue::Null => None,
             SqlValue::Int(i) => Some(HashKey::Num(*i)),
             SqlValue::Real(r) => {
-                let iv = xdb_core::value::real_to_i64(*r);
-                if xdb_core::value::real_same_as_int(*r, iv) {
+                if let Some(iv) = real_to_exact_i64(*r) {
                     Some(HashKey::Num(iv))
                 } else {
                     let norm = if *r == 0.0 { 0.0f64 } else { *r };
@@ -2686,7 +4231,7 @@ impl HashKey {
     }
 }
 
-/// Hash key for `GROUP BY` (distinct from `HashKey`: includes `Null` since two NULLs group together).
+/// Hash key for `GROUP BY` / `DISTINCT` / set ops (includes `Null`, supports BINARY/NOCASE/RTRIM).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GroupKey {
     Null,
@@ -2697,26 +4242,58 @@ enum GroupKey {
 }
 
 impl GroupKey {
-    fn from_sql(v: &SqlValue) -> Self {
+    fn from_sql_with_coll(v: &SqlValue, coll_name: &str) -> Self {
         match v {
             SqlValue::Null => GroupKey::Null,
             SqlValue::Int(i) => GroupKey::Num(*i),
             SqlValue::Real(r) => {
-                let iv = xdb_core::value::real_to_i64(*r);
-                if xdb_core::value::real_same_as_int(*r, iv) {
+                if let Some(iv) = real_to_exact_i64(*r) {
                     GroupKey::Num(iv)
                 } else {
                     let norm = if *r == 0.0 { 0.0f64 } else { *r };
                     GroupKey::FloatBits(norm.to_bits())
                 }
             }
-            SqlValue::Text(b) => GroupKey::Text(b.clone()),
+            SqlValue::Text(b) => {
+                if coll_name.eq_ignore_ascii_case("NOCASE") {
+                    if let Some(nul) = b.iter().position(|&x| x == 0) {
+                        let mut norm = Vec::with_capacity(nul + 9);
+                        norm.extend(b[..nul].iter().map(|&c| c.to_ascii_lowercase()));
+                        norm.push(0);
+                        norm.extend_from_slice(&(b.len() as u64).to_le_bytes());
+                        GroupKey::Text(norm.into_boxed_slice())
+                    } else {
+                        let norm: Vec<u8> = b.iter().map(|&c| c.to_ascii_lowercase()).collect();
+                        GroupKey::Text(norm.into_boxed_slice())
+                    }
+                } else if coll_name.eq_ignore_ascii_case("RTRIM") {
+                    let mut end = b.len();
+                    while end > 0 && b[end - 1] == b' ' {
+                        end -= 1;
+                    }
+                    GroupKey::Text(b[..end].to_vec().into_boxed_slice())
+                } else {
+                    GroupKey::Text(b.clone())
+                }
+            }
             SqlValue::Blob(b) => GroupKey::Blob(b.clone()),
         }
     }
 }
 
 // ───────────────────────────── Public entry points ─────────────────────────────
+
+/// Execute a parsed [`SelectStmt`] against `catalog`, returning full column metadata
+/// (table qualifier, name, affinity, collation) alongside the result rows.
+pub fn execute_select_stmt_detailed(
+    catalog: &dyn SqlCatalog,
+    stmt: &SelectStmt,
+    params: &QueryParams,
+    options: &QueryOptions,
+) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+    let exec = QueryExec::new(catalog, options, params);
+    exec.execute_select_stmt(stmt, &[])
+}
 
 /// Execute a parsed [`SelectStmt`] against `catalog`.
 pub fn execute_select_stmt(
@@ -2725,8 +4302,7 @@ pub fn execute_select_stmt(
     params: &QueryParams,
     options: &QueryOptions,
 ) -> SqlResult<QueryResult> {
-    let exec = QueryExec::new(catalog, options, params);
-    let (cols, rows) = exec.execute_select_stmt(stmt, &[])?;
+    let (cols, rows) = execute_select_stmt_detailed(catalog, stmt, params, options)?;
     Ok(QueryResult {
         columns: cols.into_iter().map(|c| c.name).collect(),
         rows,

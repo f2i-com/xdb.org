@@ -207,12 +207,16 @@ impl CursorCore {
         }
         if !is_leaf {
             if pgno != 1 {
+                self.invalidate();
                 return Err(SqliteError::corrupt(format!(
                     "page {pgno}: interior root page has no cells"
                 )));
             }
+            if let Err(e) = self.move_to_child(right_child) {
+                self.invalidate();
+                return Err(e);
+            }
             self.valid = true;
-            self.move_to_child(right_child)?;
             return Ok(true);
         }
         self.valid = false;
@@ -513,6 +517,14 @@ impl TableCursor {
 
     /// `sqlite3BtreeTableMoveto`: binary-search down to the leaf for `rowid`.
     pub fn move_to(&mut self, rowid: i64) -> SqliteResult<Option<i32>> {
+        let res = self.move_to_inner(rowid);
+        if res.is_err() {
+            self.core.invalidate();
+        }
+        res
+    }
+
+    fn move_to_inner(&mut self, rowid: i64) -> SqliteResult<Option<i32>> {
         if !self.core.move_to_root()? {
             return Ok(None);
         }
@@ -623,6 +635,14 @@ impl IndexCursor {
 
     /// `sqlite3BtreeIndexMoveto` (`btree.c:6068`).
     pub fn move_to_key(&mut self, key: &mut dyn RecordKey) -> SqliteResult<Option<i32>> {
+        let res = self.move_to_key_inner(key);
+        if res.is_err() {
+            self.core.invalidate();
+        }
+        res
+    }
+
+    fn move_to_key_inner(&mut self, key: &mut dyn RecordKey) -> SqliteResult<Option<i32>> {
         if !self.core.move_to_root()? {
             return Ok(None);
         }
@@ -662,7 +682,7 @@ impl IndexCursor {
                 } else if pc + 1 < end
                     && (data[pc + 1] & 0x80) == 0
                     && (((n0 & 0x7f) << 7) + usize::from(data[pc + 1])) <= max_local
-                    && pc + (((n0 & 0x7f) << 7) + usize::from(data[pc + 1])) < end
+                    && pc + 2 + (((n0 & 0x7f) << 7) + usize::from(data[pc + 1])) <= end
                 {
                     let n = ((n0 & 0x7f) << 7) + usize::from(data[pc + 1]);
                     c = key.compare_record(data, pc + 2, n);

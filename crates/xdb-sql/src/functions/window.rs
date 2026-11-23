@@ -5,7 +5,9 @@
 
 use std::cmp::Ordering;
 
-use xdb_core::value::{add, int_value, mem_compare, subtract, Collation, SqlValue};
+use xdb_core::value::{
+    add, apply_numeric_affinity, int_value, mem_compare, must_be_int, subtract, Collation, SqlValue,
+};
 use xdb_parser::{FrameBound, FrameBoundType, FrameExclude, FrameSpec, FrameUnits, SortOrder};
 
 use crate::errors::{SqlError, SqlResult};
@@ -86,43 +88,58 @@ where
     let mut out = vec![SqlValue::Null; n];
 
     match lower_name {
-        "row_number" => {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = SqlValue::Int((i + 1) as i64);
-            }
-        }
-        "rank" => {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let (g_start, _) = peers.group_bounds[peers.group_of[i]];
-                *slot = SqlValue::Int((g_start + 1) as i64);
-            }
-        }
-        "dense_rank" => {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = SqlValue::Int((peers.group_of[i] + 1) as i64);
-            }
-        }
-        "percent_rank" => {
-            for (i, slot) in out.iter_mut().enumerate() {
-                if n <= 1 {
-                    *slot = SqlValue::Real(0.0);
-                } else {
-                    let (g_start, _) = peers.group_bounds[peers.group_of[i]];
-                    *slot = SqlValue::real((g_start as f64) / ((n - 1) as f64));
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+            if let Some(first) = args_per_row.first() {
+                if !first.is_empty() {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {lower_name}()"
+                    )));
                 }
             }
-        }
-        "cume_dist" => {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let (_, g_end) = peers.group_bounds[peers.group_of[i]];
-                *slot = SqlValue::real((g_end as f64) / (n as f64));
+            match lower_name {
+                "row_number" => {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = SqlValue::Int((i + 1) as i64);
+                    }
+                }
+                "rank" => {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        let (g_start, _) = peers.group_bounds[peers.group_of[i]];
+                        *slot = SqlValue::Int((g_start + 1) as i64);
+                    }
+                }
+                "dense_rank" => {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = SqlValue::Int((peers.group_of[i] + 1) as i64);
+                    }
+                }
+                "percent_rank" => {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        if n <= 1 {
+                            *slot = SqlValue::Real(0.0);
+                        } else {
+                            let (g_start, _) = peers.group_bounds[peers.group_of[i]];
+                            *slot = SqlValue::real((g_start as f64) / ((n - 1) as f64));
+                        }
+                    }
+                }
+                "cume_dist" => {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        let (_, g_end) = peers.group_bounds[peers.group_of[i]];
+                        *slot = SqlValue::real((g_end as f64) / (n as f64));
+                    }
+                }
+                _ => unreachable!(),
             }
         }
         "ntile" => {
             for (i, slot) in out.iter_mut().enumerate() {
-                let arg = args_per_row[i].first().ok_or_else(|| {
-                    SqlError::runtime("wrong number of arguments to function ntile()")
-                })?;
+                if args_per_row[i].len() != 1 {
+                    return Err(SqlError::runtime(
+                        "wrong number of arguments to function ntile()",
+                    ));
+                }
+                let arg = &args_per_row[i][0];
                 if arg.is_null() {
                     return Err(SqlError::runtime(
                         "argument of ntile must be a positive integer",
@@ -134,10 +151,10 @@ where
                         "argument of ntile must be a positive integer",
                     ));
                 }
-                let b = buckets as usize;
+                let b = usize::try_from(buckets).unwrap_or(usize::MAX);
                 let base = n / b;
                 let rem = n % b;
-                let bucket = if i < rem * (base + 1) {
+                let bucket = if i < rem.saturating_mul(base + 1) {
                     i / (base + 1) + 1
                 } else {
                     rem + (i - rem * (base + 1)) / base.max(1) + 1
@@ -164,14 +181,16 @@ where
                     1
                 };
                 let target = if is_lead {
-                    (i as i64).checked_add(offset)
+                    i64::try_from(i).ok().and_then(|v| v.checked_add(offset))
                 } else {
-                    (i as i64).checked_sub(offset)
+                    i64::try_from(i).ok().and_then(|v| v.checked_sub(offset))
                 };
                 if let Some(t) = target {
-                    if t >= 0 && (t as usize) < n {
-                        *slot = args_per_row[t as usize][0].clone();
-                        continue;
+                    if let Ok(idx) = usize::try_from(t) {
+                        if idx < n {
+                            *slot = args_per_row[idx][0].clone();
+                            continue;
+                        }
                     }
                 }
                 *slot = args.get(2).cloned().unwrap_or(SqlValue::Null);
@@ -223,8 +242,9 @@ where
                     continue;
                 }
                 let rows = frame_rows_for(i)?;
-                *slot = rows
-                    .get((n_pos - 1) as usize)
+                *slot = usize::try_from(n_pos - 1)
+                    .ok()
+                    .and_then(|idx| rows.get(idx))
                     .map(|&r| args_per_row[r][0].clone())
                     .unwrap_or(SqlValue::Null);
             }
@@ -289,22 +309,52 @@ impl ResolvedFrame {
     }
 }
 
-fn check_non_negative_offset(v: &Option<SqlValue>) -> SqlResult<&SqlValue> {
+fn check_int_offset(v: &Option<SqlValue>, is_start: bool) -> SqlResult<usize> {
+    let label = if is_start { "starting" } else { "ending" };
     let Some(val) = v else {
         return Err(SqlError::runtime("frame offset expression missing"));
     };
-    if val.is_null() {
-        return Err(SqlError::runtime(
-            "frame start or end offset must not be NULL",
-        ));
+    let Some(n) = must_be_int(val) else {
+        return Err(SqlError::runtime(format!(
+            "frame {label} offset must be a non-negative integer"
+        )));
+    };
+    if n < 0 {
+        return Err(SqlError::runtime(format!(
+            "frame {label} offset must be a non-negative integer"
+        )));
     }
-    let cmp = mem_compare(val, &SqlValue::Int(0), None);
-    if cmp == Ordering::Less {
-        return Err(SqlError::runtime(
-            "frame start or end offset must be non-negative",
-        ));
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+fn check_range_offset(v: &Option<SqlValue>, is_start: bool) -> SqlResult<SqlValue> {
+    let label = if is_start { "starting" } else { "ending" };
+    let Some(val) = v else {
+        return Err(SqlError::runtime("frame offset expression missing"));
+    };
+    let num = match val {
+        SqlValue::Int(i) => SqlValue::Int(*i),
+        SqlValue::Real(r) => SqlValue::Real(*r),
+        SqlValue::Text(b) => match apply_numeric_affinity(b, false) {
+            Some(n) => n,
+            None => {
+                return Err(SqlError::runtime(format!(
+                    "frame {label} offset must be a non-negative number"
+                )));
+            }
+        },
+        SqlValue::Null | SqlValue::Blob(_) => {
+            return Err(SqlError::runtime(format!(
+                "frame {label} offset must be a non-negative number"
+            )));
+        }
+    };
+    if mem_compare(&num, &SqlValue::Int(0), None) == Ordering::Less {
+        return Err(SqlError::runtime(format!(
+            "frame {label} offset must be a non-negative number"
+        )));
     }
-    Ok(val)
+    Ok(num)
 }
 
 /// Compute the partition row indices belonging to the frame of row `row_idx`.
@@ -327,11 +377,11 @@ pub fn compute_frame_rows(
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => row_idx,
                 FrameBoundType::Preceding => {
-                    let off = int_value(check_non_negative_offset(&frame.start_offset)?) as usize;
+                    let off = check_int_offset(&frame.start_offset, true)?;
                     row_idx.saturating_sub(off)
                 }
                 FrameBoundType::Following => {
-                    let off = int_value(check_non_negative_offset(&frame.start_offset)?) as usize;
+                    let off = check_int_offset(&frame.start_offset, true)?;
                     row_idx.saturating_add(off).min(part_len)
                 }
             };
@@ -340,7 +390,7 @@ pub fn compute_frame_rows(
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => row_idx + 1,
                 FrameBoundType::Preceding => {
-                    let off = int_value(check_non_negative_offset(&frame.end_offset)?) as usize;
+                    let off = check_int_offset(&frame.end_offset, false)?;
                     if off > row_idx {
                         0
                     } else {
@@ -348,7 +398,7 @@ pub fn compute_frame_rows(
                     }
                 }
                 FrameBoundType::Following => {
-                    let off = int_value(check_non_negative_offset(&frame.end_offset)?) as usize;
+                    let off = check_int_offset(&frame.end_offset, false)?;
                     row_idx.saturating_add(off).saturating_add(1).min(part_len)
                 }
             };
@@ -362,11 +412,11 @@ pub fn compute_frame_rows(
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => peers.group_bounds[g].0,
                 FrameBoundType::Preceding => {
-                    let off = int_value(check_non_negative_offset(&frame.start_offset)?) as usize;
+                    let off = check_int_offset(&frame.start_offset, true)?;
                     peers.group_bounds[g.saturating_sub(off)].0
                 }
                 FrameBoundType::Following => {
-                    let off = int_value(check_non_negative_offset(&frame.start_offset)?) as usize;
+                    let off = check_int_offset(&frame.start_offset, true)?;
                     let tg = g.saturating_add(off);
                     if tg >= ng {
                         part_len
@@ -380,7 +430,7 @@ pub fn compute_frame_rows(
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => peers.group_bounds[g].1,
                 FrameBoundType::Preceding => {
-                    let off = int_value(check_non_negative_offset(&frame.end_offset)?) as usize;
+                    let off = check_int_offset(&frame.end_offset, false)?;
                     if off > g {
                         0
                     } else {
@@ -388,7 +438,7 @@ pub fn compute_frame_rows(
                     }
                 }
                 FrameBoundType::Following => {
-                    let off = int_value(check_non_negative_offset(&frame.end_offset)?) as usize;
+                    let off = check_int_offset(&frame.end_offset, false)?;
                     let tg = g.saturating_add(off).min(ng - 1);
                     peers.group_bounds[tg].1
                 }
@@ -397,19 +447,31 @@ pub fn compute_frame_rows(
         }
         FrameUnits::Range => {
             let g = peers.group_of[row_idx];
+            let needs_order = matches!(
+                frame.start_kind,
+                FrameBoundType::Preceding | FrameBoundType::Following
+            ) || matches!(
+                frame.end_kind,
+                FrameBoundType::Preceding | FrameBoundType::Following
+            );
+            if needs_order && order_vals.len() != part_len {
+                return Err(SqlError::runtime(
+                    "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression",
+                ));
+            }
             let s = match frame.start_kind {
                 FrameBoundType::UnboundedPreceding => 0,
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => peers.group_bounds[g].0,
                 FrameBoundType::Preceding | FrameBoundType::Following => {
-                    let off = check_non_negative_offset(&frame.start_offset)?;
+                    let off = check_range_offset(&frame.start_offset, true)?;
                     let cur = &order_vals[row_idx];
-                    if cur.is_null() {
+                    if !matches!(cur, SqlValue::Int(_) | SqlValue::Real(_)) {
                         peers.group_bounds[g].0
                     } else {
                         let bound = range_bound(
                             cur,
-                            off,
+                            &off,
                             frame.start_kind == FrameBoundType::Preceding,
                             order_dir,
                         );
@@ -422,14 +484,14 @@ pub fn compute_frame_rows(
                 FrameBoundType::UnboundedFollowing => part_len,
                 FrameBoundType::CurrentRow => peers.group_bounds[g].1,
                 FrameBoundType::Preceding | FrameBoundType::Following => {
-                    let off = check_non_negative_offset(&frame.end_offset)?;
+                    let off = check_range_offset(&frame.end_offset, false)?;
                     let cur = &order_vals[row_idx];
-                    if cur.is_null() {
+                    if !matches!(cur, SqlValue::Int(_) | SqlValue::Real(_)) {
                         peers.group_bounds[g].1
                     } else {
                         let bound = range_bound(
                             cur,
-                            off,
+                            &off,
                             frame.end_kind == FrameBoundType::Preceding,
                             order_dir,
                         );
@@ -479,7 +541,7 @@ fn find_range_start(
     coll: Option<&Collation>,
 ) -> usize {
     for (i, v) in vals.iter().enumerate() {
-        if v.is_null() {
+        if !matches!(v, SqlValue::Int(_) | SqlValue::Real(_)) {
             continue;
         }
         let cmp = mem_compare(v, bound, coll);
@@ -502,8 +564,7 @@ fn find_range_end(
 ) -> usize {
     let mut end = 0;
     for (i, v) in vals.iter().enumerate() {
-        if v.is_null() {
-            end = i + 1;
+        if !matches!(v, SqlValue::Int(_) | SqlValue::Real(_)) {
             continue;
         }
         let cmp = mem_compare(v, bound, coll);

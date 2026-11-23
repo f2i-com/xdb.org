@@ -40,6 +40,7 @@ pub enum WalStatus {
     Absent,
     IgnoredByOption,
     IgnoredEmptyDatabase,
+    IgnoredRollbackMode,
 }
 
 /// How the snapshot handled a `-journal` file.
@@ -224,6 +225,8 @@ impl Snapshot {
         } else {
             Ok(())
         };
+        self.wal_file = None;
+        self.frame_of = None;
         let r2 = self.image.close();
         r1.and(r2)?;
         Ok(())
@@ -291,7 +294,7 @@ pub fn open_snapshot_from_image(bytes: Vec<u8>) -> (Snapshot, u32) {
             page_size = ps;
         }
     }
-    let file_pages = bytes.len().div_ceil(page_size as usize) as u32;
+    let file_pages = u32::try_from(bytes.len().div_ceil(page_size as usize)).unwrap_or(u32::MAX);
     let mut page_count = file_pages;
     if bytes.len() >= HEADER_SIZE {
         let n_page = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
@@ -388,16 +391,34 @@ pub fn open_snapshot(
         .into());
     }
 
-    let main_size = main.size()?;
+    let main_size = match main.size() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = main.unlock(LockLevel::None);
+            let _ = main.close();
+            return Err(e.into());
+        }
+    };
     let mut main_head = [0u8; HEADER_SIZE];
-    let _ = main.read(&mut main_head, 0)?;
+    if let Err(e) = main.read(&mut main_head, 0) {
+        let _ = main.unlock(LockLevel::None);
+        let _ = main.close();
+        return Err(e.into());
+    }
     let main_header_ps = header_page_size(&main_head);
     let pager_page_size = if is_valid_page_size(main_header_ps) {
         main_header_ps
     } else {
         SQLITE_DEFAULT_PAGE_SIZE
     };
-    let main_has_reserved = main.check_reserved_lock()?;
+    let main_has_reserved = match main.check_reserved_lock() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = main.unlock(LockLevel::None);
+            let _ = main.close();
+            return Err(e.into());
+        }
+    };
 
     let mut image: Box<dyn ByteImage> = Box::new(FileImage::new(main, main_size));
 
@@ -405,7 +426,7 @@ pub fn open_snapshot(
     let journal_path = format!("{path}-journal");
     let mut journal_info: Option<JournalInfo> = None;
     if let Some((mut jfile, jsize)) = open_if_present(vfs, &journal_path, FileKind::MainJournal)? {
-        let (info, playback) = examine_journal(
+        let (info, playback) = match examine_journal(
             vfs,
             path,
             main_has_reserved,
@@ -416,7 +437,14 @@ pub fn open_snapshot(
             pager_page_size,
             options.hot_journal,
             options.max_pathname,
-        )?;
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = jfile.close();
+                let _ = image.close();
+                return Err(e);
+            }
+        };
         journal_info = Some(info);
         if let Some(pb) = playback {
             if pb.played {
@@ -445,6 +473,21 @@ pub fn open_snapshot(
             ));
         }
     } else if let Some((mut wf, wsize)) = open_if_present(vfs, &wal_path, FileKind::Wal)? {
+        // SQLite `pagerOpenWalIfPresent`: ONLY apply `-wal` when the main database is non-empty,
+        // no hot rollback journal was applied, AND page 1's header indicates WAL format (version 2).
+        let main_is_wal = if image.size() >= HEADER_SIZE as u64
+            && !journal_info
+                .as_ref()
+                .is_some_and(|j| j.status == JournalStatus::HotApplied)
+        {
+            let mut probe = [0u8; HEADER_SIZE];
+            match image.read(&mut probe, 0) {
+                Ok(()) => probe[18] == 2 || probe[19] == 2,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
         if image.size() == 0 {
             let _ = wf.close();
             wal_info = Some(WalInfo::empty(
@@ -452,8 +495,22 @@ pub fn open_snapshot(
                 WalStatus::IgnoredEmptyDatabase,
                 wsize,
             ));
+        } else if !main_is_wal {
+            let _ = wf.close();
+            wal_info = Some(WalInfo::empty(
+                wal_path.clone(),
+                WalStatus::IgnoredRollbackMode,
+                wsize,
+            ));
         } else {
-            let rec = recover_wal(wf.as_mut(), wsize)?;
+            let rec = match recover_wal(wf.as_mut(), wsize) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = wf.close();
+                    let _ = image.close();
+                    return Err(e.into());
+                }
+            };
             wal_info = Some(WalInfo::from_recovery(
                 wal_path.clone(),
                 WalStatus::Applied,
@@ -473,13 +530,21 @@ pub fn open_snapshot(
     let p1_frame = wal_recovery
         .as_ref()
         .and_then(|r| r.frame_of.get(&1).copied());
-    if let (Some(frame), Some(ref mut wf), Some(ref rec)) =
+    let read_p1_res = if let (Some(frame), Some(ref mut wf), Some(ref rec)) =
         (p1_frame, &mut wal_file, &wal_recovery)
     {
         let wps = rec.header.expect("valid wal header").page_size;
-        let _ = wf.read(&mut page1, wal_frame_offset(frame, wps) + WAL_FRAME_HEADER_SIZE)?;
+        wf.read(&mut page1, wal_frame_offset(frame, wps) + WAL_FRAME_HEADER_SIZE)
+            .map(|_| ())
     } else {
-        image.read(&mut page1, 0)?;
+        image.read(&mut page1, 0)
+    };
+    if let Err(e) = read_p1_res {
+        if let Some(ref mut wf) = wal_file {
+            let _ = wf.close();
+        }
+        let _ = image.close();
+        return Err(e.into());
     }
 
     let header = read_raw_header(&page1).expect("100 bytes");
@@ -489,7 +554,30 @@ pub fn open_snapshot(
     let (page_size, page_count) = if !size_valid && wal_n_page == 0 && image.size() == 0 {
         (pager_page_size, 0u32)
     } else {
-        let checked = check_page1(&page1, &header, size_valid, wal_n_page, image.size())?;
+        let checked = match check_page1(&page1, &header, size_valid, wal_n_page, image.size()) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(ref mut wf) = wal_file {
+                    let _ = wf.close();
+                }
+                let _ = image.close();
+                return Err(e);
+            }
+        };
+        if let Some(ref rec) = wal_recovery {
+            if let Some(whdr) = rec.header {
+                if rec.mx_frame > 0 && whdr.page_size != checked.0 {
+                    if let Some(ref mut wf) = wal_file {
+                        let _ = wf.close();
+                    }
+                    let _ = image.close();
+                    return Err(SqliteError::corrupt(format!(
+                        "WAL page size {} does not match database page size {}",
+                        whdr.page_size, checked.0
+                    )));
+                }
+            }
+        }
         if options.wal == WalMode::Apply && wal_info.is_none() && page1[19] == 2 {
             wal_info = Some(WalInfo::empty(wal_path, WalStatus::Absent, 0));
         }
@@ -590,7 +678,7 @@ fn check_page1(
     let n_page_file = if wal_n_page != 0 {
         wal_n_page
     } else {
-        file_size.div_ceil(u64::from(page_size)) as u32
+        u32::try_from(file_size.div_ceil(u64::from(page_size))).unwrap_or(u32::MAX)
     };
     let n_page = if size_valid {
         header.page_count

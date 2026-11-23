@@ -4,17 +4,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use xdb_core::vfs::{FileKind, LockLevel, OpenFlags, Vfs};
+use xdb_core::vfs::{FileKind, IoError, IoErrorCode, LockLevel, OpenFlags, Vfs};
 use xdb_core::{Meter, NoopMeter, TextEncoding};
 
 use crate::errors::{SqliteError, SqliteResult};
 use crate::format::{
     empty_database_info, header_page_size, is_valid_page_size, lock_byte_page,
-    validate_database_header, DatabaseInfo, BtreePageType, HEADER_SIZE, SQLITE_HEADER_MAGIC,
+    validate_database_header, BtreePageType, DatabaseInfo, HEADER_SIZE, MAX_SCHEMA_FORMAT,
+    SQLITE_HEADER_MAGIC,
 };
 use crate::page_source::PageSource;
 use crate::snapshot::{
-    journal_checksum, open_snapshot, open_snapshot_from_bytes, SnapshotOptions, JOURNAL_MAGIC,
+    journal_checksum, open_snapshot, open_snapshot_from_bytes, playback_journal, JournalStatus,
+    SnapshotMode, SnapshotOptions, WalStatus, JOURNAL_MAGIC,
 };
 
 /// SQLite 3.54.1 version number written into header bytes 96..100 (`3054001`).
@@ -64,6 +66,7 @@ pub struct WritePager {
     freelist_trunk: u32,
     freelist_count: u32,
     schema_cookie: u32,
+    schema_format: u32,
     change_counter: u32,
     user_version: i32,
     application_id: i32,
@@ -82,6 +85,9 @@ pub struct WritePager {
     in_explicit_tx: bool,
     /// Nonce counter for rollback journal checksums.
     journal_nonce: u32,
+    /// True if a prior `flush_to_vfs` failed after syncing `-journal`, leaving potentially
+    /// torn main-DB pages on disk that MUST be recovered from `-journal` before truncating it.
+    disk_needs_journal_recovery: bool,
     /// Tracked bytes reserved in `meter`.
     tracked_bytes: u64,
 }
@@ -96,6 +102,19 @@ impl Drop for WritePager {
 }
 
 impl WritePager {
+    /// Release all resident pages, undo buffers, and metered memory.
+    pub fn close(&mut self) {
+        self.pages = Arc::new(BTreeMap::new());
+        self.dirty_originals.clear();
+        self.undo_stack.clear();
+        self.in_explicit_tx = false;
+        self.page_count = 0;
+        if self.tracked_bytes > 0 {
+            self.meter.release_memory(self.tracked_bytes);
+            self.tracked_bytes = 0;
+        }
+    }
+
     /// Create a brand-new empty in-memory SQLite database.
     pub fn new_in_memory(page_size: u32, meter: Option<Arc<dyn Meter>>) -> SqliteResult<Self> {
         let ps = if is_valid_page_size(page_size) {
@@ -114,6 +133,7 @@ impl WritePager {
             freelist_trunk: 0,
             freelist_count: 0,
             schema_cookie: 0,
+            schema_format: 4,
             change_counter: 0,
             user_version: 0,
             application_id: 0,
@@ -124,6 +144,7 @@ impl WritePager {
             undo_stack: Vec::new(),
             in_explicit_tx: false,
             journal_nonce: 0x1a2b_3c4d,
+            disk_needs_journal_recovery: false,
             tracked_bytes: 0,
         })
     }
@@ -171,6 +192,20 @@ impl WritePager {
 
         // Open existing database (applying any hot journal or WAL overlay into our initial state!)
         let snap = open_snapshot(vfs.as_ref(), path, SnapshotOptions::default())?;
+        let snap_mode = snap.mode;
+        let journal_needs_cleanup = snap.journal.as_ref().is_some_and(|j| {
+            matches!(
+                j.status,
+                JournalStatus::HotApplied | JournalStatus::NotHotEmptyDatabase
+            )
+        });
+        let wal_applied = snap
+            .wal
+            .as_ref()
+            .is_some_and(|w| w.status == WalStatus::Applied);
+        let had_wal_version = snap
+            .header
+            .is_some_and(|h| h.write_version == 2 || h.read_version == 2);
         let mut pager = Self::from_snapshot(
             snap,
             Some(VfsBacking {
@@ -179,10 +214,21 @@ impl WritePager {
             }),
             meter,
         )?;
-        // If there was a hot journal or WAL on disk, materialize cleanly if caller later writes.
-        let _ = pager.commit_orig_page_count;
         if pager.page_count == 0 && is_valid_page_size(page_size) {
             pager.page_size = page_size;
+        }
+        // Materialize any recovered hot-journal (including rollback-to-empty `db_size == 0`
+        // and stale journal left alongside an empty 0-byte main file!) or WAL state onto the
+        // main DB file under Exclusive lock before allowing further writes.
+        if snap_mode == SnapshotMode::HotJournalOverlay
+            || journal_needs_cleanup
+            || wal_applied
+            || (had_wal_version && pager.page_count > 0)
+        {
+            pager.materialize_recovered_state_to_vfs(
+                snap_mode == SnapshotMode::HotJournalOverlay || journal_needs_cleanup,
+                wal_applied || had_wal_version,
+            )?;
         }
         Ok(pager)
     }
@@ -192,10 +238,26 @@ impl WritePager {
         backing: Option<VfsBacking>,
         meter: Arc<dyn Meter>,
     ) -> SqliteResult<Self> {
+        // RAII guard so metered page memory is never leaked if loading/validation fails.
+        struct TrackedGuard {
+            meter: Arc<dyn Meter>,
+            bytes: u64,
+        }
+        impl Drop for TrackedGuard {
+            fn drop(&mut self) {
+                if self.bytes > 0 {
+                    self.meter.release_memory(self.bytes);
+                }
+            }
+        }
+
         let page_size = snap.page_size();
         let page_count = snap.page_count();
         let mut pages = BTreeMap::new();
-        let mut tracked = 0u64;
+        let mut guard = TrackedGuard {
+            meter: meter.clone(),
+            bytes: 0,
+        };
 
         if page_count > 0 {
             for pgno in 1..=page_count {
@@ -204,11 +266,13 @@ impl WritePager {
                 }
                 meter.charge_page_reads(1)?;
                 meter.reserve_memory(u64::from(page_size))?;
-                tracked += u64::from(page_size);
+                guard.bytes += u64::from(page_size);
                 let buf = snap.read_page(pgno)?;
                 pages.insert(pgno, Arc::new(buf));
             }
         }
+        // Release the snapshot's read locks and file handles now that pages are in memory.
+        let _ = snap.close();
 
         let (
             reserved_bytes,
@@ -216,6 +280,7 @@ impl WritePager {
             freelist_trunk,
             freelist_count,
             schema_cookie,
+            schema_format,
             change_counter,
             user_version,
             application_id,
@@ -227,19 +292,49 @@ impl WritePager {
                     "writing to auto_vacuum databases is not yet supported",
                 ));
             }
+            if info.write_version_too_new {
+                return Err(SqliteError::misuse(format!(
+                    "cannot open database for writing: unsupported write format version {}",
+                    h.write_version
+                )));
+            }
+            if h.schema_format > MAX_SCHEMA_FORMAT {
+                return Err(SqliteError::schema_format("unsupported file format"));
+            }
+            let sf = if h.schema_format == 0 {
+                4
+            } else {
+                h.schema_format
+            };
             (
                 h.reserved_bytes,
                 info.text_encoding,
                 h.first_freelist_trunk,
                 h.freelist_count,
                 h.schema_cookie,
+                sf,
                 h.file_change_counter,
                 h.user_version,
                 h.application_id,
             )
         } else {
-            (0, TextEncoding::Utf8, 0, 0, 0, 0, 0, 0)
+            (0, TextEncoding::Utf8, 0, 0, 0, 4, 0, 0, 0)
         };
+
+        // Normalize in-memory writable copies loaded from WAL-mode bytes to rollback mode (1/1)
+        // so exported single-file `.db` images are self-contained rollback databases.
+        if backing.is_none() {
+            if let Some(p1_arc) = pages.get_mut(&1) {
+                let p1 = Arc::make_mut(p1_arc);
+                if p1[18] == 2 || p1[19] == 2 {
+                    p1[18] = 1;
+                    p1[19] = 1;
+                }
+            }
+        }
+
+        let tracked = guard.bytes;
+        guard.bytes = 0;
 
         Ok(Self {
             backing,
@@ -251,6 +346,7 @@ impl WritePager {
             freelist_trunk,
             freelist_count,
             schema_cookie,
+            schema_format,
             change_counter,
             user_version,
             application_id,
@@ -261,8 +357,84 @@ impl WritePager {
             undo_stack: Vec::new(),
             in_explicit_tx: false,
             journal_nonce: change_counter.wrapping_add(0x55aa_1234),
+            disk_needs_journal_recovery: false,
             tracked_bytes: tracked,
         })
+    }
+
+    /// Persist recovered hot-journal or WAL pages back to the main DB file on disk under
+    /// Exclusive lock and clean up the stale `-journal` / `-wal` / `-shm` companion files.
+    fn materialize_recovered_state_to_vfs(
+        &mut self,
+        clear_hot_journal: bool,
+        clear_wal: bool,
+    ) -> SqliteResult<()> {
+        let Some(ref backing) = self.backing else {
+            return Ok(());
+        };
+        let vfs = backing.vfs.clone();
+        let main_path = backing.path.clone();
+        let ps = self.page_size;
+
+        if clear_wal && self.page_count > 0 {
+            if let Some(p1_arc) = Arc::make_mut(&mut self.pages).get_mut(&1) {
+                let p1 = Arc::make_mut(p1_arc);
+                if p1[18] == 2 || p1[19] == 2 {
+                    p1[18] = 1;
+                    p1[19] = 1;
+                }
+            }
+        }
+
+        let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
+        acquire_exclusive_lock(main_file.as_mut(), &main_path)?;
+
+        let write_res: SqliteResult<()> = (|| {
+            let lbp = lock_byte_page(ps);
+            for pgno in 1..=self.page_count {
+                if pgno == lbp {
+                    continue;
+                }
+                if let Some(bytes) = self.pages.get(&pgno) {
+                    let off = u64::from(pgno - 1) * u64::from(ps);
+                    main_file.write(bytes, off)?;
+                }
+            }
+            let target_size = u64::from(self.page_count) * u64::from(ps);
+            if main_file.size()? != target_size {
+                main_file.truncate(target_size)?;
+            }
+            main_file.sync(false)?;
+            if clear_hot_journal {
+                let jpath = format!("{main_path}-journal");
+                if vfs.exists(&jpath)? {
+                    if let Err(e) = vfs.delete(&jpath, true) {
+                        if e.code != IoErrorCode::IoErrDeleteNoEnt {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+            if clear_wal {
+                for suffix in ["-wal", "-shm"] {
+                    let spath = format!("{main_path}{suffix}");
+                    if vfs.exists(&spath)? {
+                        if let Err(e) = vfs.delete(&spath, true) {
+                            if e.code != IoErrorCode::IoErrDeleteNoEnt {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        let _ = main_file.unlock(LockLevel::None);
+        let _ = main_file.close();
+        write_res?;
+        self.commit_orig_page_count = self.page_count;
+        Ok(())
     }
 
     pub fn meter(&self) -> &Arc<dyn Meter> {
@@ -300,6 +472,12 @@ impl WritePager {
         self.encoding
     }
 
+    pub fn set_encoding(&mut self, enc: TextEncoding) {
+        if self.page_count == 0 {
+            self.encoding = enc;
+        }
+    }
+
     pub fn freelist_trunk(&self) -> u32 {
         self.freelist_trunk
     }
@@ -310,6 +488,10 @@ impl WritePager {
 
     pub fn schema_cookie(&self) -> u32 {
         self.schema_cookie
+    }
+
+    pub fn schema_format(&self) -> u32 {
+        self.schema_format
     }
 
     pub fn schema_gen(&self) -> u64 {
@@ -348,7 +530,7 @@ impl WritePager {
     }
 
     pub fn in_transaction(&self) -> bool {
-        self.in_explicit_tx
+        self.in_explicit_tx || self.undo_stack.iter().any(|f| f.name.is_some())
     }
 
     pub fn db_info(&self) -> DatabaseInfo {
@@ -365,11 +547,12 @@ impl WritePager {
         if self.page_count > 0 {
             return Ok(());
         }
-        self.record_undo_for_page(1);
-        self.record_dirty_original(1);
         let ps = self.page_size as usize;
+        // Reserve memory BEFORE mutating undo/dirty state so a memory-limit error leaves pager clean.
         self.meter.reserve_memory(ps as u64)?;
         self.tracked_bytes += ps as u64;
+        self.record_undo_for_page(1);
+        self.record_dirty_original(1);
 
         let mut p1 = vec![0u8; ps];
         // Write 100-byte SQLite 3 header
@@ -447,12 +630,13 @@ impl WritePager {
             return Err(SqliteError::misuse("page write length mismatch"));
         }
         self.meter.charge_steps(1)?;
-        self.record_undo_for_page(pgno);
-        self.record_dirty_original(pgno);
+        // Reserve memory BEFORE recording undo/dirty metadata so OOM never leaves phantom state.
         if !self.pages.contains_key(&pgno) {
             self.meter.reserve_memory(data.len() as u64)?;
             self.tracked_bytes += data.len() as u64;
         }
+        self.record_undo_for_page(pgno);
+        self.record_dirty_original(pgno);
         Arc::make_mut(&mut self.pages).insert(pgno, Arc::new(data));
         Ok(())
     }
@@ -465,9 +649,21 @@ impl WritePager {
         // 1. Pop from freelist if available (`btree.c allocateBtreePage`).
         if self.freelist_trunk != 0 {
             let trunk_pgno = self.freelist_trunk;
+            let lbp = lock_byte_page(self.page_size);
+            if trunk_pgno < 2 || trunk_pgno > self.page_count || trunk_pgno == lbp {
+                return Err(SqliteError::corrupt(format!(
+                    "corrupt freelist trunk page {trunk_pgno}"
+                )));
+            }
+            let max_leaves = ((self.usable_size() as usize).saturating_sub(8)) / 4;
             let trunk = self.read_page(trunk_pgno)?.to_vec();
             let next_trunk = u32::from_be_bytes([trunk[0], trunk[1], trunk[2], trunk[3]]);
             let leaf_cnt = u32::from_be_bytes([trunk[4], trunk[5], trunk[6], trunk[7]]);
+            if (leaf_cnt as usize) > max_leaves {
+                return Err(SqliteError::corrupt(format!(
+                    "corrupt freelist trunk {trunk_pgno}: leaf count {leaf_cnt} exceeds max {max_leaves}"
+                )));
+            }
             if leaf_cnt > 0 {
                 let off = 8 + ((leaf_cnt - 1) as usize) * 4;
                 let popped = u32::from_be_bytes([
@@ -476,6 +672,11 @@ impl WritePager {
                     trunk[off + 2],
                     trunk[off + 3],
                 ]);
+                if popped < 2 || popped > self.page_count || popped == lbp {
+                    return Err(SqliteError::corrupt(format!(
+                        "corrupt freelist leaf page {popped} on trunk {trunk_pgno}"
+                    )));
+                }
                 let tbuf = self.write_page_mut(trunk_pgno)?;
                 tbuf[4..8].copy_from_slice(&(leaf_cnt - 1).to_be_bytes());
                 tbuf[off..off + 4].fill(0);
@@ -486,6 +687,11 @@ impl WritePager {
                 return Ok(popped);
             } else {
                 // Trunk itself has no leaves: pop trunk page and advance head!
+                if next_trunk != 0 && (next_trunk < 2 || next_trunk > self.page_count || next_trunk == lbp) {
+                    return Err(SqliteError::corrupt(format!(
+                        "corrupt next freelist trunk {next_trunk} on trunk {trunk_pgno}"
+                    )));
+                }
                 self.freelist_trunk = next_trunk;
                 self.freelist_count = self.freelist_count.saturating_sub(1);
                 self.sync_page1_header()?;
@@ -496,25 +702,31 @@ impl WritePager {
         }
 
         // 2. Extend database file by 1 page (skipping lock-byte page if reached).
-        let mut next = self.page_count + 1;
+        let mut next = self
+            .page_count
+            .checked_add(1)
+            .ok_or_else(|| SqliteError::Sql("database or disk is full".to_string()))?;
         let lbp = lock_byte_page(self.page_size);
         if next == lbp {
-            next += 1;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| SqliteError::Sql("database or disk is full".to_string()))?;
         }
-        self.page_count = next;
         let ps = self.page_size as usize;
         self.put_page(next, vec![0u8; ps])?;
+        self.page_count = next;
         self.sync_page1_header()?;
         Ok(next)
     }
 
     /// Return `pgno` (> 1) to the SQLite freelist (`fileformat2 §1.5`).
     pub fn free_page(&mut self, pgno: u32) -> SqliteResult<()> {
-        if pgno <= 1 || pgno > self.page_count {
+        let lbp = lock_byte_page(self.page_size);
+        if pgno <= 1 || pgno > self.page_count || pgno == lbp {
             return Err(SqliteError::misuse(format!("cannot free page {pgno}")));
         }
         self.meter.charge_steps(2)?;
-        let max_leaves = ((self.usable_size() as usize) - 8) / 4;
+        let max_leaves = ((self.usable_size() as usize).saturating_sub(8)) / 4;
 
         if self.freelist_trunk != 0 {
             let trunk_pgno = self.freelist_trunk;
@@ -522,6 +734,11 @@ impl WritePager {
                 let t = self.read_page(trunk_pgno)?;
                 u32::from_be_bytes([t[4], t[5], t[6], t[7]]) as usize
             };
+            if leaf_cnt > max_leaves {
+                return Err(SqliteError::corrupt(format!(
+                    "corrupt freelist trunk {trunk_pgno}: leaf count {leaf_cnt} exceeds max {max_leaves}"
+                )));
+            }
             if leaf_cnt < max_leaves {
                 let off = 8 + leaf_cnt * 4;
                 let tbuf = self.write_page_mut(trunk_pgno)?;
@@ -613,7 +830,7 @@ impl WritePager {
 
     /// `BEGIN [TRANSACTION]`.
     pub fn begin(&mut self) -> SqliteResult<()> {
-        if self.in_explicit_tx {
+        if self.in_transaction() {
             return Err(SqliteError::Sql(
                 "cannot start a transaction within a transaction".to_string(),
             ));
@@ -640,10 +857,29 @@ impl WritePager {
         }
     }
 
+    /// Commit an unnamed statement-level savepoint and flush immediately if in auto-commit mode.
+    /// If auto-commit flushing to VFS fails, rolls back the statement savepoint cleanly!
+    pub fn commit_statement_and_autocommit(&mut self) -> SqliteResult<()> {
+        if !self.in_explicit_tx && self.undo_stack.len() == 1 && self.undo_stack[0].name.is_none() {
+            if let Err(e) = self.flush_to_vfs() {
+                self.rollback_statement_savepoint();
+                self.dirty_originals.clear();
+                return Err(e);
+            }
+            self.undo_stack.pop();
+            return Ok(());
+        }
+        self.commit_statement_savepoint();
+        Ok(())
+    }
+
     /// Roll back the innermost unnamed statement-level savepoint (on constraint violation).
     pub fn rollback_statement_savepoint(&mut self) {
         if let Some(frame) = self.undo_stack.pop() {
             self.apply_undo_frame(frame);
+        }
+        if !self.in_explicit_tx && self.undo_stack.is_empty() {
+            self.dirty_originals.clear();
         }
     }
 
@@ -680,6 +916,11 @@ impl WritePager {
         }) else {
             return Err(SqliteError::Sql(format!("no such savepoint: {name}")));
         };
+        if !self.in_explicit_tx && pos == 0 {
+            self.flush_to_vfs()?;
+            self.undo_stack.clear();
+            return Ok(());
+        }
         let drained: Vec<UndoFrame> = self.undo_stack.drain(pos..).collect();
         if let Some(parent) = self.undo_stack.last_mut() {
             for frame in drained {
@@ -688,28 +929,26 @@ impl WritePager {
                 }
             }
         }
-        if !self.in_explicit_tx && self.undo_stack.is_empty() {
-            self.flush_to_vfs()?;
-        }
         Ok(())
     }
 
     /// `COMMIT`: closes all open savepoints & transaction, flushes dirty pages atomically via
     /// rollback journal to the backing VFS (if any).
     pub fn commit(&mut self) -> SqliteResult<()> {
-        if !self.in_explicit_tx {
+        if !self.in_transaction() {
             return Err(SqliteError::Sql(
                 "cannot commit - no transaction is active".to_string(),
             ));
         }
+        self.flush_to_vfs()?;
         self.in_explicit_tx = false;
         self.undo_stack.clear();
-        self.flush_to_vfs()
+        Ok(())
     }
 
     /// `ROLLBACK`: reverts all uncommitted writes back to the start of the active transaction.
     pub fn rollback(&mut self) -> SqliteResult<()> {
-        if !self.in_explicit_tx && self.undo_stack.is_empty() {
+        if !self.in_transaction() {
             return Err(SqliteError::Sql(
                 "cannot rollback - no transaction is active".to_string(),
             ));
@@ -719,6 +958,12 @@ impl WritePager {
             self.apply_undo_frame(frame);
         }
         self.dirty_originals.clear();
+        // If a prior COMMIT failed mid-write leaving a hot journal on disk, best-effort heal
+        // the backing VFS now (if still failing, `disk_needs_journal_recovery` stays true so
+        // the next commit recovers BEFORE truncating `-journal`).
+        if self.disk_needs_journal_recovery {
+            let _ = self.recover_hot_journal_on_vfs();
+        }
         Ok(())
     }
 
@@ -754,20 +999,140 @@ impl WritePager {
         self.application_id = frame.application_id;
         self.change_counter = frame.change_counter;
         if !frame.initialized {
-            Arc::make_mut(&mut self.pages).clear();
+            let map = Arc::make_mut(&mut self.pages);
+            let leftover: u64 = map.values().map(|p| p.len() as u64).sum();
+            map.clear();
+            if leftover > 0 {
+                self.tracked_bytes = self.tracked_bytes.saturating_sub(leftover);
+                self.meter.release_memory(leftover);
+            }
         }
         self.invalidate_schema_cache();
+    }
+
+    /// Play back an on-disk hot rollback journal left by an earlier failed `flush_to_vfs`,
+    /// restoring torn main-DB pages and truncating to the journal's `original_page_count`
+    /// BEFORE deleting `-journal`. Must be called with EXCLUSIVE lock held on `main_file`.
+    fn playback_hot_journal_locked(
+        vfs: &Arc<dyn Vfs>,
+        main_path: &str,
+        main_file: &mut dyn xdb_core::VfsFile,
+        pager_page_size: u32,
+    ) -> SqliteResult<()> {
+        let journal_path = format!("{main_path}-journal");
+        if !vfs.exists(&journal_path)? {
+            return Ok(());
+        }
+        let mut jfile = vfs.open(&journal_path, OpenFlags::readonly(FileKind::MainJournal))?;
+        let playback_res = (|| -> SqliteResult<()> {
+            let jsize = jfile.size()?;
+            if jsize > 0 {
+                let pb = playback_journal(jfile.as_mut(), jsize, pager_page_size)?;
+                if pb.played {
+                    let ps = pb.page_size;
+                    let mut buf = vec![0u8; ps as usize];
+                    let mut pgnos: Vec<u32> = pb.records.keys().copied().collect();
+                    pgnos.sort_unstable();
+                    for pgno in pgnos {
+                        if let Some(&j_off) = pb.records.get(&pgno) {
+                            let n = jfile.read(&mut buf, j_off)?;
+                            if n < ps as usize {
+                                buf[n..].fill(0);
+                            }
+                            let off = u64::from(pgno - 1) * u64::from(ps);
+                            main_file.write(&buf, off)?;
+                        }
+                    }
+                    let orig_pages = pb.original_page_count;
+                    let target_size = u64::from(orig_pages) * u64::from(ps);
+                    if main_file.size()? != target_size {
+                        main_file.truncate(target_size)?;
+                    }
+                    main_file.sync(false)?;
+                }
+            }
+            Ok(())
+        })();
+        let _ = jfile.close();
+        playback_res?;
+        if let Err(e) = vfs.delete(&journal_path, true) {
+            if e.code != IoErrorCode::IoErrDeleteNoEnt {
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_hot_journal_on_vfs(&mut self) -> SqliteResult<()> {
+        let Some(ref backing) = self.backing else {
+            self.disk_needs_journal_recovery = false;
+            return Ok(());
+        };
+        let vfs = backing.vfs.clone();
+        let main_path = backing.path.clone();
+        let ps = self.page_size;
+        let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
+        if let Err(e) = acquire_exclusive_lock(main_file.as_mut(), &main_path) {
+            let _ = main_file.unlock(LockLevel::None);
+            let _ = main_file.close();
+            return Err(e);
+        }
+        let res = Self::playback_hot_journal_locked(&vfs, &main_path, main_file.as_mut(), ps);
+        let _ = main_file.unlock(LockLevel::None);
+        let _ = main_file.close();
+        res?;
+        self.disk_needs_journal_recovery = false;
+        Ok(())
     }
 
     /// Atomically flush dirty pages to the backing VFS using a genuine SQLite 3 rollback journal.
     pub fn flush_to_vfs(&mut self) -> SqliteResult<()> {
         if self.dirty_originals.is_empty() {
+            if self.disk_needs_journal_recovery {
+                self.recover_hot_journal_on_vfs()?;
+            }
             return Ok(());
         }
-        // Increment SQLite change counter on every commit (when page 1 exists).
+
+        // For VFS-backed databases, open & acquire EXCLUSIVE lock BEFORE bumping change_counter
+        // so a `SQLITE_BUSY` failure leaves in-memory pager state completely untouched.
+        type LockedVfsMain = (Arc<dyn Vfs>, String, Box<dyn xdb_core::VfsFile>);
+        let mut locked_vfs: Option<LockedVfsMain> = None;
+        if let Some(ref backing) = self.backing {
+            let vfs = backing.vfs.clone();
+            let main_path = backing.path.clone();
+            let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
+            if let Err(e) = acquire_exclusive_lock(main_file.as_mut(), &main_path) {
+                let _ = main_file.unlock(LockLevel::None);
+                let _ = main_file.close();
+                return Err(e);
+            }
+            // If an earlier commit failed mid-write leaving a hot journal + torn pages on disk,
+            // recover the main DB from that hot journal BEFORE truncating `-journal`!
+            if self.disk_needs_journal_recovery {
+                if let Err(e) = Self::playback_hot_journal_locked(
+                    &vfs,
+                    &main_path,
+                    main_file.as_mut(),
+                    self.page_size,
+                ) {
+                    let _ = main_file.unlock(LockLevel::None);
+                    let _ = main_file.close();
+                    return Err(e);
+                }
+                self.disk_needs_journal_recovery = false;
+            }
+            locked_vfs = Some((vfs, main_path, main_file));
+        }
+
+        // Snapshot pre-commit page 1 BEFORE mutating change_counter so the rollback journal
+        // ALWAYS records page 1's original on-disk image AND so an I/O failure restores page 1
+        // cleanly without desyncing `self.pages[1]` from `self.change_counter`!
+        let old_cc = self.change_counter;
+        let old_p1 = self.pages.get(&1).cloned();
         if self.page_count > 0 {
-            self.change_counter = self.change_counter.wrapping_add(1);
-            let cc = self.change_counter;
+            self.record_dirty_original(1);
+            let cc = self.change_counter.wrapping_add(1);
             let pc = self.page_count;
             let ft = self.freelist_trunk;
             let fc = self.freelist_count;
@@ -786,38 +1151,35 @@ impl WritePager {
                 p1[92..96].copy_from_slice(&cc.to_be_bytes());
                 p1[96..100].copy_from_slice(&SQLITE_VERSION_NUMBER.to_be_bytes());
             }
-            self.dirty_originals.entry(1).or_insert(None);
+            self.change_counter = cc;
         }
 
-        let Some(ref backing) = self.backing else {
+        let Some((vfs, main_path, mut main_file)) = locked_vfs else {
             self.dirty_originals.clear();
             self.commit_orig_page_count = self.page_count;
             return Ok(());
         };
 
-        let vfs = backing.vfs.clone();
-        let main_path = backing.path.clone();
         let journal_path = format!("{main_path}-journal");
         let ps = self.page_size;
+        let mut journal_synced = false;
 
-        // Open main DB file & acquire EXCLUSIVE lock.
-        let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
-        main_file.lock(LockLevel::Shared)?;
-        main_file.lock(LockLevel::Reserved)?;
-        main_file.lock(LockLevel::Exclusive)?;
+        let commit_res: SqliteResult<()> = (|| {
+            // Collect original pre-transaction pages that existed on disk (for rollback journal).
+            let mut journal_pages: Vec<(u32, &Vec<u8>)> = self
+                .dirty_originals
+                .iter()
+                .filter_map(|(&pgno, orig)| orig.as_ref().map(|bytes| (pgno, bytes.as_ref())))
+                .collect();
+            journal_pages.sort_by_key(|(pgno, _)| *pgno);
 
-        // Collect original pre-transaction pages that existed on disk (for rollback journal).
-        let mut journal_pages: Vec<(u32, &Vec<u8>)> = self
-            .dirty_originals
-            .iter()
-            .filter_map(|(&pgno, orig)| orig.as_ref().map(|bytes| (pgno, bytes.as_ref())))
-            .collect();
-        journal_pages.sort_by_key(|(pgno, _)| *pgno);
-
-        // Step 1: Write & sync genuine SQLite 3 rollback journal (if DB already existed on disk).
-        let wrote_journal = self.commit_orig_page_count > 0;
-        if wrote_journal {
-            self.journal_nonce = self.journal_nonce.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Step 1: Always write & sync a genuine SQLite 3 rollback journal (including
+            // `db_size = 0, n_rec = 0` on the initial commit so a crash mid-first-commit
+            // cleanly truncates the partial DB back to 0 bytes, matching C SQLite!).
+            self.journal_nonce = self
+                .journal_nonce
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
             let nonce = self.journal_nonce;
             let sector = JOURNAL_SECTOR_SIZE as usize;
 
@@ -830,45 +1192,64 @@ impl WritePager {
             jbuf[24..28].copy_from_slice(&ps.to_be_bytes());
 
             let mut jfile = vfs.open(&journal_path, OpenFlags::create(FileKind::MainJournal))?;
-            let mut joff = 0u64;
-            jfile.write(&jbuf, joff)?;
-            joff += sector as u64;
+            let jres: SqliteResult<()> = (|| {
+                // Truncate any stale prior journal contents so trailing segments can never survive.
+                jfile.truncate(0)?;
+                let mut joff = 0u64;
+                jfile.write(&jbuf, joff)?;
+                joff += sector as u64;
 
-            let mut rec = Vec::with_capacity(4 + ps as usize + 4);
-            for (pgno, orig_bytes) in &journal_pages {
-                rec.clear();
-                rec.extend_from_slice(&pgno.to_be_bytes());
-                rec.extend_from_slice(orig_bytes);
-                let cksum = journal_checksum(nonce, orig_bytes, 0, ps as usize);
-                rec.extend_from_slice(&cksum.to_be_bytes());
-                jfile.write(&rec, joff)?;
-                joff += rec.len() as u64;
+                let mut rec = Vec::with_capacity(4 + ps as usize + 4);
+                for (pgno, orig_bytes) in &journal_pages {
+                    rec.clear();
+                    rec.extend_from_slice(&pgno.to_be_bytes());
+                    rec.extend_from_slice(orig_bytes);
+                    let cksum = journal_checksum(nonce, orig_bytes, 0, ps as usize);
+                    rec.extend_from_slice(&cksum.to_be_bytes());
+                    jfile.write(&rec, joff)?;
+                    joff += rec.len() as u64;
+                }
+                jfile.sync(false)?;
+                Ok(())
+            })();
+            let close_res = jfile.close();
+            jres?;
+            close_res?;
+            journal_synced = true;
+
+            // Step 2: Write all dirty pages to main database file and sync!
+            let mut dirty_pgnos: Vec<u32> = self.dirty_originals.keys().copied().collect();
+            dirty_pgnos.sort_unstable();
+            for pgno in dirty_pgnos {
+                if let Some(bytes) = self.pages.get(&pgno) {
+                    let off = u64::from(pgno - 1) * u64::from(ps);
+                    main_file.write(bytes, off)?;
+                }
             }
-            jfile.sync(false)?;
-            jfile.close()?;
-        }
-
-        // Step 2: Write all dirty pages to main database file and sync!
-        let mut dirty_pgnos: Vec<u32> = self.dirty_originals.keys().copied().collect();
-        dirty_pgnos.sort_unstable();
-        for pgno in dirty_pgnos {
-            if let Some(bytes) = self.pages.get(&pgno) {
-                let off = u64::from(pgno - 1) * u64::from(ps);
-                main_file.write(bytes, off)?;
+            let target_size = u64::from(self.page_count) * u64::from(ps);
+            if main_file.size()? > target_size {
+                main_file.truncate(target_size)?;
             }
-        }
-        let target_size = u64::from(self.page_count) * u64::from(ps);
-        if main_file.size()? > target_size {
-            main_file.truncate(target_size)?;
-        }
-        main_file.sync(false)?;
+            main_file.sync(false)?;
 
-        // Step 3: Commit complete — delete rollback journal and unlock!
-        if wrote_journal {
+            // Step 3: Commit complete — delete rollback journal!
             vfs.delete(&journal_path, true)?;
-        }
+            Ok(())
+        })();
+
         let _ = main_file.unlock(LockLevel::None);
         let _ = main_file.close();
+        if let Err(e) = commit_res {
+            // Restore pre-commit page-1 header in memory so subsequent ROLLBACK or retry stays exact!
+            self.change_counter = old_cc;
+            if let Some(orig_p1) = old_p1 {
+                Arc::make_mut(&mut self.pages).insert(1, orig_p1);
+            }
+            if journal_synced {
+                self.disk_needs_journal_recovery = true;
+            }
+            return Err(e);
+        }
 
         self.dirty_originals.clear();
         self.commit_orig_page_count = self.page_count;
@@ -903,6 +1284,22 @@ impl WritePager {
             pages: Arc::clone(&self.pages),
         })
     }
+}
+
+/// Acquire SQLite's Shared -> Reserved -> Exclusive lock progression, returning `Busy` on contention.
+fn acquire_exclusive_lock(file: &mut dyn xdb_core::VfsFile, path: &str) -> SqliteResult<()> {
+    for level in [LockLevel::Shared, LockLevel::Reserved, LockLevel::Exclusive] {
+        if !file.lock(level)? {
+            let _ = file.unlock(LockLevel::None);
+            return Err(IoError::with_path(
+                IoErrorCode::Busy,
+                format!("database is locked: {path}"),
+                path,
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Initialize a blank B-tree page header on `buf` (`pgno = 1` starts at offset 100).

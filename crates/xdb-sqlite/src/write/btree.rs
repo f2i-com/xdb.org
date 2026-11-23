@@ -5,14 +5,15 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use xdb_core::value::mem_compare;
-use xdb_core::SqlValue;
+use xdb_core::value::{mem_compare, BuiltinCollation, Collation};
+use xdb_core::{SqlValue, TextEncoding};
 
 use crate::access::KeyInfo;
 use crate::errors::{SqliteError, SqliteResult};
 use crate::format::{
-    decode_serial_value, get_varint, local_payload_size, lock_byte_page, payload_limits,
-    read_u32_be, serial_type_length, BtreePageType, HEADER_SIZE,
+    decode_serial_value, get_payload_size_varint, get_varint, get_varint32, local_payload_size,
+    lock_byte_page, overflow_page_count, payload_limits, read_u32_be, serial_type_length,
+    BtreePageType, BTREE_MAX_DEPTH, HEADER_SIZE,
 };
 use crate::format::page::read_u16_be;
 use crate::write::pager::{init_empty_btree_page, WritePager};
@@ -33,13 +34,26 @@ pub fn drop_btree(pager: &mut WritePager, root_pgno: u32) -> SqliteResult<()> {
         return Ok(());
     }
     let usable = pager.usable_size();
+    let usable_len = usable as usize;
     let limits = payload_limits(usable);
     let mut stack = vec![root_pgno];
+    let mut seen = HashSet::new();
     let mut to_free = Vec::new();
 
     while let Some(pgno) = stack.pop() {
+        if !seen.insert(pgno) {
+            return Err(SqliteError::corrupt(format!(
+                "drop_btree: cycle or shared page {pgno}"
+            )));
+        }
         let data = pager.read_page(pgno)?.to_vec();
+        let bound = usable_len.min(data.len());
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+        if hdr + 8 > bound {
+            return Err(SqliteError::corrupt(format!(
+                "drop_btree: page {pgno} truncated"
+            )));
+        }
         let Some(ptype) = BtreePageType::from_byte(data[hdr]) else {
             return Err(SqliteError::corrupt(format!(
                 "drop_btree: invalid page type 0x{:02x} on page {pgno}",
@@ -50,6 +64,11 @@ pub fn drop_btree(pager: &mut WritePager, root_pgno: u32) -> SqliteResult<()> {
         let is_leaf = ptype.is_leaf();
         let is_table = ptype.is_table();
         let ptr_off = hdr + if is_leaf { 8 } else { 12 };
+        if ptr_off + 2 * n_cell > bound {
+            return Err(SqliteError::corrupt(format!(
+                "drop_btree: cell pointer array overflows page {pgno}"
+            )));
+        }
 
         if !is_leaf {
             let right_child = read_u32_be(&data, hdr + 8);
@@ -67,6 +86,11 @@ pub fn drop_btree(pager: &mut WritePager, root_pgno: u32) -> SqliteResult<()> {
             let pc = usize::from(read_u16_be(&data, ptr_off + 2 * i));
             let mut pos = pc;
             if !is_leaf {
+                if pos + 4 > bound {
+                    return Err(SqliteError::corrupt(format!(
+                        "drop_btree: cell {i} on page {pgno} truncated"
+                    )));
+                }
                 let left_child = read_u32_be(&data, pos);
                 if left_child != 0 {
                     stack.push(left_child);
@@ -76,17 +100,21 @@ pub fn drop_btree(pager: &mut WritePager, root_pgno: u32) -> SqliteResult<()> {
             if is_table && !is_leaf {
                 continue;
             }
-            let (psize, n1) = get_varint(&data, pos);
+            let (psize_u32, n1) = get_payload_size_varint(&data, pos);
             pos += n1;
             if is_table {
                 let (_, n2) = get_varint(&data, pos);
                 pos += n2;
             }
-            let psize_u32 = psize as u32;
             let local = local_payload_size(psize_u32, max_l, min_l, usable);
             if psize_u32 > local as u32 {
+                if pos + local + 4 > bound {
+                    return Err(SqliteError::corrupt(format!(
+                        "drop_btree: cell {i} overflow pointer out of bounds on page {pgno}"
+                    )));
+                }
                 let ovfl = read_u32_be(&data, pos + local);
-                free_overflow_chain(pager, ovfl)?;
+                free_overflow_chain_tracked(pager, ovfl, &mut seen)?;
             }
         }
         to_free.push(pgno);
@@ -122,20 +150,32 @@ fn write_overflow_chain(pager: &mut WritePager, overflow_data: &[u8]) -> SqliteR
     Ok(pgnos[0])
 }
 
-fn free_overflow_chain(pager: &mut WritePager, mut pgno: u32) -> SqliteResult<()> {
-    let mut steps = 0usize;
-    let max_steps = pager.page_count() as usize + 1;
+fn free_overflow_chain(pager: &mut WritePager, pgno: u32) -> SqliteResult<()> {
+    let mut seen = HashSet::new();
+    free_overflow_chain_tracked(pager, pgno, &mut seen)
+}
+
+fn free_overflow_chain_tracked(
+    pager: &mut WritePager,
+    mut pgno: u32,
+    seen: &mut HashSet<u32>,
+) -> SqliteResult<()> {
+    let mut to_free = Vec::new();
     while pgno != 0 {
-        steps += 1;
-        if steps > max_steps {
-            return Err(SqliteError::corrupt("overflow page cycle"));
+        if !seen.insert(pgno) {
+            return Err(SqliteError::corrupt(format!(
+                "overflow page cycle or shared overflow page {pgno}"
+            )));
         }
         let next = {
             let p = pager.read_page(pgno)?;
             read_u32_be(p, 0)
         };
-        pager.free_page(pgno)?;
+        to_free.push(pgno);
         pgno = next;
+    }
+    for p in to_free {
+        pager.free_page(p)?;
     }
     Ok(())
 }
@@ -149,12 +189,22 @@ fn read_full_payload(
     if total_size <= local.len() {
         return Ok(local[..total_size].to_vec());
     }
+    let chunk_cap = (pager.usable_size() as usize).saturating_sub(4);
+    let max_record = (pager.page_size() as u64).saturating_mul(pager.page_count() as u64);
+    if total_size as u64 > max_record {
+        return Err(SqliteError::corrupt("payload size exceeds database size"));
+    }
     let mut out = Vec::with_capacity(total_size);
     out.extend_from_slice(local);
-    let chunk_cap = (pager.usable_size() as usize) - 4;
+    let max_steps = pager.page_count() as usize + 1;
+    let mut steps = 0usize;
     while out.len() < total_size {
         if ovfl_pgno == 0 {
             return Err(SqliteError::corrupt("truncated overflow chain"));
+        }
+        steps += 1;
+        if steps > max_steps {
+            return Err(SqliteError::corrupt("overflow page cycle"));
         }
         let page = pager.read_page(ovfl_pgno)?;
         let next = read_u32_be(page, 0);
@@ -253,6 +303,9 @@ fn parse_table_leaf_cells(
     usable: u32,
 ) -> SqliteResult<Vec<TableLeafCell>> {
     let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+    if hdr + 8 > data.len() {
+        return Err(SqliteError::corrupt(format!("page {pgno}: truncated header")));
+    }
     if data[hdr] != BtreePageType::TableLeaf as u8 {
         return Err(SqliteError::corrupt(format!(
             "expected TableLeaf on page {pgno}, got 0x{:02x}",
@@ -262,14 +315,24 @@ fn parse_table_leaf_cells(
     let limits = payload_limits(usable);
     let n_cell = usize::from(read_u16_be(data, hdr + 3));
     let ptr_off = hdr + 8;
+    if ptr_off + 2 * n_cell > data.len() {
+        return Err(SqliteError::corrupt(format!(
+            "page {pgno}: cell pointer array runs past page end"
+        )));
+    }
     let mut out = Vec::with_capacity(n_cell);
     for i in 0..n_cell {
         let pc = usize::from(read_u16_be(data, ptr_off + 2 * i));
-        let (psize, n1) = get_varint(data, pc);
+        let (psize_u32, n1) = get_payload_size_varint(data, pc);
         let (rowid_u64, n2) = get_varint(data, pc + n1);
-        let local = local_payload_size(psize as u32, limits.max_leaf, limits.min_leaf, usable);
-        let has_ovfl = (psize as u32) > (local as u32);
+        let local = local_payload_size(psize_u32, limits.max_leaf, limits.min_leaf, usable);
+        let has_ovfl = psize_u32 > (local as u32);
         let cell_end = pc + n1 + n2 + local + if has_ovfl { 4 } else { 0 };
+        if cell_end > (usable as usize).min(data.len()) {
+            return Err(SqliteError::corrupt(format!(
+                "page {pgno}: table leaf cell {i} runs past usable page end"
+            )));
+        }
         let overflow_pgno = if has_ovfl {
             read_u32_be(data, pc + n1 + n2 + local)
         } else {
@@ -289,6 +352,9 @@ fn parse_table_interior_cells(
     pgno: u32,
 ) -> SqliteResult<(Vec<TableInteriorCell>, u32)> {
     let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+    if hdr + 12 > data.len() {
+        return Err(SqliteError::corrupt(format!("page {pgno}: truncated interior header")));
+    }
     if data[hdr] != BtreePageType::TableInterior as u8 {
         return Err(SqliteError::corrupt(format!(
             "expected TableInterior on page {pgno}, got 0x{:02x}",
@@ -298,11 +364,26 @@ fn parse_table_interior_cells(
     let n_cell = usize::from(read_u16_be(data, hdr + 3));
     let right_child = read_u32_be(data, hdr + 8);
     let ptr_off = hdr + 12;
+    if ptr_off + 2 * n_cell > data.len() {
+        return Err(SqliteError::corrupt(format!(
+            "page {pgno}: interior cell pointer array runs past page end"
+        )));
+    }
     let mut out = Vec::with_capacity(n_cell);
     for i in 0..n_cell {
         let pc = usize::from(read_u16_be(data, ptr_off + 2 * i));
+        if pc + 4 > data.len() {
+            return Err(SqliteError::corrupt(format!(
+                "page {pgno}: table interior cell {i} runs past page end"
+            )));
+        }
         let left_child = read_u32_be(data, pc);
-        let (key_u64, _) = get_varint(data, pc + 4);
+        let (key_u64, klen) = get_varint(data, pc + 4);
+        if pc + 4 + klen > data.len() {
+            return Err(SqliteError::corrupt(format!(
+                "page {pgno}: table interior cell {i} key runs past page end"
+            )));
+        }
         out.push(TableInteriorCell {
             left_child,
             key: key_u64,
@@ -316,6 +397,9 @@ fn build_table_leaf_cell(
     rowid: i64,
     payload: &[u8],
 ) -> SqliteResult<TableLeafCell> {
+    if payload.len() > i32::MAX as usize {
+        return Err(SqliteError::Sql("string or blob too big".to_string()));
+    }
     let usable = pager.usable_size();
     let limits = payload_limits(usable);
     let psize = payload.len() as u32;
@@ -343,17 +427,30 @@ fn build_table_leaf_cell(
 pub fn table_max_rowid(pager: &WritePager, root_pgno: u32) -> SqliteResult<Option<i64>> {
     let usable = pager.usable_size();
     let mut pgno = root_pgno;
+    let mut depth = 0usize;
     loop {
+        if depth >= BTREE_MAX_DEPTH {
+            return Err(SqliteError::corrupt(format!(
+                "table_max_rowid: b-tree {root_pgno} exceeds max depth"
+            )));
+        }
         let data = pager.read_page(pgno)?;
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+        if hdr + 8 > data.len() {
+            return Err(SqliteError::corrupt(format!("page {pgno}: truncated header")));
+        }
         match BtreePageType::from_byte(data[hdr]) {
             Some(BtreePageType::TableLeaf) => {
                 let cells = parse_table_leaf_cells(data, pgno, usable)?;
                 return Ok(cells.last().map(|c| c.rowid));
             }
             Some(BtreePageType::TableInterior) => {
+                if hdr + 12 > data.len() {
+                    return Err(SqliteError::corrupt(format!("page {pgno}: truncated interior header")));
+                }
                 let right_child = read_u32_be(data, hdr + 8);
                 pgno = right_child;
+                depth += 1;
             }
             _ => {
                 return Err(SqliteError::corrupt(format!(
@@ -374,8 +471,16 @@ fn table_descend(
     let mut pgno = root_pgno;
     let mut path = Vec::new();
     loop {
+        if path.len() >= BTREE_MAX_DEPTH {
+            return Err(SqliteError::corrupt(format!(
+                "table_descend: b-tree {root_pgno} exceeds max depth"
+            )));
+        }
         let data = pager.read_page(pgno)?;
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+        if hdr + 8 > data.len() {
+            return Err(SqliteError::corrupt(format!("page {pgno}: truncated header")));
+        }
         match BtreePageType::from_byte(data[hdr]) {
             Some(BtreePageType::TableLeaf) => return Ok((pgno, path)),
             Some(BtreePageType::TableInterior) => {
@@ -455,48 +560,73 @@ pub fn table_insert(
         return Ok(replaced);
     }
 
-    // Leaf overflowed: split at ~half byte size!
-    let split = choose_split_point(&raw_cells);
-    let left_raw = &raw_cells[..split];
-    let right_raw = &raw_cells[split..];
-    let divider_key = cells[split - 1].rowid;
+    // Leaf overflowed: partition into 1..=k guaranteed-fitting non-root leaf chunks!
+    // Special case: single cell on page 1 that exceeds `usable - 108` but fits on a normal page
+    // (`usable - 8`) — SQLite's `balance_deeper` turns page 1 into a 0-cell TableInterior!
+    if raw_cells.len() == 1 {
+        if !path.is_empty() || leaf_pgno != 1 || !cells_fit(2, true, usable as usize, &raw_cells) {
+            return Err(SqliteError::corrupt(format!(
+                "single table leaf cell ({} bytes) cannot fit on usable size {usable}",
+                raw_cells[0].len()
+            )));
+        }
+        let child_pg = pager.allocate_page()?;
+        pack_btree_page(pager, child_pg, BtreePageType::TableLeaf, 0, &raw_cells)?;
+        pack_btree_page(pager, root_pgno, BtreePageType::TableInterior, child_pg, &[])?;
+        return Ok(replaced);
+    }
+
+    let chunks = partition_table_leaf_cells(&raw_cells, usable as usize)?;
+    debug_assert!(chunks.len() >= 2);
 
     if path.is_empty() {
-        // Splitting the root leaf: allocate 2 new child leaves and turn root into TableInterior.
-        let left_pg = pager.allocate_page()?;
-        let right_pg = pager.allocate_page()?;
-        pack_btree_page(pager, left_pg, BtreePageType::TableLeaf, 0, left_raw)?;
-        pack_btree_page(pager, right_pg, BtreePageType::TableLeaf, 0, right_raw)?;
-        let divider = TableInteriorCell {
-            left_child: left_pg,
-            key: divider_key,
-        };
+        // Splitting the root leaf into `k >= 2` child leaves and turning root into TableInterior.
+        let mut child_pgs = Vec::with_capacity(chunks.len());
+        for &(start, end) in &chunks {
+            let pg = pager.allocate_page()?;
+            pack_btree_page(pager, pg, BtreePageType::TableLeaf, 0, &raw_cells[start..end])?;
+            child_pgs.push(pg);
+        }
+        let mut dividers = Vec::with_capacity(chunks.len() - 1);
+        for j in 0..chunks.len() - 1 {
+            let div = TableInteriorCell {
+                left_child: child_pgs[j],
+                key: cells[chunks[j].1 - 1].rowid,
+            };
+            dividers.push(div.encode());
+        }
+        let right_pg = *child_pgs.last().expect("chunks >= 2");
         pack_btree_page(
             pager,
             root_pgno,
             BtreePageType::TableInterior,
             right_pg,
-            &[divider.encode()],
+            &dividers,
         )?;
         return Ok(replaced);
     }
 
-    // Non-root leaf split: keep left half on `leaf_pgno`, put right half on `right_pg`.
-    let right_pg = pager.allocate_page()?;
-    pack_btree_page(pager, leaf_pgno, BtreePageType::TableLeaf, 0, left_raw)?;
-    pack_btree_page(pager, right_pg, BtreePageType::TableLeaf, 0, right_raw)?;
+    // Non-root leaf split: keep chunk 0 on `leaf_pgno`, allocate fresh pages for chunks `1..`.
+    let (s0, e0) = chunks[0];
+    pack_btree_page(pager, leaf_pgno, BtreePageType::TableLeaf, 0, &raw_cells[s0..e0])?;
+    let mut new_siblings: Vec<(i64, u32)> = Vec::with_capacity(chunks.len() - 1);
+    for (j, &(start, end)) in chunks.iter().enumerate().skip(1) {
+        let sib_pg = pager.allocate_page()?;
+        pack_btree_page(pager, sib_pg, BtreePageType::TableLeaf, 0, &raw_cells[start..end])?;
+        let divider_key = cells[chunks[j - 1].1 - 1].rowid;
+        new_siblings.push((divider_key, sib_pg));
+    }
 
-    table_insert_into_parent(pager, root_pgno, &path, leaf_pgno, divider_key, right_pg)?;
+    table_insert_siblings_into_parent(pager, root_pgno, &path, leaf_pgno, &new_siblings)?;
     Ok(replaced)
 }
 
-fn table_insert_into_parent(
+fn table_insert_siblings_into_parent(
     pager: &mut WritePager,
     root_pgno: u32,
     path: &[(u32, usize)],
     left_pg: u32,
-    divider_key: i64,
-    right_pg: u32,
+    siblings: &[(i64, u32)],
 ) -> SqliteResult<()> {
     let (parent_pg, child_slot) = *path.last().expect("path non-empty");
     let usable = pager.usable_size() as usize;
@@ -505,23 +635,29 @@ fn table_insert_into_parent(
         parse_table_interior_cells(data, parent_pg)?
     };
 
-    // Previously child at `child_slot` was `left_pg`. Now `left_pg` has keys <= `divider_key`
-    // and `right_pg` has keys > `divider_key` (taking over the old slot!).
-    if child_slot < cells.len() {
-        cells[child_slot].left_child = right_pg;
-        cells.insert(
-            child_slot,
-            TableInteriorCell {
-                left_child: left_pg,
-                key: divider_key,
-            },
-        );
-    } else {
-        cells.push(TableInteriorCell {
-            left_child: left_pg,
-            key: divider_key,
-        });
-        right_child = right_pg;
+    // Previously child at `child_slot` was `left_pg`. Now `left_pg` holds chunk 0 and each
+    // `(divider_key, sib_pg)` in `siblings` splits off the next chunk to the right.
+    let mut cur_left = left_pg;
+    let mut insert_at = child_slot;
+    for &(div_key, sib_pg) in siblings {
+        if insert_at < cells.len() {
+            cells[insert_at].left_child = sib_pg;
+            cells.insert(
+                insert_at,
+                TableInteriorCell {
+                    left_child: cur_left,
+                    key: div_key,
+                },
+            );
+        } else {
+            cells.push(TableInteriorCell {
+                left_child: cur_left,
+                key: div_key,
+            });
+            right_child = sib_pg;
+        }
+        cur_left = sib_pg;
+        insert_at += 1;
     }
 
     let raw_cells: Vec<Vec<u8>> = cells.iter().map(TableInteriorCell::encode).collect();
@@ -593,13 +729,12 @@ fn table_insert_into_parent(
         right_child,
         right_raw,
     )?;
-    table_insert_into_parent(
+    table_insert_siblings_into_parent(
         pager,
         root_pgno,
         &path[..path.len() - 1],
         parent_pg,
-        promoted_key,
-        new_right,
+        &[(promoted_key, new_right)],
     )
 }
 
@@ -673,21 +808,15 @@ fn table_remove_empty_child(
             // For page 1 overflow edge case, keep valid interior by splitting child!
             return split_child_into_page1_table(pager, root_pgno, right_child);
         }
-        // Non-root parent has 0 cells: replace parent's pointer in grandparent with `right_child` and free `parent_pg`!
-        let (gp_pg, gp_slot) = path[path.len() - 2];
-        let (mut gp_cells, mut gp_rc) = {
-            let data = pager.read_page(gp_pg)?;
-            parse_table_interior_cells(data, gp_pg)?
-        };
-        if gp_slot < gp_cells.len() {
-            gp_cells[gp_slot].left_child = right_child;
-        } else {
-            gp_rc = right_child;
-        }
-        let raw: Vec<Vec<u8>> = gp_cells.iter().map(TableInteriorCell::encode).collect();
-        pack_btree_page(pager, gp_pg, BtreePageType::TableInterior, gp_rc, &raw)?;
-        pager.free_page(parent_pg)?;
-        return Ok(());
+        // Non-root parent has 0 cells and 1 remaining child (`right_child`):
+        // rebalance with an adjacent sibling interior page so ALL leaves stay at uniform depth!
+        return table_rebalance_zero_cell_interior(
+            pager,
+            root_pgno,
+            parent_pg,
+            right_child,
+            &path[..path.len() - 1],
+        );
     }
 
     let raw: Vec<Vec<u8>> = cells.iter().map(TableInteriorCell::encode).collect();
@@ -697,6 +826,209 @@ fn table_remove_empty_child(
         BtreePageType::TableInterior,
         right_child,
         &raw,
+    )
+}
+
+/// Rebalance a non-root `TableInterior` page `empty_pg` that dropped to 0 cells (with single
+/// remaining child `sole_child`) by merging into or borrowing from an adjacent sibling interior
+/// page under its parent (`gp_path`), preserving uniform leaf depth across the entire B-tree.
+fn table_rebalance_zero_cell_interior(
+    pager: &mut WritePager,
+    root_pgno: u32,
+    empty_pg: u32,
+    sole_child: u32,
+    gp_path: &[(u32, usize)],
+) -> SqliteResult<()> {
+    let usable = pager.usable_size() as usize;
+    if gp_path.is_empty() {
+        // `empty_pg` IS `root_pgno` (collapsed all the way up to root).
+        if try_collapse_child_into_root(pager, root_pgno, sole_child)? {
+            return Ok(());
+        }
+        return split_child_into_page1_table(pager, root_pgno, sole_child);
+    }
+
+    let (gp_pg, gp_slot) = *gp_path.last().unwrap();
+    let (mut gp_cells, mut gp_rc) = {
+        let data = pager.read_page(gp_pg)?;
+        parse_table_interior_cells(data, gp_pg)?
+    };
+    if gp_cells.is_empty() {
+        // Grandparent also had 0 cells (only `empty_pg` as `gp_rc`) -> shrinking height uniformly!
+        pager.free_page(empty_pg)?;
+        return table_rebalance_zero_cell_interior(
+            pager,
+            root_pgno,
+            gp_pg,
+            sole_child,
+            &gp_path[..gp_path.len() - 1],
+        );
+    }
+
+    if gp_slot < gp_cells.len() {
+        // Merge/redistribute with RIGHT sibling of `empty_pg`.
+        let sep_key = gp_cells[gp_slot].key;
+        let sib_pg = if gp_slot + 1 < gp_cells.len() {
+            gp_cells[gp_slot + 1].left_child
+        } else {
+            gp_rc
+        };
+        let (sib_cells, sib_rc) = {
+            let data = pager.read_page(sib_pg)?;
+            parse_table_interior_cells(data, sib_pg)?
+        };
+        let mut merged = Vec::with_capacity(1 + sib_cells.len());
+        merged.push(TableInteriorCell {
+            left_child: sole_child,
+            key: sep_key,
+        });
+        merged.extend(sib_cells);
+        let merged_raw: Vec<Vec<u8>> = merged.iter().map(TableInteriorCell::encode).collect();
+
+        if cells_fit(sib_pg, false, usable, &merged_raw) {
+            pack_btree_page(pager, sib_pg, BtreePageType::TableInterior, sib_rc, &merged_raw)?;
+            pager.free_page(empty_pg)?;
+            gp_cells.remove(gp_slot);
+            if gp_cells.is_empty() {
+                return table_rebalance_zero_cell_interior(
+                    pager,
+                    root_pgno,
+                    gp_pg,
+                    sib_pg,
+                    &gp_path[..gp_path.len() - 1],
+                );
+            }
+            let gp_raw: Vec<Vec<u8>> = gp_cells.iter().map(TableInteriorCell::encode).collect();
+            return pack_btree_page(pager, gp_pg, BtreePageType::TableInterior, gp_rc, &gp_raw);
+        }
+
+        // Redistribute between `empty_pg` (left) and `sib_pg` (right).
+        let mid = merged.len() / 2;
+        let left_rc = merged[mid].left_child;
+        let promoted_key = merged[mid].key;
+        pack_btree_page(
+            pager,
+            empty_pg,
+            BtreePageType::TableInterior,
+            left_rc,
+            &merged_raw[..mid],
+        )?;
+        pack_btree_page(
+            pager,
+            sib_pg,
+            BtreePageType::TableInterior,
+            sib_rc,
+            &merged_raw[mid + 1..],
+        )?;
+        gp_cells[gp_slot].key = promoted_key;
+        table_pack_or_split_interior(pager, root_pgno, gp_pg, &gp_path[..gp_path.len() - 1], gp_cells, gp_rc)
+    } else {
+        // `empty_pg` is `gp_rc`: merge/redistribute with LEFT sibling (`gp_cells.last()`).
+        let sep_key = gp_cells.last().unwrap().key;
+        let sib_pg = gp_cells.last().unwrap().left_child;
+        let (sib_cells, sib_rc) = {
+            let data = pager.read_page(sib_pg)?;
+            parse_table_interior_cells(data, sib_pg)?
+        };
+        let mut merged = Vec::with_capacity(sib_cells.len() + 1);
+        merged.extend(sib_cells);
+        merged.push(TableInteriorCell {
+            left_child: sib_rc,
+            key: sep_key,
+        });
+        let merged_raw: Vec<Vec<u8>> = merged.iter().map(TableInteriorCell::encode).collect();
+
+        if cells_fit(sib_pg, false, usable, &merged_raw) {
+            pack_btree_page(
+                pager,
+                sib_pg,
+                BtreePageType::TableInterior,
+                sole_child,
+                &merged_raw,
+            )?;
+            pager.free_page(empty_pg)?;
+            gp_cells.pop();
+            gp_rc = sib_pg;
+            if gp_cells.is_empty() {
+                return table_rebalance_zero_cell_interior(
+                    pager,
+                    root_pgno,
+                    gp_pg,
+                    sib_pg,
+                    &gp_path[..gp_path.len() - 1],
+                );
+            }
+            let gp_raw: Vec<Vec<u8>> = gp_cells.iter().map(TableInteriorCell::encode).collect();
+            return pack_btree_page(pager, gp_pg, BtreePageType::TableInterior, gp_rc, &gp_raw);
+        }
+
+        // Redistribute between `sib_pg` (left) and `empty_pg` (right).
+        let mid = merged.len() / 2;
+        let left_rc = merged[mid].left_child;
+        let promoted_key = merged[mid].key;
+        pack_btree_page(
+            pager,
+            sib_pg,
+            BtreePageType::TableInterior,
+            left_rc,
+            &merged_raw[..mid],
+        )?;
+        pack_btree_page(
+            pager,
+            empty_pg,
+            BtreePageType::TableInterior,
+            sole_child,
+            &merged_raw[mid + 1..],
+        )?;
+        gp_cells.last_mut().unwrap().key = promoted_key;
+        table_pack_or_split_interior(pager, root_pgno, gp_pg, &gp_path[..gp_path.len() - 1], gp_cells, gp_rc)
+    }
+}
+
+fn table_pack_or_split_interior(
+    pager: &mut WritePager,
+    root_pgno: u32,
+    pgno: u32,
+    parent_path: &[(u32, usize)],
+    cells: Vec<TableInteriorCell>,
+    right_child: u32,
+) -> SqliteResult<()> {
+    let usable = pager.usable_size() as usize;
+    let raw_cells: Vec<Vec<u8>> = cells.iter().map(TableInteriorCell::encode).collect();
+    if cells_fit(pgno, false, usable, &raw_cells) {
+        return pack_btree_page(pager, pgno, BtreePageType::TableInterior, right_child, &raw_cells);
+    }
+    let mid = cells.len() / 2;
+    let promoted_key = cells[mid].key;
+    let left_rc = cells[mid].left_child;
+    let left_raw = &raw_cells[..mid];
+    let right_raw = &raw_cells[mid + 1..];
+    if parent_path.is_empty() {
+        let new_left = pager.allocate_page()?;
+        let new_right = pager.allocate_page()?;
+        pack_btree_page(pager, new_left, BtreePageType::TableInterior, left_rc, left_raw)?;
+        pack_btree_page(pager, new_right, BtreePageType::TableInterior, right_child, right_raw)?;
+        let root_cell = TableInteriorCell {
+            left_child: new_left,
+            key: promoted_key,
+        };
+        return pack_btree_page(
+            pager,
+            root_pgno,
+            BtreePageType::TableInterior,
+            new_right,
+            &[root_cell.encode()],
+        );
+    }
+    let new_right = pager.allocate_page()?;
+    pack_btree_page(pager, pgno, BtreePageType::TableInterior, left_rc, left_raw)?;
+    pack_btree_page(pager, new_right, BtreePageType::TableInterior, right_child, right_raw)?;
+    table_insert_siblings_into_parent(
+        pager,
+        root_pgno,
+        parent_path,
+        pgno,
+        &[(promoted_key, new_right)],
     )
 }
 
@@ -712,29 +1044,45 @@ fn split_child_into_page1_table(
     match ptype {
         BtreePageType::TableLeaf => {
             let cells = parse_table_leaf_cells(&data, child_pg, usable)?;
+            let raw: Vec<Vec<u8>> = cells.iter().map(|c| c.raw.clone()).collect();
             if cells.len() <= 1 {
-                // Single cell always fits on page 1 since max_leaf already accounts for page size.
-                let raw: Vec<Vec<u8>> = cells.iter().map(|c| c.raw.clone()).collect();
-                pack_btree_page(pager, root_pgno, BtreePageType::TableLeaf, 0, &raw)?;
-                pager.free_page(child_pg)?;
+                if cells_fit(root_pgno, true, usable as usize, &raw) {
+                    pack_btree_page(pager, root_pgno, BtreePageType::TableLeaf, 0, &raw)?;
+                    pager.free_page(child_pg)?;
+                } else {
+                    // Single large cell cannot fit after page 1's 100-byte DB header;
+                    // keep valid 0-cell TableInterior on page 1 pointing to `child_pg`.
+                    pack_btree_page(pager, root_pgno, BtreePageType::TableInterior, child_pg, &[])?;
+                }
                 return Ok(());
             }
-            let raw: Vec<Vec<u8>> = cells.iter().map(|c| c.raw.clone()).collect();
-            let split = choose_split_point(&raw);
-            let right_pg = pager.allocate_page()?;
-            pack_btree_page(pager, child_pg, BtreePageType::TableLeaf, 0, &raw[..split])?;
-            pack_btree_page(pager, right_pg, BtreePageType::TableLeaf, 0, &raw[split..])?;
-            let div = TableInteriorCell {
-                left_child: child_pg,
-                key: cells[split - 1].rowid,
-            };
+            let chunks = partition_table_leaf_cells(&raw, usable as usize)?;
+            let mut pgs = Vec::with_capacity(chunks.len());
+            pgs.push(child_pg);
             pack_btree_page(
                 pager,
-                root_pgno,
-                BtreePageType::TableInterior,
-                right_pg,
-                &[div.encode()],
-            )
+                child_pg,
+                BtreePageType::TableLeaf,
+                0,
+                &raw[chunks[0].0..chunks[0].1],
+            )?;
+            for &(start, end) in &chunks[1..] {
+                let npg = pager.allocate_page()?;
+                pack_btree_page(pager, npg, BtreePageType::TableLeaf, 0, &raw[start..end])?;
+                pgs.push(npg);
+            }
+            let mut divs = Vec::with_capacity(chunks.len() - 1);
+            for j in 0..chunks.len() - 1 {
+                divs.push(
+                    TableInteriorCell {
+                        left_child: pgs[j],
+                        key: cells[chunks[j].1 - 1].rowid,
+                    }
+                    .encode(),
+                );
+            }
+            let right_pg = *pgs.last().expect("chunks >= 2");
+            pack_btree_page(pager, root_pgno, BtreePageType::TableInterior, right_pg, &divs)
         }
         BtreePageType::TableInterior => {
             let (cells, rc) = parse_table_interior_cells(&data, child_pg)?;
@@ -862,6 +1210,9 @@ impl IndexCell {
 
 fn parse_index_cells(data: &[u8], pgno: u32, usable: u32) -> SqliteResult<(Vec<IndexCell>, u32)> {
     let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+    if hdr + 8 > data.len() {
+        return Err(SqliteError::corrupt(format!("page {pgno}: truncated index header")));
+    }
     let ptype = BtreePageType::from_byte(data[hdr])
         .ok_or_else(|| SqliteError::corrupt(format!("invalid index page type on page {pgno}")))?;
     let is_leaf = match ptype {
@@ -876,12 +1227,17 @@ fn parse_index_cells(data: &[u8], pgno: u32, usable: u32) -> SqliteResult<(Vec<I
     };
     let limits = payload_limits(usable);
     let n_cell = usize::from(read_u16_be(data, hdr + 3));
+    let ptr_off = hdr + if is_leaf { 8 } else { 12 };
+    if ptr_off + 2 * n_cell > data.len() {
+        return Err(SqliteError::corrupt(format!(
+            "page {pgno}: index cell pointer array runs past page end"
+        )));
+    }
     let right_child = if is_leaf {
         0
     } else {
         read_u32_be(data, hdr + 8)
     };
-    let ptr_off = hdr + if is_leaf { 8 } else { 12 };
     let mut out = Vec::with_capacity(n_cell);
 
     for i in 0..n_cell {
@@ -890,25 +1246,34 @@ fn parse_index_cells(data: &[u8], pgno: u32, usable: u32) -> SqliteResult<(Vec<I
         let left_child = if is_leaf {
             0
         } else {
+            if pos + 4 > data.len() {
+                return Err(SqliteError::corrupt(format!(
+                    "page {pgno}: index interior cell {i} runs past page end"
+                )));
+            }
             let lc = read_u32_be(data, pos);
             pos += 4;
             lc
         };
-        let (psize, n1) = get_varint(data, pos);
+        let (psize_u32, n1) = get_payload_size_varint(data, pos);
         pos += n1;
-        let psize_u32 = psize as u32;
         let local = local_payload_size(psize_u32, limits.max_local, limits.min_local, usable);
         let has_ovfl = psize_u32 > local as u32;
+        let cell_end = pos + local + if has_ovfl { 4 } else { 0 };
+        if cell_end > (usable as usize).min(data.len()) {
+            return Err(SqliteError::corrupt(format!(
+                "page {pgno}: index cell {i} runs past usable page end"
+            )));
+        }
         let ovfl = if has_ovfl {
             read_u32_be(data, pos + local)
         } else {
             0
         };
-        let cell_end = pos + local + if has_ovfl { 4 } else { 0 };
         out.push(IndexCell {
             left_child,
             raw: data[pc..cell_end].to_vec(),
-            payload_size: psize as usize,
+            payload_size: psize_u32 as usize,
             local_offset: pos - pc,
             local_size: local,
             overflow_pgno: ovfl,
@@ -918,6 +1283,9 @@ fn parse_index_cells(data: &[u8], pgno: u32, usable: u32) -> SqliteResult<(Vec<I
 }
 
 fn build_index_cell_body(pager: &mut WritePager, payload: &[u8]) -> SqliteResult<Vec<u8>> {
+    if payload.len() > i32::MAX as usize {
+        return Err(SqliteError::Sql("string or blob too big".to_string()));
+    }
     let usable = pager.usable_size();
     let limits = payload_limits(usable);
     let psize = payload.len() as u32;
@@ -941,39 +1309,60 @@ pub fn decode_record_fields(payload: &[u8], key_info: &KeyInfo) -> SqliteResult<
     if payload.is_empty() {
         return Ok(Vec::new());
     }
-    let (hdr_len, mut hpos) = get_varint(payload, 0);
+    let (hdr_len, mut hpos) = get_varint32(payload, 0);
     let hdr_end = hdr_len as usize;
-    if hdr_end > payload.len() {
+    if hdr_end == 0 {
+        return Ok(Vec::new());
+    }
+    if hdr_end < hpos || hdr_end > payload.len() {
         return Err(SqliteError::corrupt("index record header exceeds payload"));
     }
     let mut serials = Vec::new();
     while hpos < hdr_end {
-        let (st, n) = get_varint(payload, hpos);
-        serials.push(st as u32);
+        let (st, n) = get_varint32(payload, hpos);
+        serials.push(st);
         hpos += n;
+    }
+    if hpos != hdr_end {
+        return Err(SqliteError::corrupt("index record header varint overrun"));
     }
     let mut boff = hdr_end;
     let mut vals = Vec::with_capacity(serials.len());
     for st in serials {
         let blen = serial_type_length(st);
-        if boff + blen > payload.len() {
+        let Some(end) = boff.checked_add(blen) else {
+            return Err(SqliteError::corrupt("index record body length overflow"));
+        };
+        if end > payload.len() {
             return Err(SqliteError::corrupt("index record body truncated"));
         }
         vals.push(decode_serial_value(
-            &payload[boff..boff + blen],
+            &payload[boff..end],
             st,
             key_info.encoding,
         ));
-        boff += blen;
+        boff = end;
     }
     Ok(vals)
 }
 
-/// Compare two decoded index records using SQLite `KeyInfo` (collations & ASC/DESC).
+/// Compare two decoded index records using SQLite `KeyInfo` (collations & ASC/DESC),
+/// honoring UTF-16 `BINARY` code-unit ordering on UTF-16 databases.
 pub fn compare_index_values(a: &[SqlValue], b: &[SqlValue], key_info: &KeyInfo) -> Ordering {
-    let n = a.len().min(b.len()).min(key_info.n_all_field);
+    let a_len = a.len().min(key_info.n_all_field);
+    let b_len = b.len().min(key_info.n_all_field);
+    let n = a_len.min(b_len);
+    let utf16_bin = if key_info.encoding != TextEncoding::Utf8 {
+        Some(Collation::builtin(BuiltinCollation::Binary, key_info.encoding))
+    } else {
+        None
+    };
     for i in 0..n {
-        let coll = key_info.collations.get(i).and_then(|c| c.as_ref());
+        let coll = key_info
+            .collations
+            .get(i)
+            .and_then(|c| c.as_ref())
+            .or(utf16_bin.as_ref());
         let mut ord = mem_compare(&a[i], &b[i], coll);
         if ord != Ordering::Equal {
             if key_info.desc.get(i).copied().unwrap_or(false) {
@@ -982,7 +1371,7 @@ pub fn compare_index_values(a: &[SqlValue], b: &[SqlValue], key_info: &KeyInfo) 
             return ord;
         }
     }
-    a.len().cmp(&b.len())
+    a_len.cmp(&b_len)
 }
 
 fn compare_key_to_cell(
@@ -1012,6 +1401,11 @@ fn index_find(
     let mut path = Vec::new();
 
     loop {
+        if path.len() >= BTREE_MAX_DEPTH {
+            return Err(SqliteError::corrupt(format!(
+                "index_find: b-tree {root_pgno} exceeds max depth"
+            )));
+        }
         let data = pager.read_page(pgno)?;
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
         let is_leaf = match BtreePageType::from_byte(data[hdr]) {
@@ -1060,7 +1454,14 @@ pub fn index_contains_prefix(
 ) -> SqliteResult<Option<Vec<SqlValue>>> {
     let usable = pager.usable_size();
     let mut pgno = root_pgno;
+    let mut depth = 0usize;
     loop {
+        if depth >= BTREE_MAX_DEPTH {
+            return Err(SqliteError::corrupt(format!(
+                "index_contains_prefix: b-tree {root_pgno} exceeds max depth"
+            )));
+        }
+        depth += 1;
         let data = pager.read_page(pgno)?;
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
         let is_leaf = match BtreePageType::from_byte(data[hdr]) {
@@ -1099,8 +1500,17 @@ pub fn index_contains_prefix(
 
 fn compare_prefix(prefix: &[SqlValue], full: &[SqlValue], key_info: &KeyInfo) -> Ordering {
     let n = prefix.len().min(full.len());
+    let utf16_bin = if key_info.encoding != TextEncoding::Utf8 {
+        Some(Collation::builtin(BuiltinCollation::Binary, key_info.encoding))
+    } else {
+        None
+    };
     for i in 0..n {
-        let coll = key_info.collations.get(i).and_then(|c| c.as_ref());
+        let coll = key_info
+            .collations
+            .get(i)
+            .and_then(|c| c.as_ref())
+            .or(utf16_bin.as_ref());
         let mut ord = mem_compare(&prefix[i], &full[i], coll);
         if ord != Ordering::Equal {
             if key_info.desc.get(i).copied().unwrap_or(false) {
@@ -1399,11 +1809,6 @@ pub fn index_delete(
         cur_pg = prc;
     }
 
-    // Free the deleted interior cell's overflow chain.
-    if old_ovfl != 0 {
-        free_overflow_chain(pager, old_ovfl)?;
-    }
-
     // Install predecessor into `hit_pgno` at `hit_idx`, preserving `left_child`.
     let pred_leaf_became_empty = {
         let ldata = pager.read_page(cur_pg)?;
@@ -1419,6 +1824,9 @@ pub fn index_delete(
     raw_cells[hit_idx] = replacement;
 
     if cells_fit(hit_pgno, false, usable as usize, &raw_cells) {
+        if old_ovfl != 0 {
+            free_overflow_chain(pager, old_ovfl)?;
+        }
         pack_btree_page(
             pager,
             hit_pgno,
@@ -1430,69 +1838,103 @@ pub fn index_delete(
             pager.free_page(cur_pg)?;
             index_remove_empty_child(pager, root_pgno, &pred_path)?;
         }
-    } else {
-        // Rare case: predecessor cell is slightly wider than deleted cell and overflows interior page.
-        // Detach empty leaf first (if needed) while path is valid, then split interior page!
-        if pred_leaf_became_empty {
-            // Re-pack `hit_pgno` temporarily? Better: split `hit_pgno` first, then re-find & remove if empty.
-            // Actually, if `cur_pg` only had 1 cell (the predecessor), free it cleanly by replacing
-            // the cell in `hit_pgno` ONLY after detaching `cur_pg`! Wait: detaching `cur_pg` might
-            // change `hit_pgno` if `cur_pg == left_sub_root`!
-            if cur_pg == left_sub_root {
-                // `left_sub_root` was a 1-cell leaf right under `hit_idx`:
-                // removing `hit_idx` AND freeing `cur_pg` simply deletes `hit_idx` from `hit_pgno`!
-                // Wait — we ALREADY stole its single cell `pred_body` to replace `hit_idx`, so instead
-                // `pred_body` shouldn't remain as a separator with an empty left_child!
-                // Simply delete `hit_idx` from `hit_pgno` and move `pred_body` into right sibling's leftmost leaf!
-                pager.free_page(cur_pg)?;
-                raw_cells.remove(hit_idx);
-                if raw_cells.is_empty() {
-                    pack_btree_page(
-                        pager,
-                        hit_pgno,
-                        BtreePageType::IndexInterior,
-                        right_child,
-                        &[],
-                    )?;
-                    // Collapse single remaining child into hit_pgno
-                    if path.is_empty() {
-                        let _ = try_collapse_child_into_root(pager, root_pgno, right_child)?;
-                    }
-                } else {
-                    pack_btree_page(
-                        pager,
-                        hit_pgno,
-                        BtreePageType::IndexInterior,
-                        right_child,
-                        &raw_cells,
-                    )?;
-                }
-                // Re-insert `pred_body`'s payload cleanly into the tree!
-                let (psize, n1) = get_varint(&pred_body, 0);
-                let limits = payload_limits(usable);
-                let local = local_payload_size(psize as u32, limits.max_local, limits.min_local, usable);
-                let ovfl = if (psize as u32) > local as u32 {
-                    read_u32_be(&pred_body, n1 + local)
-                } else {
-                    0
-                };
-                let full_pred = read_full_payload(
-                    pager,
-                    &pred_body[n1..n1 + local],
-                    psize as usize,
-                    ovfl,
-                )?;
-                if ovfl != 0 {
-                    free_overflow_chain(pager, ovfl)?;
-                }
-                let _ = index_insert(pager, root_pgno, &full_pred, key_info, true)?;
-                return Ok(true);
-            }
-            pager.free_page(cur_pg)?;
-            index_remove_empty_child(pager, root_pgno, &pred_path)?;
+    } else if !pred_leaf_became_empty {
+        // `cur_pg` still has cells and was already repacked; `hit_pgno` & `path` are fresh!
+        if old_ovfl != 0 {
+            free_overflow_chain(pager, old_ovfl)?;
         }
-        // Re-read hit_pgno in case detaching updated it, then split.
         index_split_interior(pager, root_pgno, hit_pgno, &path, raw_cells, right_child)?;
+    } else if cur_pg == left_sub_root {
+        // `left_sub_root` was a 1-cell leaf right under `hit_idx`:
+        // extract `pred_body`'s full payload, delete `hit_idx` + free `cur_pg`, then re-insert `pred`!
+        let (psize, n1) = get_payload_size_varint(&pred_body, 0);
+        let limits = payload_limits(usable);
+        let local = local_payload_size(psize, limits.max_local, limits.min_local, usable);
+        let pred_ovfl = if psize > local as u32 {
+            read_u32_be(&pred_body, n1 + local)
+        } else {
+            0
+        };
+        let full_pred = read_full_payload(
+            pager,
+            &pred_body[n1..n1 + local],
+            psize as usize,
+            pred_ovfl,
+        )?;
+        if old_ovfl != 0 {
+            free_overflow_chain(pager, old_ovfl)?;
+        }
+        if pred_ovfl != 0 {
+            free_overflow_chain(pager, pred_ovfl)?;
+        }
+        pager.free_page(cur_pg)?;
+        raw_cells.remove(hit_idx);
+        if raw_cells.is_empty() {
+            pack_btree_page(
+                pager,
+                hit_pgno,
+                BtreePageType::IndexInterior,
+                right_child,
+                &[],
+            )?;
+            if path.is_empty() {
+                let _ = try_collapse_child_into_root(pager, root_pgno, right_child)?;
+            } else {
+                // Non-root interior dropped to 0 cells: rebalance with sibling so leaf depth stays uniform.
+                index_rebalance_zero_cell_interior(pager, root_pgno, hit_pgno, right_child, &path)?;
+            }
+        } else {
+            pack_btree_page(
+                pager,
+                hit_pgno,
+                BtreePageType::IndexInterior,
+                right_child,
+                &raw_cells,
+            )?;
+        }
+        let _ = index_insert(pager, root_pgno, &full_pred, key_info, true)?;
+        return Ok(true);
+    } else {
+        // `cur_pg` is strictly deeper than `left_sub_root` and became empty:
+        // detach `cur_pg` first while `hit_pgno` still holds the untouched `key_vals`, then
+        // re-find `key_vals` so we NEVER operate on stale `raw_cells` or stale `path`!
+        pager.free_page(cur_pg)?;
+        index_remove_empty_child(pager, root_pgno, &pred_path)?;
+
+        let Ok((fresh_pg, fresh_idx, fresh_path)) = index_find(pager, root_pgno, key_vals, key_info)?
+        else {
+            return Err(SqliteError::corrupt(
+                "index_delete: target key vanished after detaching empty predecessor leaf",
+            ));
+        };
+        let fdata = pager.read_page(fresh_pg)?.to_vec();
+        let fhdr = if fresh_pg == 1 { HEADER_SIZE } else { 0 };
+        let f_is_leaf = fdata[fhdr] == BtreePageType::IndexLeaf as u8;
+        let (fcells, frc) = parse_index_cells(&fdata, fresh_pg, usable)?;
+        if fcells[fresh_idx].overflow_pgno != 0 {
+            free_overflow_chain(pager, fcells[fresh_idx].overflow_pgno)?;
+        }
+        let mut fresh_raw: Vec<Vec<u8>> = fcells.iter().map(|c| c.raw.clone()).collect();
+        fresh_raw[fresh_idx] = if f_is_leaf {
+            pred_body
+        } else {
+            let mut v = Vec::with_capacity(4 + pred_body.len());
+            v.extend_from_slice(&fcells[fresh_idx].left_child.to_be_bytes());
+            v.extend_from_slice(&pred_body);
+            v
+        };
+        if cells_fit(fresh_pg, f_is_leaf, usable as usize, &fresh_raw) {
+            let ptype = if f_is_leaf {
+                BtreePageType::IndexLeaf
+            } else {
+                BtreePageType::IndexInterior
+            };
+            pack_btree_page(pager, fresh_pg, ptype, frc, &fresh_raw)?;
+        } else if f_is_leaf {
+            index_split_leaf(pager, root_pgno, fresh_pg, &fresh_path, fresh_raw)?;
+        } else {
+            index_split_interior(pager, root_pgno, fresh_pg, &fresh_path, fresh_raw, frc)?;
+        }
     }
 
     Ok(true)
@@ -1542,36 +1984,55 @@ fn index_remove_empty_child(
 
     let demoted_leaf_raw = demoted.as_leaf_raw(false);
 
-    // Update parent first (or collapse parent if it now has 0 cells).
+    // Update parent first (or rebalance parent if it now has 0 cells).
     if cells.is_empty() {
         if path.len() == 1 {
             // Root now has only `sibling_pg`! Collapse `sibling_pg` into root!
             let _ = try_collapse_child_into_root(pager, root_pgno, sibling_pg)?;
             // Insert demoted key into the root subtree!
             let target_pg = root_pgno;
-            return index_insert_raw_at_edge(pager, root_pgno, target_pg, demoted_leaf_raw, insert_at_front);
+            return index_insert_raw_at_edge(
+                pager,
+                root_pgno,
+                target_pg,
+                demoted_leaf_raw,
+                insert_at_front,
+            );
         }
-        // Non-root parent has 0 cells: point grandparent directly at `sibling_pg` and free `parent_pg`!
-        let (gp_pg, gp_slot) = path[path.len() - 2];
-        let (mut gp_cells, mut gp_rc) = {
-            let data = pager.read_page(gp_pg)?;
-            parse_index_cells(data, gp_pg, usable)?
-        };
-        if gp_slot < gp_cells.len() {
-            gp_cells[gp_slot].raw[0..4].copy_from_slice(&sibling_pg.to_be_bytes());
-        } else {
-            gp_rc = sibling_pg;
-        }
-        let gp_raw: Vec<Vec<u8>> = gp_cells.into_iter().map(|c| c.raw).collect();
-        pack_btree_page(pager, gp_pg, BtreePageType::IndexInterior, gp_rc, &gp_raw)?;
-        pager.free_page(parent_pg)?;
-        return index_insert_raw_at_edge_with_prefix(
+        // Temporarily pack `parent_pg` with 0 cells and `right_child = sibling_pg`, then insert
+        // `demoted_leaf_raw` into `sibling_pg`. If `sibling_pg` splits, `parent_pg` receives a
+        // promoted key (now >= 1 cell and balanced!); otherwise rebalance `parent_pg` with an
+        // adjacent sibling interior page under its grandparent so ALL leaves stay at uniform depth!
+        pack_btree_page(
+            pager,
+            parent_pg,
+            BtreePageType::IndexInterior,
+            sibling_pg,
+            &[],
+        )?;
+        let mut sib_path = path.to_vec();
+        sib_path.last_mut().unwrap().1 = 0;
+        index_insert_raw_at_edge_with_prefix(
             pager,
             root_pgno,
-            &path[..path.len() - 1],
+            &sib_path,
             sibling_pg,
             demoted_leaf_raw,
             insert_at_front,
+        )?;
+        let (recheck_cells, recheck_rc) = {
+            let data = pager.read_page(parent_pg)?;
+            parse_index_cells(data, parent_pg, usable)?
+        };
+        if !recheck_cells.is_empty() {
+            return Ok(());
+        }
+        return index_rebalance_zero_cell_interior(
+            pager,
+            root_pgno,
+            parent_pg,
+            recheck_rc,
+            &path[..path.len() - 1],
         );
     }
 
@@ -1600,6 +2061,186 @@ fn index_remove_empty_child(
         demoted_leaf_raw,
         insert_at_front,
     )
+}
+
+/// Rebalance a non-root `IndexInterior` page `empty_pg` that dropped to 0 cells (with single
+/// remaining child `sole_child`) by merging into or borrowing from an adjacent sibling interior
+/// page under its parent (`gp_path`), preserving uniform leaf depth across the entire B-tree.
+fn index_rebalance_zero_cell_interior(
+    pager: &mut WritePager,
+    root_pgno: u32,
+    empty_pg: u32,
+    sole_child: u32,
+    gp_path: &[(u32, usize)],
+) -> SqliteResult<()> {
+    let usable = pager.usable_size();
+    let usable_usize = usable as usize;
+    if gp_path.is_empty() {
+        let _ = try_collapse_child_into_root(pager, root_pgno, sole_child)?;
+        return Ok(());
+    }
+
+    let (gp_pg, gp_slot) = *gp_path.last().unwrap();
+    let (mut gp_cells, mut gp_rc) = {
+        let data = pager.read_page(gp_pg)?;
+        parse_index_cells(data, gp_pg, usable)?
+    };
+    if gp_cells.is_empty() {
+        pager.free_page(empty_pg)?;
+        return index_rebalance_zero_cell_interior(
+            pager,
+            root_pgno,
+            gp_pg,
+            sole_child,
+            &gp_path[..gp_path.len() - 1],
+        );
+    }
+
+    if gp_slot < gp_cells.len() {
+        // Merge/redistribute with RIGHT sibling of `empty_pg`.
+        let sep_cell = gp_cells.remove(gp_slot);
+        let sib_pg = if gp_slot < gp_cells.len() {
+            gp_cells[gp_slot].left_child
+        } else {
+            gp_rc
+        };
+        let (sib_cells, sib_rc) = {
+            let data = pager.read_page(sib_pg)?;
+            parse_index_cells(data, sib_pg, usable)?
+        };
+        let mut pulled = Vec::with_capacity(sep_cell.raw.len());
+        pulled.extend_from_slice(&sole_child.to_be_bytes());
+        pulled.extend_from_slice(&sep_cell.raw[4..]);
+
+        let mut merged_raw = Vec::with_capacity(1 + sib_cells.len());
+        merged_raw.push(pulled);
+        merged_raw.extend(sib_cells.into_iter().map(|c| c.raw));
+
+        if cells_fit(sib_pg, false, usable_usize, &merged_raw) {
+            pack_btree_page(pager, sib_pg, BtreePageType::IndexInterior, sib_rc, &merged_raw)?;
+            pager.free_page(empty_pg)?;
+            if gp_cells.is_empty() {
+                return index_rebalance_zero_cell_interior(
+                    pager,
+                    root_pgno,
+                    gp_pg,
+                    sib_pg,
+                    &gp_path[..gp_path.len() - 1],
+                );
+            }
+            let gp_raw: Vec<Vec<u8>> = gp_cells.into_iter().map(|c| c.raw).collect();
+            return pack_btree_page(pager, gp_pg, BtreePageType::IndexInterior, gp_rc, &gp_raw);
+        }
+
+        // Redistribute across `empty_pg` (left) and `sib_pg` (right).
+        let mid = choose_index_split_mid(&merged_raw);
+        let left_rc = read_u32_be(&merged_raw[mid], 0);
+        let mut promoted = Vec::with_capacity(merged_raw[mid].len());
+        promoted.extend_from_slice(&empty_pg.to_be_bytes());
+        promoted.extend_from_slice(&merged_raw[mid][4..]);
+        pack_btree_page(
+            pager,
+            empty_pg,
+            BtreePageType::IndexInterior,
+            left_rc,
+            &merged_raw[..mid],
+        )?;
+        pack_btree_page(
+            pager,
+            sib_pg,
+            BtreePageType::IndexInterior,
+            sib_rc,
+            &merged_raw[mid + 1..],
+        )?;
+        let mut gp_raw: Vec<Vec<u8>> = gp_cells.into_iter().map(|c| c.raw).collect();
+        gp_raw.insert(gp_slot, promoted);
+        if cells_fit(gp_pg, false, usable_usize, &gp_raw) {
+            pack_btree_page(pager, gp_pg, BtreePageType::IndexInterior, gp_rc, &gp_raw)
+        } else {
+            index_split_interior(
+                pager,
+                root_pgno,
+                gp_pg,
+                &gp_path[..gp_path.len() - 1],
+                gp_raw,
+                gp_rc,
+            )
+        }
+    } else {
+        // `empty_pg` is `gp_rc`: merge/redistribute with LEFT sibling.
+        let sep_cell = gp_cells.pop().unwrap();
+        let sib_pg = sep_cell.left_child;
+        gp_rc = sib_pg;
+        let (sib_cells, sib_rc) = {
+            let data = pager.read_page(sib_pg)?;
+            parse_index_cells(data, sib_pg, usable)?
+        };
+        let mut pulled = Vec::with_capacity(sep_cell.raw.len());
+        pulled.extend_from_slice(&sib_rc.to_be_bytes());
+        pulled.extend_from_slice(&sep_cell.raw[4..]);
+
+        let mut merged_raw = Vec::with_capacity(sib_cells.len() + 1);
+        merged_raw.extend(sib_cells.into_iter().map(|c| c.raw));
+        merged_raw.push(pulled);
+
+        if cells_fit(sib_pg, false, usable_usize, &merged_raw) {
+            pack_btree_page(
+                pager,
+                sib_pg,
+                BtreePageType::IndexInterior,
+                sole_child,
+                &merged_raw,
+            )?;
+            pager.free_page(empty_pg)?;
+            if gp_cells.is_empty() {
+                return index_rebalance_zero_cell_interior(
+                    pager,
+                    root_pgno,
+                    gp_pg,
+                    sib_pg,
+                    &gp_path[..gp_path.len() - 1],
+                );
+            }
+            let gp_raw: Vec<Vec<u8>> = gp_cells.into_iter().map(|c| c.raw).collect();
+            return pack_btree_page(pager, gp_pg, BtreePageType::IndexInterior, gp_rc, &gp_raw);
+        }
+
+        // Redistribute across `sib_pg` (left) and `empty_pg` (right).
+        let mid = choose_index_split_mid(&merged_raw);
+        let left_rc = read_u32_be(&merged_raw[mid], 0);
+        let mut promoted = Vec::with_capacity(merged_raw[mid].len());
+        promoted.extend_from_slice(&sib_pg.to_be_bytes());
+        promoted.extend_from_slice(&merged_raw[mid][4..]);
+        pack_btree_page(
+            pager,
+            sib_pg,
+            BtreePageType::IndexInterior,
+            left_rc,
+            &merged_raw[..mid],
+        )?;
+        pack_btree_page(
+            pager,
+            empty_pg,
+            BtreePageType::IndexInterior,
+            sole_child,
+            &merged_raw[mid + 1..],
+        )?;
+        let mut gp_raw: Vec<Vec<u8>> = gp_cells.into_iter().map(|c| c.raw).collect();
+        gp_raw.push(promoted);
+        gp_rc = empty_pg;
+        if cells_fit(gp_pg, false, usable_usize, &gp_raw) {
+            pack_btree_page(pager, gp_pg, BtreePageType::IndexInterior, gp_rc, &gp_raw)
+        } else {
+            index_split_interior(
+                pager,
+                root_pgno,
+                gp_pg,
+                &gp_path[..gp_path.len() - 1],
+                gp_raw,
+                gp_rc,
+            )
+        }
+    }
 }
 
 fn index_insert_raw_at_edge(
@@ -1650,18 +2291,62 @@ fn index_insert_raw_at_edge_with_prefix(
     }
 }
 
-/// Choose a balanced split index `1..len` for TableLeaf cells (by byte weight).
-fn choose_split_point(cells: &[Vec<u8>]) -> usize {
-    let total: usize = cells.iter().map(|c| cell_storage_len(c) + 2).sum();
-    let half = total / 2;
-    let mut acc = 0usize;
-    for (i, c) in cells.iter().enumerate() {
-        acc += cell_storage_len(c) + 2;
-        if acc >= half && i >= 1 && i < cells.len() - 1 {
-            return i + 1;
+/// Partition `cells` (`len >= 2`) into `k >= 2` non-empty contiguous chunks where EVERY chunk
+/// fits on a non-root TableLeaf page (`usable_size - 8` bytes).
+///
+/// Prefers the most balanced 2-way split when one exists; falls back to greedy multi-way packing
+/// (e.g. 3 chunks for `[250B, 490B, 250B]` on a 512-byte page where no 2-way split fits).
+fn partition_table_leaf_cells(
+    cells: &[Vec<u8>],
+    usable_size: usize,
+) -> SqliteResult<Vec<(usize, usize)>> {
+    let cap = usable_size.saturating_sub(8);
+    let sizes: Vec<usize> = cells.iter().map(|c| cell_storage_len(c) + 2).collect();
+    if let Some(&biggest) = sizes.iter().max() {
+        if biggest > cap {
+            return Err(SqliteError::corrupt(format!(
+                "table leaf cell ({biggest} bytes) exceeds page capacity {cap}"
+            )));
         }
     }
-    (cells.len() / 2).max(1)
+    let total: usize = sizes.iter().sum();
+    let half = total / 2;
+
+    // 1. Try finding the best balanced 2-way split where BOTH halves fit in `cap`.
+    let mut best_split: Option<(usize, usize)> = None; // (split_idx, distance_from_half)
+    let mut left_sum = 0usize;
+    for (i, &sz) in sizes.iter().enumerate() {
+        left_sum += sz;
+        let split = i + 1;
+        if split >= sizes.len() {
+            break;
+        }
+        let right_sum = total - left_sum;
+        if left_sum <= cap && right_sum <= cap {
+            let dist = left_sum.abs_diff(half);
+            if best_split.is_none_or(|(_, best_d)| dist < best_d) {
+                best_split = Some((split, dist));
+            }
+        }
+    }
+    if let Some((split, _)) = best_split {
+        return Ok(vec![(0, split), (split, cells.len())]);
+    }
+
+    // 2. Greedy multi-way packing (guaranteed >= 2 chunks, each <= cap and non-empty).
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < sizes.len() {
+        let mut acc = sizes[start];
+        let mut end = start + 1;
+        while end < sizes.len() && acc + sizes[end] <= cap {
+            acc += sizes[end];
+            end += 1;
+        }
+        chunks.push((start, end));
+        start = end;
+    }
+    Ok(chunks)
 }
 
 /// Choose a balanced split middle index `1..len-1` for IndexLeaf / IndexInterior
@@ -1696,12 +2381,16 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
     let mut visited: HashSet<u32> = HashSet::new();
 
     // 1. Walk all B-trees
+    let usable_len = usable as usize;
     for &root in root_pages {
         if root == 0 {
             continue;
         }
-        let mut stack = vec![(root, true)];
-        while let Some((pgno, is_root)) = stack.pop() {
+        let mut expected_leaf_depth: Option<usize> = None;
+        let mut expected_is_table: Option<bool> = None;
+        // Stack entries: (pgno, is_root, depth)
+        let mut stack = vec![(root, true, 0usize)];
+        while let Some((pgno, is_root, depth)) = stack.pop() {
             if pgno < 1 || pgno > page_count {
                 errors.push(format!("page {pgno} out of range 1..={page_count}"));
                 continue;
@@ -1714,21 +2403,53 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 errors.push(format!("cannot read page {pgno}"));
                 continue;
             };
+            let bound = usable_len.min(data.len());
             let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
+            if hdr + 8 > bound {
+                errors.push(format!("page {pgno}: truncated header"));
+                continue;
+            }
             let Some(ptype) = BtreePageType::from_byte(data[hdr]) else {
                 errors.push(format!("page {pgno}: invalid type 0x{:02x}", data[hdr]));
                 continue;
             };
             let n_cell = usize::from(read_u16_be(data, hdr + 3));
+            let is_leaf = ptype.is_leaf();
             if !is_root && n_cell == 0 {
                 errors.push(format!("page {pgno}: non-root page has 0 cells"));
             }
-            let is_leaf = ptype.is_leaf();
+            if is_root && !is_leaf && n_cell == 0 && pgno != 1 {
+                errors.push(format!("page {pgno}: non-page-1 interior root has 0 cells"));
+            }
             let is_table = ptype.is_table();
+            if let Some(exp_tbl) = expected_is_table {
+                if exp_tbl != is_table {
+                    errors.push(format!(
+                        "page {pgno}: mismatched B-tree page kind in tree rooted at {root}"
+                    ));
+                }
+            } else {
+                expected_is_table = Some(is_table);
+            }
+            if is_leaf {
+                if let Some(exp_d) = expected_leaf_depth {
+                    if exp_d != depth {
+                        errors.push(format!(
+                            "page {pgno}: child page depth differs ({depth} != {exp_d})"
+                        ));
+                    }
+                } else {
+                    expected_leaf_depth = Some(depth);
+                }
+            }
             let ptr_off = hdr + if is_leaf { 8 } else { 12 };
+            if ptr_off + 2 * n_cell > bound {
+                errors.push(format!("page {pgno}: cell pointer array overflows page"));
+                continue;
+            }
             if !is_leaf {
                 let rc = read_u32_be(data, hdr + 8);
-                stack.push((rc, false));
+                stack.push((rc, false, depth + 1));
             }
             let (max_l, min_l) = if is_table && is_leaf {
                 (limits.max_leaf, limits.min_leaf)
@@ -1740,11 +2461,19 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 let pc = usize::from(read_u16_be(data, ptr_off + 2 * i));
                 let mut pos = pc;
                 if !is_leaf {
-                    stack.push((read_u32_be(data, pos), false));
+                    if pos + 4 > bound {
+                        errors.push(format!("page {pgno}: cell {i} runs past page end"));
+                        continue;
+                    }
+                    stack.push((read_u32_be(data, pos), false, depth + 1));
                     pos += 4;
                 }
                 if is_table && !is_leaf {
-                    let (rk, _) = get_varint(data, pos);
+                    let (rk, klen) = get_varint(data, pos);
+                    if pos + klen > bound {
+                        errors.push(format!("page {pgno}: cell {i} key runs past page end"));
+                        continue;
+                    }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
                             errors.push(format!("page {pgno}: unsorted table interior keys"));
@@ -1753,10 +2482,14 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                     prev_rowid = Some(rk);
                     continue;
                 }
-                let (psize, n1) = get_varint(data, pos);
+                let (psize_u32, n1) = get_payload_size_varint(data, pos);
                 pos += n1;
                 if is_table {
                     let (rk, n2) = get_varint(data, pos);
+                    if pos + n2 > bound {
+                        errors.push(format!("page {pgno}: cell {i} rowid runs past page end"));
+                        continue;
+                    }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
                             errors.push(format!("page {pgno}: unsorted table leaf rowids"));
@@ -1765,11 +2498,18 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                     prev_rowid = Some(rk);
                     pos += n2;
                 }
-                let local = local_payload_size(psize as u32, max_l, min_l, usable);
-                if (psize as u32) > local as u32 {
+                let local = local_payload_size(psize_u32, max_l, min_l, usable);
+                let expected_end = pos + local + if psize_u32 > local as u32 { 4 } else { 0 };
+                if expected_end > bound {
+                    errors.push(format!("page {pgno}: cell {i} payload runs past page end"));
+                    continue;
+                }
+                if psize_u32 > local as u32 {
+                    let expected_ovfl = overflow_page_count(psize_u32, local, usable);
+                    let mut actual_ovfl = 0u32;
                     let mut ovfl = read_u32_be(data, pos + local);
                     while ovfl != 0 {
-                        if ovfl < 2 || ovfl > page_count {
+                        if ovfl < 2 || ovfl > page_count || ovfl == lbp {
                             errors.push(format!("page {pgno}: bad overflow page {ovfl}"));
                             break;
                         }
@@ -1777,7 +2517,13 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                             errors.push(format!("overflow page {ovfl} referenced more than once"));
                             break;
                         }
+                        actual_ovfl += 1;
                         ovfl = pager.read_page(ovfl).map(|p| read_u32_be(p, 0)).unwrap_or(0);
+                    }
+                    if actual_ovfl != expected_ovfl {
+                        errors.push(format!(
+                            "page {pgno}: cell {i} overflow chain length {actual_ovfl} != expected {expected_ovfl}"
+                        ));
                     }
                 }
             }
@@ -1785,10 +2531,11 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
     }
 
     // 2. Walk freelist
+    let max_leaves = ((usable as usize).saturating_sub(8)) / 4;
     let mut trunk = pager.freelist_trunk();
     let mut free_seen = 0u32;
     while trunk != 0 {
-        if trunk < 2 || trunk > page_count {
+        if trunk < 2 || trunk > page_count || trunk == lbp {
             errors.push(format!("freelist trunk {trunk} out of range"));
             break;
         }
@@ -1801,12 +2548,22 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
             errors.push(format!("cannot read freelist trunk {trunk}"));
             break;
         };
+        if tpage.len() < 8 {
+            errors.push(format!("freelist trunk {trunk} truncated"));
+            break;
+        }
         let next_trunk = read_u32_be(tpage, 0);
-        let cnt = read_u32_be(tpage, 4);
+        let cnt = read_u32_be(tpage, 4) as usize;
+        if cnt > max_leaves {
+            errors.push(format!(
+                "freelist trunk {trunk}: leaf count {cnt} exceeds max {max_leaves}"
+            ));
+            break;
+        }
         for i in 0..cnt {
-            let off = 8 + (i as usize) * 4;
+            let off = 8 + i * 4;
             let leaf = read_u32_be(tpage, off);
-            if leaf < 2 || leaf > page_count {
+            if leaf < 2 || leaf > page_count || leaf == lbp {
                 errors.push(format!("freelist leaf {leaf} out of range"));
                 continue;
             }

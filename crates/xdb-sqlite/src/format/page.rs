@@ -128,13 +128,13 @@ pub struct BtreePage {
 impl BtreePage {
     pub fn parse(pgno: u32, data: Arc<[u8]>, db: &DatabaseInfo) -> SqliteResult<Self> {
         let page_size = data.len();
-        let mask_page = page_size - 1;
         let hdr = if pgno == 1 { 100usize } else { 0usize };
         if hdr + 8 > page_size {
             return Err(SqliteError::corrupt(format!(
                 "page {pgno}: page buffer too short ({page_size} bytes)"
             )));
         }
+        let mask_page = page_size - 1;
         let flag = data[hdr];
         let Some(page_type) = BtreePageType::from_byte(flag) else {
             return Err(SqliteError::corrupt(format!(
@@ -334,6 +334,7 @@ impl BtreePage {
         let end = self.page_size;
         let mut p = if self.is_leaf {
             let mut pos = self.cell_offset(i);
+            let mut steps = 0usize;
             loop {
                 if pos >= end {
                     return Err(SqliteError::corrupt(format!(
@@ -343,7 +344,8 @@ impl BtreePage {
                 }
                 let b = data[pos];
                 pos += 1;
-                if b < 0x80 {
+                steps += 1;
+                if b < 0x80 || steps >= 9 {
                     break;
                 }
             }

@@ -210,11 +210,18 @@ impl LockHandle {
             }
             LockLevel::Exclusive => {
                 if self.level == LockLevel::Shared {
-                    if st.writer.is_some() || st.shared_count > 1 {
+                    if st.writer.is_some() {
                         return Ok(false);
                     }
-                    st.writer = Some((self.id, LockLevel::Exclusive));
+                    // SQLite unixLock: acquire PENDING first so new readers block while
+                    // existing readers drain, preventing writer starvation.
+                    self.level = LockLevel::Pending;
+                    st.writer = Some((self.id, LockLevel::Pending));
+                    if st.shared_count > 1 {
+                        return Ok(false);
+                    }
                     self.level = LockLevel::Exclusive;
+                    st.writer = Some((self.id, LockLevel::Exclusive));
                     Ok(true)
                 } else {
                     // Coming from RESERVED or PENDING: this handle owns writer.

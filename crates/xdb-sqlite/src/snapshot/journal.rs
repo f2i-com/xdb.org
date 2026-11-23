@@ -148,7 +148,10 @@ pub fn playback_journal(
             (((journal_off - 1) / sector) + 1) * sector
         };
         journal_off = hdr_off;
-        if hdr_off.saturating_add(sector) > sz_j {
+        // On the very first header, `sector` is not known until we read the 28-byte header
+        // (SQLite allows `i_sector_size` down to 32 bytes, smaller than `READER_SECTOR_SIZE`).
+        let min_hdr_bytes = if journal_off == 0 { 28 } else { sector };
+        if hdr_off.saturating_add(min_hdr_bytes) > sz_j {
             stop_reason = JournalStopReason::NoMoreHeaders;
             break;
         }
@@ -181,6 +184,10 @@ pub fn playback_journal(
             page_size = i_page_size;
             lck_pgno = lock_byte_page(page_size);
             sector = u64::from(i_sector_size);
+            if hdr_off.saturating_add(sector) > sz_j {
+                stop_reason = JournalStopReason::NoMoreHeaders;
+                break;
+            }
             header_page_size = i_page_size;
             header_sector = i_sector_size;
             rec = vec![0u8; page_size as usize + 8];
@@ -188,7 +195,8 @@ pub fn playback_journal(
         journal_off += sector;
 
         if n_rec == 0xffff_ffff {
-            n_rec = ((sz_j.saturating_sub(sector)) / (u64::from(page_size) + 8)) as u32;
+            let rem = sz_j.saturating_sub(journal_off) / (u64::from(page_size) + 8);
+            n_rec = u32::try_from(rem).unwrap_or(u32::MAX);
         }
         if journal_off == sector {
             played = true;

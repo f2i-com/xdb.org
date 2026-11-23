@@ -8,7 +8,7 @@ caller_pwd="$(pwd)"
 here="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-$here/dist}"
 case "$OUT_DIR" in
-  /*|[A-Za-z]:/*) ;;
+  /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
   *) OUT_DIR="$caller_pwd/$OUT_DIR" ;;
 esac
 mkdir -p "$OUT_DIR"
@@ -31,6 +31,14 @@ wasm-bindgen --target web --out-dir "$WEB_DIR" \
 wasm-bindgen --target nodejs --out-dir "$NODE_DIR" \
   --remove-name-section --remove-producers-section "$RAW_WASM"
 
+to_node_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 if command -v wasm-opt >/dev/null 2>&1; then
   echo "=== Running wasm-opt -Oz"
   wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals \
@@ -39,10 +47,15 @@ if command -v wasm-opt >/dev/null 2>&1; then
   wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals \
     "$NODE_DIR/xdb_wasm_bg.wasm" -o "$NODE_DIR/xdb_wasm_bg.opt.wasm"
   mv "$NODE_DIR/xdb_wasm_bg.opt.wasm" "$NODE_DIR/xdb_wasm_bg.wasm"
+elif [[ "${REQUIRE_WASM_OPT:-0}" = "1" ]]; then
+  echo "ERROR: wasm-opt not found on PATH (REQUIRE_WASM_OPT=1)" >&2
+  exit 1
+else
+  echo "WARNING: wasm-opt not found on PATH; skipping Binaryen -Oz optimization" >&2
 fi
 
-echo "=== Verifying xdb-wasm under Node.js"
-node - "$NODE_DIR/xdb_wasm.js" <<'EOF'
+echo "=== Verifying xdb-wasm (nodejs target) under Node.js"
+node - "$(to_node_path "$NODE_DIR/xdb_wasm.js")" <<'EOF'
 const assert = require('node:assert/strict');
 const { WasmConnection, WasmDatabase } = require(process.argv[2]);
 
@@ -66,7 +79,9 @@ const ro = new WasmDatabase(exported, undefined, undefined, 10_000_000n, 33_554_
 const xdbQ = JSON.parse(ro.query_xdb_json('FROM items SELECT name ORDER BY id'));
 assert.deepEqual(xdbQ.rows, [['Espresso'], ['Flat White']]);
 ro.close();
+ro.free();
 conn.close();
+conn.free();
 console.log('ok: xdb-wasm Node smoke verification passed (' + exported.length + ' exported bytes)');
 EOF
 
@@ -76,7 +91,36 @@ cp "$WEB_DIR/xdb_wasm.js" "$OUT_DIR/xdb-${VERSION}-wasm.js"
 cp "$WEB_DIR/xdb_wasm.d.ts" "$OUT_DIR/xdb-${VERSION}-wasm.d.ts"
 cp "$WEB_DIR/xdb_wasm_bg.wasm.d.ts" "$OUT_DIR/xdb-${VERSION}-wasm.wasm.d.ts"
 
-node - "$OUT_DIR/xdb-${VERSION}-wasm.wasm" "$OUT_DIR/xdb-${VERSION}-wasm.wasm.br" <<'EOF'
+# Rewrite default .wasm URL in packaged web JS so zero-arg `await initXdb()` resolves the versioned filename.
+node - "$(to_node_path "$OUT_DIR/xdb-${VERSION}-wasm.js")" "xdb-${VERSION}-wasm.wasm" <<'EOF'
+const fs = require('node:fs');
+const file = process.argv[2];
+const wasmName = process.argv[3];
+const src = fs.readFileSync(file, 'utf8');
+const updated = src.replaceAll('xdb_wasm_bg.wasm', wasmName);
+if (updated === src) {
+  throw new Error('Failed to rewrite default wasm filename in ' + file);
+}
+fs.writeFileSync(file, updated, 'utf8');
+EOF
+
+echo "=== Verifying packaged web ESM asset under Node.js"
+node --input-type=module - "$(to_node_path "$OUT_DIR/xdb-${VERSION}-wasm.js")" "$(to_node_path "$OUT_DIR/xdb-${VERSION}-wasm.wasm")" <<'EOF'
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+const mod = await import(pathToFileURL(process.argv[2]).href);
+await mod.default({ module_or_path: fs.readFileSync(process.argv[3]) });
+const conn = new mod.WasmConnection(undefined, undefined, undefined, 4096, 10_000_000n, 33_554_432n, 50_000n);
+const res = JSON.parse(conn.execute_json('SELECT 40 + 2 AS ans'));
+assert.deepEqual(res.rows, [[42]]);
+conn.close();
+conn.free();
+console.log('ok: xdb-wasm packaged web ESM verification passed');
+EOF
+
+node - "$(to_node_path "$OUT_DIR/xdb-${VERSION}-wasm.wasm")" "$(to_node_path "$OUT_DIR/xdb-${VERSION}-wasm.wasm.br")" <<'EOF'
 const fs = require('node:fs');
 const zlib = require('node:zlib');
 const raw = fs.readFileSync(process.argv[2]);

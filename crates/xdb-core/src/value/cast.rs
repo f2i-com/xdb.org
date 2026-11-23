@@ -49,7 +49,7 @@ pub fn cast_value(v0: SqlValue, aff: Affinity, enc: TextEncoding) -> Result<SqlV
         },
         Affinity::Numeric => Ok(numerify(&v)),
         Affinity::Integer => Ok(SqlValue::Int(int_value(&v))),
-        Affinity::Real => Ok(SqlValue::Real(real_value(&v))),
+        Affinity::Real => Ok(SqlValue::real(real_value(&v))),
         Affinity::Text => match v {
             SqlValue::Text(_) => Ok(v),
             SqlValue::Blob(b) => Ok(SqlValue::Text(blob_to_text(&b, enc))),

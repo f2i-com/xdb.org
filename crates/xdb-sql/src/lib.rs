@@ -21,7 +21,9 @@ pub use errors::{SqlError, SqlResult};
 pub use eval::{
     eval_expr, eval_generated_expr, EvalEnv, EvalScope, NoSubqueries, ScopeColumn, SubqueryRunner,
 };
-pub use exec::{execute_query, execute_select_stmt, CatalogSubqueryRunner};
+pub use exec::{
+    execute_query, execute_select_stmt, execute_select_stmt_detailed, CatalogSubqueryRunner,
+};
 pub use functions::{
     CustomScalarFn, FunctionContext, FunctionLimits, FunctionRegistry, TableValuedResult,
 };

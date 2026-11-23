@@ -134,6 +134,72 @@ pub fn append_utf8_raw(out: &mut Vec<u8>, v: u32) {
     }
 }
 
+/// RAII cumulative memory reservation guard for materialized buffers/rows.
+#[derive(Debug)]
+pub struct MemoryGuard<'m> {
+    meter: Option<&'m dyn Meter>,
+    reserved: u64,
+}
+
+impl<'m> MemoryGuard<'m> {
+    #[inline]
+    pub fn new(meter: Option<&'m dyn Meter>) -> Self {
+        Self { meter, reserved: 0 }
+    }
+
+    #[inline]
+    pub fn reserve(&mut self, bytes: u64) -> SqlResult<()> {
+        if bytes > 0 {
+            if let Some(m) = self.meter {
+                m.reserve_memory(bytes)?;
+            }
+            self.reserved = self.reserved.saturating_add(bytes);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn release(&mut self, bytes: u64) {
+        let take = bytes.min(self.reserved);
+        if take > 0 {
+            if let Some(m) = self.meter {
+                m.release_memory(take);
+            }
+            self.reserved -= take;
+        }
+    }
+}
+
+impl Drop for MemoryGuard<'_> {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            if let Some(m) = self.meter {
+                m.release_memory(self.reserved);
+            }
+            self.reserved = 0;
+        }
+    }
+}
+
+/// Conservative heap size estimate for a single [`SqlValue`].
+#[inline]
+pub fn estimate_value_bytes(v: &SqlValue) -> u64 {
+    match v {
+        SqlValue::Null | SqlValue::Int(_) | SqlValue::Real(_) => 24,
+        SqlValue::Text(b) | SqlValue::Blob(b) => 24 + b.len() as u64,
+    }
+}
+
+/// Conservative heap size estimate for one materialized row.
+#[inline]
+pub fn estimate_row_bytes(row: &[SqlValue]) -> u64 {
+    let mut bytes = 32u64;
+    for v in row {
+        bytes = bytes.saturating_add(estimate_value_bytes(v));
+    }
+    bytes
+}
+
 /// Length-limited and meter-aware byte accumulator (SQLite `StrAccum`).
 #[derive(Debug)]
 pub struct ByteAccum<'m> {
@@ -143,6 +209,7 @@ pub struct ByteAccum<'m> {
     pub str_accum: bool,
     meter: Option<&'m dyn Meter>,
     charged: usize,
+    step_pending: usize,
 }
 
 impl<'m> ByteAccum<'m> {
@@ -153,6 +220,7 @@ impl<'m> ByteAccum<'m> {
             str_accum,
             meter,
             charged: 0,
+            step_pending: 0,
         }
     }
 
@@ -185,10 +253,34 @@ impl<'m> ByteAccum<'m> {
             let delta = target - self.charged;
             if let Some(m) = self.meter {
                 m.reserve_memory(delta as u64)?;
+                self.step_pending = self.step_pending.saturating_add(delta);
+                if self.step_pending >= 256 {
+                    let steps = (self.step_pending / 256) as u64;
+                    self.step_pending %= 256;
+                    m.charge_steps(steps)?;
+                }
             }
             self.charged = target;
         }
         self.buf.reserve(extra);
+        Ok(())
+    }
+
+    /// Check that an upcoming temporary allocation of `extra` bytes fits within both
+    /// `max_length` and the meter's memory/step limits before allocating it.
+    pub fn check_scratch(&self, extra: usize) -> SqlResult<()> {
+        if self.exceeds(extra) {
+            return Err(SqlError::too_big());
+        }
+        if let Some(m) = self.meter {
+            if extra > 0 {
+                m.reserve_memory(extra as u64)?;
+                m.release_memory(extra as u64);
+                if extra >= 256 {
+                    m.charge_steps((extra / 256) as u64)?;
+                }
+            }
+        }
         Ok(())
     }
 

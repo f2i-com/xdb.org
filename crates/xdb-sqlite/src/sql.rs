@@ -282,40 +282,35 @@ impl<'a> SqliteSqlCatalog<'a> {
             }
         }
 
-        // Range scan using `TableCursor::seek` + sequential leaf traversal
-        let mut tcur = self
-            .db
-            .btree()
-            .table_cursor(reader.info().root_page)
-            .map_err(map_sqlite_err)?;
+        // Range scan using `RowCursor::seek` + sequential leaf traversal (true O(log N + K)!)
+        let range_opts = ScanOptions {
+            columns: scan_opts.columns.clone(),
+            rowid: false,
+        };
+        let mut rcur = reader.cursor(Some(&range_opts)).map_err(map_sqlite_err)?;
         let positioned = if let Some(lo) = lo_i64 {
-            tcur.seek(lo).map_err(map_sqlite_err)? != SeekResult::Eof
+            rcur.seek(lo).map_err(map_sqlite_err)? != SeekResult::Eof
         } else {
-            tcur.first().map_err(map_sqlite_err)?
+            rcur.next().map_err(map_sqlite_err)?
         };
         if !positioned {
             return Ok(Some(Vec::new()));
         }
 
-        let point_opts = ScanOptions {
-            columns: scan_opts.columns.clone(),
-            rowid: false,
-        };
         let mut rows = Vec::new();
         loop {
             if let Some(m) = meter {
                 m.charge_steps(1)?;
             }
-            let rid = tcur.rowid().map_err(map_sqlite_err)?;
+            let rid = rcur.rowid().map_err(map_sqlite_err)?;
             if let Some(hi) = hi_i64 {
                 if rid > hi {
                     break;
                 }
             }
-            if let Some(vals) = reader.get(rid, Some(&point_opts)).map_err(map_sqlite_err)? {
-                rows.push((Some(rid), vals));
-            }
-            if !tcur.next().map_err(map_sqlite_err)? {
+            let vals = rcur.row().map_err(map_sqlite_err)?;
+            rows.push((Some(rid), vals));
+            if !rcur.next().map_err(map_sqlite_err)? {
                 break;
             }
         }
@@ -334,7 +329,7 @@ impl<'a> SqliteSqlCatalog<'a> {
             return Ok(None);
         };
         let idx_info = idx_reader.info();
-        if idx_info.without_rowid_primary_key || prefix_values.is_empty() {
+        if idx_info.without_rowid_primary_key || idx_info.partial || prefix_values.is_empty() {
             return Ok(None);
         }
         let Ok(key_info) = idx_reader.key_info(Some(&self.options.collations)) else {

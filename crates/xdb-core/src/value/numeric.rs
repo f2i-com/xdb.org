@@ -1,7 +1,7 @@
 //! Numeric views of [`SqlValue`], ported from SQLite 3.54.1 `vdbemem.c` / `vdbe.c`.
 
 use super::atof::{atof, atoi64, dec_or_hex_to_i64, AtoFResult};
-use super::int64::{real_same_as_int, real_to_exact_i64, real_to_i64, real_to_integer_affinity};
+use super::int64::{real_same_as_int, real_to_i64, real_to_integer_affinity};
 use super::SqlValue;
 
 /// `sqlite3MemRealValueRC` (`vdbemem.c:735`) for a `TEXT`/`BLOB` byte slice.
@@ -63,7 +63,7 @@ pub fn numeric_value(v: &SqlValue) -> SqlValue {
     match v {
         SqlValue::Null => SqlValue::Null,
         SqlValue::Int(i) => SqlValue::Int(*i),
-        SqlValue::Real(r) => SqlValue::Real(*r),
+        SqlValue::Real(r) => SqlValue::real(*r),
         SqlValue::Text(b) | SqlValue::Blob(b) => text_numeric_value(b),
     }
 }
@@ -73,7 +73,7 @@ pub fn numerify(v: &SqlValue) -> SqlValue {
     match v {
         SqlValue::Null => SqlValue::Null,
         SqlValue::Int(i) => SqlValue::Int(*i),
-        SqlValue::Real(r) => SqlValue::Real(*r),
+        SqlValue::Real(r) => SqlValue::real(*r),
         SqlValue::Text(b) | SqlValue::Blob(b) => {
             let r = atof(b);
             if (r.rc & 2) == 0 {
@@ -86,7 +86,7 @@ pub fn numerify(v: &SqlValue) -> SqlValue {
             if real_same_as_int(r.value, ix) {
                 return SqlValue::Int(ix);
             }
-            SqlValue::Real(r.value)
+            SqlValue::real(r.value)
         }
     }
 }
@@ -127,12 +127,13 @@ pub fn apply_numeric_affinity(bytes: &[u8], try_for_int: bool) -> Option<SqlValu
 }
 
 /// `OP_MustBeInt` (`vdbe.c:2166`): integer value for `INTEGER`, integral `REAL` in
-/// `[-2^63, 2^63)`, or `TEXT` that numeric affinity converts to `INTEGER`.
+/// `(-2^63, 2^63)` (matching `sqlite3VdbeIntegerAffinity` / ticket #3922), or `TEXT`
+/// that numeric affinity converts to `INTEGER`.
 pub fn must_be_int(v: &SqlValue) -> Option<i64> {
     match v {
         SqlValue::Null | SqlValue::Blob(_) => None,
         SqlValue::Int(i) => Some(*i),
-        SqlValue::Real(r) => real_to_exact_i64(*r),
+        SqlValue::Real(r) => real_to_integer_affinity(*r),
         SqlValue::Text(b) => match apply_numeric_affinity(b, true) {
             Some(SqlValue::Int(i)) => Some(i),
             _ => None,

@@ -227,7 +227,7 @@ pub fn load_schema(bt: &Btree, options: &LoadSchemaOptions<'_>) -> SqliteResult<
         None => bt.info().header.as_ref(),
     };
     let enc = bt.info().text_encoding;
-    let mut file_format = header.map_or(0, |h| h.schema_format & 0xff);
+    let mut file_format = header.map_or(0, |h| h.schema_format);
     if file_format == 0 {
         file_format = 1;
     }

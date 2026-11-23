@@ -14,7 +14,7 @@ use xdb_core::{SqlValue, TextEncoding};
 
 use crate::btree::RecordKey;
 use crate::errors::{SqliteError, SqliteResult};
-use crate::format::{decode_fixed, get_varint32, serial_type_length, varint_len};
+use crate::format::{decode_fixed, get_varint32, serial_type_length};
 use crate::schema::IndexInfo;
 
 /// One record field of a [`KeyInfo`]: its collation name and direction.
@@ -250,45 +250,76 @@ impl RecordKey for SearchKey {
             let p = start + idx1;
             let body = start + d1;
             let st: u32;
+            let st_len: usize;
             let rc: i32;
             match &self.fields[i] {
                 PreparedField::Int(rhs) => {
-                    st = u32::from(byte_at(buf, p));
+                    let sb = byte_at(buf, p);
+                    if sb < 0x80 {
+                        st = u32::from(sb);
+                        st_len = 1;
+                    } else {
+                        let (v, l) = get_varint32(buf, p);
+                        st = v;
+                        st_len = l;
+                    }
                     if st >= 10 {
-                        rc = if st == 10 { -1 } else { 1 };
+                        rc = if st == 10 || st == 11 { -1 } else { 1 };
                     } else if st == 0 {
                         rc = -1;
-                    } else if st == 7 {
-                        rc = -ord_to_i32(int_float_compare(*rhs, read_f64_padded(buf, body)));
                     } else {
-                        let lhs = match decode_fixed_padded(buf, body, st) {
-                            SqlValue::Int(v) => v,
-                            _ => 0,
-                        };
-                        rc = ord_to_i32(lhs.cmp(rhs));
+                        let len = serial_type_length(st);
+                        if d1.saturating_add(len) > n {
+                            self.corrupt = true;
+                            return 0;
+                        }
+                        if st == 7 {
+                            rc = -ord_to_i32(int_float_compare(*rhs, read_f64_padded(buf, body)));
+                        } else {
+                            let lhs = match decode_fixed_padded(buf, body, st) {
+                                SqlValue::Int(v) => v,
+                                _ => 0,
+                            };
+                            rc = ord_to_i32(lhs.cmp(rhs));
+                        }
                     }
                 }
                 PreparedField::Real(rhs) => {
-                    st = u32::from(byte_at(buf, p));
+                    let sb = byte_at(buf, p);
+                    if sb < 0x80 {
+                        st = u32::from(sb);
+                        st_len = 1;
+                    } else {
+                        let (v, l) = get_varint32(buf, p);
+                        st = v;
+                        st_len = l;
+                    }
                     if st >= 10 {
-                        rc = if st == 10 { -1 } else { 1 };
+                        rc = if st == 10 || st == 11 { -1 } else { 1 };
                     } else if st == 0 {
                         rc = -1;
-                    } else if st == 7 {
-                        let r = read_f64_padded(buf, body);
-                        rc = if r.is_nan() || r < *rhs {
-                            -1
-                        } else if r > *rhs {
-                            1
-                        } else {
-                            0
-                        };
                     } else {
-                        let lhs = match decode_fixed_padded(buf, body, st) {
-                            SqlValue::Int(v) => v,
-                            _ => 0,
-                        };
-                        rc = ord_to_i32(int_float_compare(lhs, *rhs));
+                        let len = serial_type_length(st);
+                        if d1.saturating_add(len) > n {
+                            self.corrupt = true;
+                            return 0;
+                        }
+                        if st == 7 {
+                            let r = read_f64_padded(buf, body);
+                            rc = if r.is_nan() || r < *rhs {
+                                -1
+                            } else if r > *rhs {
+                                1
+                            } else {
+                                0
+                            };
+                        } else {
+                            let lhs = match decode_fixed_padded(buf, body, st) {
+                                SqlValue::Int(v) => v,
+                                _ => 0,
+                            };
+                            rc = ord_to_i32(int_float_compare(lhs, *rhs));
+                        }
                     }
                 }
                 PreparedField::Text {
@@ -296,11 +327,14 @@ impl RecordKey for SearchKey {
                     utf8_bytes,
                 } => {
                     let sb = byte_at(buf, p);
-                    st = if sb < 0x80 {
-                        u32::from(sb)
+                    if sb < 0x80 {
+                        st = u32::from(sb);
+                        st_len = 1;
                     } else {
-                        get_varint32(buf, p).0
-                    };
+                        let (v, l) = get_varint32(buf, p);
+                        st = v;
+                        st_len = l;
+                    }
                     if st < 12 {
                         rc = -1;
                     } else if (st & 1) == 0 {
@@ -322,11 +356,14 @@ impl RecordKey for SearchKey {
                 }
                 PreparedField::Blob(key_bytes) => {
                     let sb = byte_at(buf, p);
-                    st = if sb < 0x80 {
-                        u32::from(sb)
+                    if sb < 0x80 {
+                        st = u32::from(sb);
+                        st_len = 1;
                     } else {
-                        get_varint32(buf, p).0
-                    };
+                        let (v, l) = get_varint32(buf, p);
+                        st = v;
+                        st_len = l;
+                    }
                     if st < 12 || (st & 1) == 1 {
                         rc = -1;
                     } else {
@@ -340,9 +377,26 @@ impl RecordKey for SearchKey {
                     }
                 }
                 PreparedField::Null => {
-                    st = u32::from(byte_at(buf, p));
-                    let is_null_like =
-                        st == 0 || st == 10 || (st == 7 && read_f64_padded(buf, body).is_nan());
+                    let sb = byte_at(buf, p);
+                    if sb < 0x80 {
+                        st = u32::from(sb);
+                        st_len = 1;
+                    } else {
+                        let (v, l) = get_varint32(buf, p);
+                        st = v;
+                        st_len = l;
+                    }
+                    let is_null_like = if st == 0 || st == 10 || st == 11 {
+                        true
+                    } else if st == 7 {
+                        if d1.saturating_add(8) > n {
+                            self.corrupt = true;
+                            return 0;
+                        }
+                        read_f64_padded(buf, body).is_nan()
+                    } else {
+                        false
+                    };
                     rc = if is_null_like { 0 } else { 1 };
                 }
             }
@@ -355,9 +409,10 @@ impl RecordKey for SearchKey {
             }
             d1 = d1.saturating_add(serial_type_length(st));
             if d1 > n {
-                break;
+                self.corrupt = true;
+                return 0;
             }
-            idx1 += if st < 0x80 { 1 } else { varint_len(i64::from(st)) };
+            idx1 += st_len;
             if idx1 >= sz_hdr {
                 self.corrupt = true;
                 return 0;

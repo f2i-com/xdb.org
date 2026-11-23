@@ -214,7 +214,7 @@ pub fn call_core_scalar(
             if args.len() != 2 {
                 return Err(wrong_arity("instr"));
             }
-            instr_fn(&args[0], &args[1])
+            instr_fn(&args[0], &args[1], ctx)?
         }
         "replace" => {
             if args.len() != 3 {
@@ -251,10 +251,12 @@ pub fn call_core_scalar(
             if args.len() != 1 {
                 return Err(wrong_arity("zeroblob"));
             }
-            let n = int_value(&args[0]).max(0) as usize;
-            if n > ctx.limits.max_length {
+            let raw = int_value(&args[0]).max(0);
+            if raw > ctx.limits.max_length as i64 {
                 return Err(SqlError::too_big());
             }
+            let n = raw as usize;
+            ctx.charge_steps((n / 256) as u64 + 1)?;
             if let Some(m) = ctx.meter {
                 m.reserve_memory(n as u64)?;
                 m.release_memory(n as u64);
@@ -266,9 +268,15 @@ pub fn call_core_scalar(
                 return Err(wrong_arity("randomblob"));
             }
             ctx.require_pure("randomblob")?;
-            let n = int_value(&args[0]).max(1) as usize;
-            if n > ctx.limits.max_length {
+            let raw = int_value(&args[0]).max(1);
+            if raw > ctx.limits.max_length as i64 {
                 return Err(SqlError::too_big());
+            }
+            let n = raw as usize;
+            ctx.charge_steps((n / 64) as u64 + 1)?;
+            if let Some(m) = ctx.meter {
+                m.reserve_memory(n as u64)?;
+                m.release_memory(n as u64);
             }
             let mut out = vec![0u8; n];
             ctx.fill_random(&mut out);
@@ -349,9 +357,13 @@ pub fn call_core_scalar(
             if args.len() != 1 {
                 return Err(wrong_arity("sqlite_compileoption_get"));
             }
-            let n = int_value(&args[0]) as i32;
-            if n >= 0 && (n as usize) < COMPILE_OPTIONS.len() {
-                SqlValue::text(COMPILE_OPTIONS[n as usize])
+            let raw = int_value(&args[0]);
+            if let Ok(idx) = usize::try_from(raw) {
+                if idx < COMPILE_OPTIONS.len() {
+                    SqlValue::text(COMPILE_OPTIONS[idx])
+                } else {
+                    SqlValue::Null
+                }
             } else {
                 SqlValue::Null
             }
@@ -360,18 +372,21 @@ pub fn call_core_scalar(
             if !args.is_empty() {
                 return Err(wrong_arity("changes"));
             }
+            ctx.require_pure("changes")?;
             SqlValue::Int(ctx.changes)
         }
         "total_changes" => {
             if !args.is_empty() {
                 return Err(wrong_arity("total_changes"));
             }
+            ctx.require_pure("total_changes")?;
             SqlValue::Int(ctx.total_changes)
         }
         "last_insert_rowid" => {
             if !args.is_empty() {
                 return Err(wrong_arity("last_insert_rowid"));
             }
+            ctx.require_pure("last_insert_rowid")?;
             SqlValue::Int(ctx.last_insert_rowid)
         }
         _ => return Ok(None),
@@ -432,6 +447,11 @@ fn hex_fn(v: &SqlValue, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
     if out_len > ctx.limits.max_length {
         return Err(SqlError::too_big());
     }
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve(out_len as u64)?;
+    if out_len >= 256 {
+        ctx.charge_steps((out_len / 256) as u64)?;
+    }
     let mut out = Vec::with_capacity(out_len);
     for &b in bytes.iter() {
         out.push(HEX_UPPER[(b >> 4) as usize]);
@@ -453,15 +473,20 @@ fn unhex_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue>
     let Some(src) = text_bytes_of(&args[0]) else {
         return Ok(SqlValue::Null);
     };
-    let skip_chars: Option<Vec<u32>> = if args.len() == 2 {
+    let skip_chars: Option<std::collections::HashSet<u32>> = if args.len() == 2 {
         let Some(ign) = text_bytes_of(&args[1]) else {
             return Ok(SqlValue::Null);
         };
-        let mut chars = Vec::new();
+        let mut chars = std::collections::HashSet::new();
         let mut p = 0;
+        let mut ticks = 0u64;
         while p < ign.len() && ign[p] != 0 {
+            ticks += 1;
+            if (ticks & 255) == 0 {
+                ctx.charge_steps(1)?;
+            }
             let (cp, next) = utf8_read(&ign, p);
-            chars.push(cp);
+            chars.insert(cp);
             p = next;
         }
         Some(chars)
@@ -469,10 +494,18 @@ fn unhex_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue>
         None
     };
 
-    let mut out = Vec::with_capacity(src.len() / 2);
+    let cap = (src.len() / 2).min(ctx.limits.max_length);
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve(cap as u64)?;
+    let mut out = Vec::with_capacity(cap);
     let mut hi: Option<u8> = None;
     let mut i = 0;
+    let mut ticks = 0u64;
     while i < src.len() {
+        ticks += 1;
+        if (ticks & 255) == 0 {
+            ctx.charge_steps(1)?;
+        }
         let b = src[i];
         if let Some(v) = hex_val(b) {
             if let Some(h) = hi.take() {
@@ -584,6 +617,11 @@ fn quote_fn(v: &SqlValue, unistr: bool, ctx: &FunctionContext<'_>) -> SqlResult<
             if needed > ctx.limits.max_length {
                 return Err(SqlError::too_big());
             }
+            let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+            mem.reserve(needed as u64)?;
+            if needed >= 256 {
+                ctx.charge_steps((needed / 256) as u64)?;
+            }
             let mut out = Vec::with_capacity(b.len() * 2 + 3);
             out.extend_from_slice(b"X'");
             for &byte in b.iter() {
@@ -613,6 +651,11 @@ fn ascii_case_fn(v: &SqlValue, to_upper: bool, ctx: &FunctionContext<'_>) -> Sql
     };
     if bytes.len() > ctx.limits.max_length {
         return Err(SqlError::too_big());
+    }
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve(bytes.len() as u64)?;
+    if bytes.len() >= 256 {
+        ctx.charge_steps((bytes.len() / 256) as u64)?;
     }
     let mut out = bytes.into_owned();
     for b in &mut out {
@@ -668,8 +711,12 @@ fn substr_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue
         if p1 >= len || p2 <= 0 {
             return Ok(SqlValue::Blob(Box::new([])));
         }
-        let start = p1 as usize;
-        let take = (p2 as usize).min(bytes.len() - start);
+        let start = usize::try_from(p1).unwrap_or(bytes.len());
+        let take = usize::try_from(p2)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len().saturating_sub(start));
+        let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+        mem.reserve(take as u64)?;
         return Ok(SqlValue::Blob(bytes[start..start + take].into()));
     }
 
@@ -727,47 +774,96 @@ fn substr_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue
     if slice.len() > ctx.limits.max_length {
         return Err(SqlError::too_big());
     }
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve(slice.len() as u64)?;
     Ok(SqlValue::Text(slice.into()))
 }
 
 /// SQLite `instrFunc` (`func.c:412`): 1-based position (bytes for two BLOBs, chars otherwise).
-fn instr_fn(hay: &SqlValue, needle: &SqlValue) -> SqlValue {
+/// Uses O(N + M) KMP search with step metering so adversarial needles cannot cause O(N*M) DoS.
+fn instr_fn(hay: &SqlValue, needle: &SqlValue, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
     if hay.is_null() || needle.is_null() {
-        return SqlValue::Null;
+        return Ok(SqlValue::Null);
     }
     let is_blob = hay.is_blob() && needle.is_blob();
     let Some(h) = text_bytes_of(hay) else {
-        return SqlValue::Null;
+        return Ok(SqlValue::Null);
     };
     let Some(n) = text_bytes_of(needle) else {
-        return SqlValue::Null;
+        return Ok(SqlValue::Null);
     };
     if n.is_empty() {
-        return SqlValue::Int(1);
+        return Ok(SqlValue::Int(1));
     }
     if n.len() > h.len() {
-        return SqlValue::Int(0);
+        return Ok(SqlValue::Int(0));
     }
 
-    if is_blob {
-        for i in 0..=(h.len() - n.len()) {
-            if &h[i..i + n.len()] == n.as_ref() {
-                return SqlValue::Int((i + 1) as i64);
+    // Build KMP prefix table in O(M) with metering so `instr` is strictly linear-time.
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve((n.len().saturating_mul(std::mem::size_of::<usize>())) as u64)?;
+    let mut lps = vec![0usize; n.len()];
+    let mut len = 0usize;
+    let mut idx = 1usize;
+    while idx < n.len() {
+        if (idx & 255) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        if n[idx] == n[len] {
+            len += 1;
+            lps[idx] = len;
+            idx += 1;
+        } else if len != 0 {
+            len = lps[len - 1];
+        } else {
+            lps[idx] = 0;
+            idx += 1;
+        }
+    }
+
+    // Search haystack in O(N).
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut found_byte: Option<usize> = None;
+    while i < h.len() {
+        if (i & 255) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        if h[i] == n[j] {
+            i += 1;
+            j += 1;
+            if j == n.len() {
+                let start = i - j;
+                // For TEXT, SQLite matches only on UTF-8 character boundaries (non-continuation byte).
+                if is_blob || (h[start] & 0xc0) != 0x80 {
+                    found_byte = Some(start);
+                    break;
+                }
+                j = lps[j - 1];
             }
+        } else if j != 0 {
+            j = lps[j - 1];
+        } else {
+            i += 1;
         }
-        return SqlValue::Int(0);
     }
 
+    let Some(match_off) = found_byte else {
+        return Ok(SqlValue::Int(0));
+    };
+    if is_blob {
+        return Ok(SqlValue::Int((match_off + 1) as i64));
+    }
     let mut char_pos: i64 = 1;
-    let mut i = 0;
-    while i + n.len() <= h.len() {
-        if &h[i..i + n.len()] == n.as_ref() {
-            return SqlValue::Int(char_pos);
+    let mut p = 0usize;
+    while p < match_off {
+        if (p & 255) == 0 {
+            ctx.charge_steps(1)?;
         }
-        i = skip_utf8(&h, i);
+        p = skip_utf8(&h, p);
         char_pos += 1;
     }
-    SqlValue::Int(0)
+    Ok(SqlValue::Int(char_pos))
 }
 
 /// SQLite `replaceFunc` (`func.c:1302`).
@@ -794,7 +890,12 @@ fn replace_fn(
     let mut acc = ByteAccum::new(ctx.limits.max_length, false, ctx.meter);
     let mut i = 0;
     let mut last = 0;
+    let mut scan_ops = 0u64;
     while i + pat.len() <= src.len() {
+        scan_ops += 1;
+        if (scan_ops & 63) == 0 {
+            ctx.charge_steps((pat.len().max(1) as u64).min(64))?;
+        }
         if &src[i..i + pat.len()] == pat {
             acc.push_bytes(&src[last..i])?;
             acc.push_bytes(rep)?;
@@ -813,7 +914,7 @@ fn trim_fn(
     args: &[SqlValue],
     trim_left: bool,
     trim_right: bool,
-    _ctx: &FunctionContext<'_>,
+    ctx: &FunctionContext<'_>,
 ) -> SqlResult<SqlValue> {
     let Some(src) = text_bytes_of(&args[0]) else {
         return Ok(SqlValue::Null);
@@ -838,10 +939,15 @@ fn trim_fn(
 
     let mut start = 0;
     let mut end = src.len();
+    let mut ops = 0u64;
 
     if trim_left && !cut_chars.is_empty() {
         'outer_l: while start < end {
             for &ch in &cut_chars {
+                ops += 1;
+                if (ops & 127) == 0 {
+                    ctx.charge_steps(1)?;
+                }
                 if end - start >= ch.len() && &src[start..start + ch.len()] == ch {
                     start += ch.len();
                     continue 'outer_l;
@@ -854,6 +960,10 @@ fn trim_fn(
     if trim_right && !cut_chars.is_empty() {
         'outer_r: while end > start {
             for &ch in &cut_chars {
+                ops += 1;
+                if (ops & 127) == 0 {
+                    ctx.charge_steps(1)?;
+                }
                 if end - start >= ch.len() && &src[end - ch.len()..end] == ch {
                     end -= ch.len();
                     continue 'outer_r;

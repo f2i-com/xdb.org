@@ -149,6 +149,7 @@ pub fn atof(bytes: &[u8]) -> AtoFResult {
 
     // Exponent.
     if c == b'e' || c == b'E' {
+        let e_pos = i;
         i += 1;
         c = byte_at(i);
         let mut esign: i32 = 1;
@@ -176,7 +177,7 @@ pub fn atof(bytes: &[u8]) -> AtoFResult {
             }
             d += esign * exp;
         } else {
-            i -= 1;
+            i = e_pos;
             c = byte_at(i);
         }
     }

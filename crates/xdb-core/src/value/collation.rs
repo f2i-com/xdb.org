@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use super::utf::{sqlite_utf16_to_utf8, TextEncoding};
+use super::utf::{encode_utf8_to_stored_text, sqlite_utf16_to_utf8, TextEncoding};
 
 /// SQLite's three built-in collations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,11 +173,18 @@ impl Collation {
         }
     }
 
-    /// Compare two `TEXT` byte slices stored in the connection's UTF-8 form.
+    /// Compare two `TEXT` byte slices stored in the connection's UTF-8 form, honoring the
+    /// collation's database encoding (`BINARY` compares bytes in `UTF-16LE`/`UTF-16BE` when set).
     pub fn compare_utf8(&self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
-            Collation::Builtin { kind, .. } => {
-                compare_text_bytes(*kind, a, b, TextEncoding::Utf8)
+            Collation::Builtin { kind, encoding } => {
+                if *kind == BuiltinCollation::Binary && *encoding != TextEncoding::Utf8 {
+                    let ea = encode_utf8_to_stored_text(a, *encoding);
+                    let eb = encode_utf8_to_stored_text(b, *encoding);
+                    compare_bytes_binary(&ea, &eb)
+                } else {
+                    compare_text_bytes(*kind, a, b, TextEncoding::Utf8)
+                }
             }
             Collation::Custom { func, .. } => func(a, b),
         }

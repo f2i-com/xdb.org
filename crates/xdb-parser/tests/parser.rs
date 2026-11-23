@@ -248,3 +248,96 @@ fn parses_triggers_views_vtabs_and_expressions() {
         }
     ));
 }
+
+#[test]
+fn parser_hardening_utf8_depth_and_expression_boundaries() {
+    // Multi-byte UTF-8 after type quotes and in table names must never panic on byte slicing.
+    let ct_sql = "CREATE TABLE aaaaaaé (a [int] é, b TEXT ALWAYS, c \"varchar\" é)";
+    let Statement::CreateTable(ct) = parse_statement(ct_sql, &opts()).unwrap() else {
+        panic!("expected CreateTable");
+    };
+    let tbl = build_table(&ct, ct_sql, &BuildOptions::default()).unwrap();
+    assert_eq!(tbl.columns[0].decl_type, "int");
+    assert_eq!(tbl.columns[1].decl_type, "TEXT ALWAYS");
+    assert_eq!(tbl.columns[2].decl_type, "varchar");
+
+    let idx_sql = "CREATE INDEX idx_u ON aaaaaaé(a)";
+    let Statement::CreateIndex(ci) = parse_statement(idx_sql, &opts()).unwrap() else {
+        panic!("expected CreateIndex");
+    };
+    let idx = build_index(&ci, &tbl, &BuildOptions::default()).unwrap();
+    assert_eq!(idx.table, "aaaaaaé");
+
+    // max_expr_depth must apply to CAST, XDB :: casts, AND chains, and empty IN ().
+    let mut tight = xdb_opts();
+    tight.max_expr_depth = 5;
+    let deep_dcolon = format!("SELECT 1{}", "::int".repeat(12));
+    assert_eq!(
+        parse_statement(&deep_dcolon, &tight).unwrap_err().kind,
+        SqlParseErrorKind::Limit
+    );
+    let deep_cast = format!("SELECT {}1{}", "CAST(".repeat(10), " AS INT)".repeat(10));
+    assert_eq!(
+        parse_statement(&deep_cast, &tight).unwrap_err().kind,
+        SqlParseErrorKind::Limit
+    );
+    let deep_and = format!("SELECT 1{}", " AND 1".repeat(12));
+    assert_eq!(
+        parse_statement(&deep_and, &tight).unwrap_err().kind,
+        SqlParseErrorKind::Limit
+    );
+    let deep_in = format!("SELECT 1{}", " IN ()".repeat(12));
+    assert_eq!(
+        parse_statement(&deep_in, &tight).unwrap_err().kind,
+        SqlParseErrorKind::Limit
+    );
+
+    // parse_expression must reject trailing statements or SELECT clauses smuggled via `)`.
+    assert!(parse_expression("1); DROP TABLE x; --", &opts()).is_err());
+    assert!(parse_expression("1) ORDER BY (1", &opts()).is_err());
+    assert!(parse_expression("1) LIMIT (1", &opts()).is_err());
+
+    // max_parser_depth < 50 must actually be enforced (not silently raised to 50).
+    let mut tiny_stack = opts();
+    tiny_stack.max_parser_depth = 10;
+    let nested_parens = format!("SELECT {}1{}", "(".repeat(20), ")".repeat(20));
+    assert_eq!(
+        parse_statement(&nested_parens, &tiny_stack).unwrap_err().kind,
+        SqlParseErrorKind::Limit
+    );
+
+    // Dialect::Xdb tokenizer must classify ILIKE as tk::LIKE_KW.
+    let ilike_toks = parser_tokens("a ILIKE b", Dialect::Xdb);
+    assert_eq!(ilike_toks.len(), 3);
+    assert_eq!(ilike_toks[1].kind, tk::LIKE_KW);
+}
+
+#[test]
+fn parser_pass2_comment_metering_and_natural_join_rejection() {
+    // Huge run of leading comments must be metered in parse_statement_at_metered.
+    let meter = BudgetMeter::new(ResourceLimits {
+        max_steps: Some(25),
+        max_memory_bytes: None,
+        max_page_reads: None,
+    });
+    let comments = "/* x */ ".repeat(200);
+    let err = parse_statement_at_metered(&comments, 0, &opts(), &meter).unwrap_err();
+    assert_eq!(err.kind, SqlParseErrorKind::ResourceLimit);
+    assert_eq!(err.resource_limit.unwrap().kind, LimitKind::Steps);
+
+    // Trailing semicolons/comments after a statement must also be metered in parse_statement_metered.
+    let meter2 = BudgetMeter::new(ResourceLimits {
+        max_steps: Some(30),
+        max_memory_bytes: None,
+        max_page_reads: None,
+    });
+    let trailing = format!("SELECT 1{}", "; /* x */ ".repeat(200));
+    let err2 = parse_statement_metered(&trailing, &opts(), &meter2).unwrap_err();
+    assert_eq!(err2.kind, SqlParseErrorKind::ResourceLimit);
+    assert_eq!(err2.resource_limit.unwrap().kind, LimitKind::Steps);
+
+    // SQLite forbids combining NATURAL JOIN with ON or USING.
+    assert!(parse_statement("SELECT * FROM a NATURAL JOIN b ON a.id = b.id", &opts()).is_err());
+    assert!(parse_statement("SELECT * FROM a NATURAL LEFT JOIN b USING (id)", &opts()).is_err());
+    assert!(parse_statement("SELECT * FROM a NATURAL JOIN b", &opts()).is_ok());
+}

@@ -85,6 +85,7 @@ impl SqliteConnection {
     /// case it joins the active transaction). Every DDL/DML operation executes through the
     /// normal metered engine so sandbox resource limits are strictly enforced.
     pub fn seed_json(&mut self, seed_json: &str) -> SqliteResult<SeedReport> {
+        self.check_open()?;
         let trimmed = seed_json.trim();
         if trimmed.is_empty() {
             return Ok(SeedReport::default());
@@ -108,7 +109,12 @@ impl SqliteConnection {
         match result {
             Ok(report) => {
                 if started_tx {
-                    self.execute("COMMIT")?;
+                    if let Err(err) = self.execute("COMMIT") {
+                        if self.in_transaction() {
+                            let _ = self.execute("ROLLBACK");
+                        }
+                        return Err(err);
+                    }
                 }
                 Ok(report)
             }
@@ -514,10 +520,10 @@ fn infer_value_type(v: &JsonVal) -> InferredType {
         JsonVal::Real(_) => InferredType::Real,
         JsonVal::Str(_) | JsonVal::Array(_) => InferredType::Text,
         JsonVal::Object(entries) if entries.len() == 1 => {
-            if entries[0].0 == "__blob" || entries[0].0 == "hex" {
-                if matches!(seed_json_to_sql_value(v), SqlValue::Blob(_)) {
-                    return InferredType::Blob;
-                }
+            if (entries[0].0 == "__blob" || entries[0].0 == "hex")
+                && matches!(seed_json_to_sql_value(v), SqlValue::Blob(_))
+            {
+                return InferredType::Blob;
             }
             InferredType::Text
         }
@@ -535,7 +541,8 @@ fn infer_columns_from_rows(
 
     if let Some(cols) = explicit_columns {
         for c in cols {
-            if seen.insert(c.clone()) {
+            let key = c.to_ascii_lowercase();
+            if seen.insert(key) {
                 order.push(c.clone());
                 types.push(InferredType::Unknown);
             }
@@ -547,19 +554,19 @@ fn infer_columns_from_rows(
             JsonVal::Object(fields) => {
                 for (k, v) in fields {
                     let t = infer_value_type(v);
-                    if let Some(idx) = order.iter().position(|existing| existing == k) {
+                    if let Some(idx) = order.iter().position(|existing| existing.eq_ignore_ascii_case(k)) {
                         types[idx] = types[idx].merge(t);
                     } else {
-                        seen.insert(k.clone());
+                        seen.insert(k.to_ascii_lowercase());
                         order.push(k.clone());
                         types.push(t);
                     }
                 }
             }
             JsonVal::Array(cells) => {
-                if let Some(cols) = explicit_columns {
+                if explicit_columns.is_some() {
                     for (i, cell) in cells.iter().enumerate() {
-                        if i < cols.len() {
+                        if i < types.len() {
                             types[i] = types[i].merge(infer_value_type(cell));
                         }
                     }
@@ -666,7 +673,7 @@ pub fn seed_json_to_sql_value(v: &JsonVal) -> SqlValue {
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let raw = s.as_bytes();
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(raw.len() / 2);

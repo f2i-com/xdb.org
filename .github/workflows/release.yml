@@ -24,13 +24,13 @@ jobs:
       - name: Validate tag matches Cargo.toml version
         id: ver
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
           WS_VER="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           WASM_VER="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' crates/xdb-wasm/Cargo.toml | head -n 1)"
-          if [[ "$TAG" == v* ]]; then
+          test "$WS_VER" = "$WASM_VER"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
             test "$VERSION" = "$WS_VER"
-            test "$VERSION" = "$WASM_VER"
           else
             VERSION="$WS_VER"
             TAG="v$VERSION"
@@ -40,17 +40,22 @@ jobs:
 
       - name: Install Rust 1.92.0 + wasm32 target
         run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup toolchain install 1.92.0 --profile minimal --component clippy --no-self-update
           rustup target add wasm32-unknown-unknown --toolchain 1.92.0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Run full workspace tests (-Dwarnings)
+      - name: Run full workspace tests & clippy (-Dwarnings)
         env:
           RUSTFLAGS: -Dwarnings
-        run: cargo +1.92.0 test --locked --workspace
+        run: |
+          cargo +1.92.0 test --locked --workspace --all-targets
+          cargo +1.92.0 clippy --locked --workspace --all-targets -- -D warnings
+          cargo +1.92.0 test --manifest-path crates/xdb-wasm/Cargo.toml --locked
+          cargo +1.92.0 clippy --manifest-path crates/xdb-wasm/Cargo.toml --locked --all-targets -- -D warnings
+          cargo +1.92.0 clippy --manifest-path crates/xdb-wasm/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
 
       - name: Install wasm-bindgen-cli & Binaryen
         run: |
@@ -58,6 +63,8 @@ jobs:
           npm install --global binaryen@125.0.0
 
       - name: Build & verify xdb-wasm release artifacts
+        env:
+          REQUIRE_WASM_OPT: "1"
         run: bash crates/xdb-wasm/build-wasm.sh crates/xdb-wasm/dist
 
       - name: Publish GitHub Release

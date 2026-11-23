@@ -63,6 +63,16 @@ pub fn varint_size(v: u64) -> usize {
 /// Encode `values` as a SQLite 3 binary record (`sqlite3VdbeMakeRecord`) for database
 /// encoding `enc` (assuming schema format 4, where `0` and `1` use serial types 8 and 9).
 pub fn encode_record(values: &[SqlValue], enc: TextEncoding) -> Vec<u8> {
+    encode_record_with_format(values, enc, 4)
+}
+
+/// Encode `values` as a SQLite 3 binary record honoring `schema_format` (`< 4` avoids
+/// serial types 8 and 9 for integer `0` and `1`).
+pub fn encode_record_with_format(
+    values: &[SqlValue],
+    enc: TextEncoding,
+    schema_format: u32,
+) -> Vec<u8> {
     let mut serials: Vec<u64> = Vec::with_capacity(values.len());
     let mut encoded_texts: Vec<Option<Vec<u8>>> = Vec::with_capacity(values.len());
     let mut header_body_len = 0usize;
@@ -71,12 +81,13 @@ pub fn encode_record(values: &[SqlValue], enc: TextEncoding) -> Vec<u8> {
     for v in values {
         let (st, blen, txt) = match v {
             SqlValue::Null => (0u64, 0usize, None),
-            SqlValue::Int(0) => (8u64, 0usize, None),
-            SqlValue::Int(1) => (9u64, 0usize, None),
+            SqlValue::Int(0) if schema_format >= 4 => (8u64, 0usize, None),
+            SqlValue::Int(1) if schema_format >= 4 => (9u64, 0usize, None),
             SqlValue::Int(i) => {
                 let (s, l) = int_serial_type(*i);
                 (s, l, None)
             }
+            SqlValue::Real(r) if r.is_nan() => (0u64, 0usize, None),
             SqlValue::Real(_) => (7u64, 8usize, None),
             SqlValue::Text(bytes) => {
                 if enc == TextEncoding::Utf8 {
@@ -118,8 +129,10 @@ pub fn encode_record(values: &[SqlValue], enc: TextEncoding) -> Vec<u8> {
 
     for (idx, v) in values.iter().enumerate() {
         match v {
-            SqlValue::Null | SqlValue::Int(0) | SqlValue::Int(1) => {}
+            SqlValue::Null => {}
+            SqlValue::Int(_) if matches!(serials[idx], 8 | 9) => {}
             SqlValue::Int(i) => write_int_be(*i, serials[idx], &mut out),
+            SqlValue::Real(r) if r.is_nan() => {}
             SqlValue::Real(r) => out.extend_from_slice(&r.to_bits().to_be_bytes()),
             SqlValue::Text(bytes) => {
                 if let Some(ref stored) = encoded_texts[idx] {

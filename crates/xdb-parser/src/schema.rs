@@ -1518,14 +1518,13 @@ pub fn build_table(
         .indexes
         .iter()
         .position(|x| x.origin == IndexOrigin::PrimaryKey);
-    let n_cols = st.cols.len();
     for col in &mut st.cols {
         if !col.primary_key {
             col.pk = 0;
         } else if let Some(pi) = pk_idx {
             let pk_cols = &st.indexes[pi].columns;
             let mut k = 1usize;
-            while k <= n_cols && (k > pk_cols.len() || pk_cols[k - 1].cid != col.cid as i32) {
+            while k <= pk_cols.len() && pk_cols[k - 1].cid != col.cid as i32 {
                 k += 1;
             }
             col.pk = k;
@@ -1605,8 +1604,11 @@ pub fn build_index(
     let schema_mode = options.schema;
     let sort_mask = options.file_format >= 4;
     if !schema_mode
-        && table.name.len() >= 7
-        && same_name(&table.name[..7], "sqlite_")
+        && table
+            .name
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"sqlite_"))
     {
         return Err(def_err(
             format!("table {} may not be indexed", table.name),

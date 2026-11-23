@@ -51,6 +51,7 @@ pub fn blob_compare(a: &[u8], b: &[u8]) -> Ordering {
 fn class_rank(v: &SqlValue) -> u8 {
     match v {
         SqlValue::Null => 0,
+        SqlValue::Real(r) if r.is_nan() => 0,
         SqlValue::Int(_) | SqlValue::Real(_) => 1,
         SqlValue::Text(_) => 2,
         SqlValue::Blob(_) => 3,
@@ -67,11 +68,24 @@ pub fn mem_compare(a: &SqlValue, b: &SqlValue, coll: Option<&Collation>) -> Orde
     }
     match (a, b) {
         (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+        (SqlValue::Null, SqlValue::Real(r)) | (SqlValue::Real(r), SqlValue::Null)
+            if r.is_nan() =>
+        {
+            Ordering::Equal
+        }
         (SqlValue::Int(x), SqlValue::Int(y)) => x.cmp(y),
         (SqlValue::Int(x), SqlValue::Real(y)) => int_float_compare(*x, *y),
         (SqlValue::Real(x), SqlValue::Int(y)) => int_float_compare(*y, *x).reverse(),
         (SqlValue::Real(x), SqlValue::Real(y)) => {
-            if x < y {
+            if x.is_nan() {
+                if y.is_nan() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Less
+                }
+            } else if y.is_nan() {
+                Ordering::Greater
+            } else if x < y {
                 Ordering::Less
             } else if x > y {
                 Ordering::Greater

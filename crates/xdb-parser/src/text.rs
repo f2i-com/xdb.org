@@ -119,34 +119,44 @@ pub fn stored_type(raw_type: Option<&str>) -> StoredType {
     let bytes = raw.as_bytes();
     let mut n = bytes.len();
     if n >= 16 && matches_at(raw, n - 6, "always") {
-        n -= 6;
-        while n > 0 && is_sql_space(bytes[n - 1]) {
-            n -= 1;
+        let mut m = n - 6;
+        while m > 0 && is_sql_space(bytes[m - 1]) {
+            m -= 1;
         }
-        if n >= 9 && matches_at(raw, n - 9, "generated") {
-            n -= 9;
-            while n > 0 && is_sql_space(bytes[n - 1]) {
-                n -= 1;
+        if m >= 9 && matches_at(raw, m - 9, "generated") {
+            m -= 9;
+            while m > 0 && is_sql_space(bytes[m - 1]) {
+                m -= 1;
             }
+            n = m;
         }
     }
     let mut z = &raw[..n];
     if n >= 3 {
         let zb = z.as_bytes();
-        // sqlite3DequoteToken (util.c:383): strip first and last char when no other quote inside
-        if is_quote_char(zb[0]) {
-            let mut inner = true;
-            let mut i = 1;
-            while i < n - 1 {
-                if is_quote_char(zb[i]) {
-                    inner = false;
-                    break;
+        // sqlite3DequoteToken (util.c:383): strip matching outer quotes when no inner quotes exist.
+        let expected_close = match zb[0] {
+            b'"' => Some(b'"'),
+            b'\'' => Some(b'\''),
+            b'`' => Some(b'`'),
+            b'[' => Some(b']'),
+            _ => None,
+        };
+        if let Some(close) = expected_close {
+            if zb[n - 1] == close {
+                let mut inner = true;
+                let mut i = 1;
+                while i < n - 1 {
+                    if is_quote_char(zb[i]) || zb[i] == close {
+                        inner = false;
+                        break;
+                    }
+                    i += 1;
                 }
-                i += 1;
-            }
-            if inner {
-                z = &z[1..n - 1];
-                n -= 2;
+                if inner {
+                    z = &z[1..n - 1];
+                    n -= 2;
+                }
             }
         }
         for &std_ty in StandardType::ALL {

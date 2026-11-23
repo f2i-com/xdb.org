@@ -9,7 +9,7 @@ use xdb_core::value::{
 };
 
 use crate::errors::{SqlError, SqlResult};
-use crate::functions::json::{json_value_from_sql, render_json_compact};
+use crate::functions::json::json_value_from_sql;
 use crate::functions::FunctionContext;
 use crate::utf8::{text_bytes_of, value_byte_len};
 
@@ -47,12 +47,10 @@ pub trait AggregateAcc: std::fmt::Debug {
 pub fn is_builtin_aggregate(lower_name: &str, arity: usize, star: bool) -> bool {
     match lower_name {
         "count" => star || arity <= 1,
-        "sum" | "total" | "avg" | "median" | "json_group_array" | "jsonb_group_array" => {
-            !star && arity == 1
-        }
+        "sum" | "total" | "avg" | "median" | "json_group_array" => !star && arity == 1,
         "min" | "max" => !star && arity == 1,
         "group_concat" => !star && (arity == 1 || arity == 2),
-        "string_agg" | "json_group_object" | "jsonb_group_object" => !star && arity == 2,
+        "string_agg" | "json_group_object" => !star && arity == 2,
         "percentile" | "percentile_cont" | "percentile_disc" => !star && arity == 2,
         _ => false,
     }
@@ -445,6 +443,14 @@ impl AggregateAcc for GroupConcatAcc {
             self.buf.clear();
             return Ok(());
         }
+        if let Some(m) = ctx.meter {
+            let total = (self.buf.len() + add_len + self.items.len() * 16) as u64;
+            m.reserve_memory(total)?;
+            m.release_memory(total);
+            if add_len >= 256 {
+                m.charge_steps((add_len / 256) as u64)?;
+            }
+        }
         if let Some(ref sep) = sep_bytes {
             self.buf.extend_from_slice(sep);
         }
@@ -524,15 +530,27 @@ impl PercentileAcc {
 }
 
 impl AggregateAcc for PercentileAcc {
-    fn step(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
+    fn step(&mut self, args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<()> {
         if self.kind != PercentileKind::Median {
             let p_arg = &args[1];
-            if p_arg.is_null() {
-                return Err(SqlError::runtime(
-                    "2nd argument to percentile() is not a number",
-                ));
-            }
-            let p_val = real_value(p_arg);
+            let p_val = match p_arg {
+                SqlValue::Int(i) => *i as f64,
+                SqlValue::Real(r) if r.is_finite() => *r,
+                SqlValue::Text(b) => match xdb_core::value::apply_numeric_affinity(b, false) {
+                    Some(SqlValue::Int(i)) => i as f64,
+                    Some(SqlValue::Real(r)) if r.is_finite() => r,
+                    _ => {
+                        return Err(SqlError::runtime(
+                            "2nd argument to percentile() is not a number",
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(SqlError::runtime(
+                        "2nd argument to percentile() is not a number",
+                    ));
+                }
+            };
             let frac = match self.kind {
                 PercentileKind::Percentile => {
                     if !(0.0..=100.0).contains(&p_val) {
@@ -583,19 +601,33 @@ impl AggregateAcc for PercentileAcc {
             }
             SqlValue::Null => {}
         }
+        if let Some(m) = ctx.meter {
+            let total = (self.values.len().saturating_mul(std::mem::size_of::<f64>())) as u64;
+            if total > 0 && self.values.len().is_multiple_of(32) {
+                m.reserve_memory(total)?;
+                m.release_memory(total);
+            }
+        }
         Ok(())
     }
 
-    fn value(&self, _ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
+    fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
         if self.values.is_empty() {
             return Ok(SqlValue::Null);
         }
         let Some(frac) = self.p else {
             return Ok(SqlValue::Null);
         };
+        let n = self.values.len();
+        if let Some(m) = ctx.meter {
+            let total = (n.saturating_mul(std::mem::size_of::<f64>())) as u64;
+            m.reserve_memory(total)?;
+            m.release_memory(total);
+            let sort_steps = ((n as u64) * (usize::BITS as u64 - n.leading_zeros() as u64)).max(1);
+            m.charge_steps((sort_steps / 16).max(1))?;
+        }
         let mut sorted = self.values.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
-        let n = sorted.len();
         if self.kind == PercentileKind::Disc {
             let idx = if frac <= 0.0 {
                 0
@@ -624,18 +656,30 @@ impl AggregateAcc for PercentileAcc {
 #[derive(Debug)]
 struct JsonGroupArrayAcc {
     items: Vec<crate::functions::json::JsonVal>,
+    est_bytes: u64,
 }
 
 impl JsonGroupArrayAcc {
     fn new() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Vec::new(),
+            est_bytes: 0,
+        }
     }
 }
 
 impl AggregateAcc for JsonGroupArrayAcc {
     fn step(&mut self, args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<()> {
         let is_json = ctx.arg_is_json(0);
-        self.items.push(json_value_from_sql(&args[0], is_json)?);
+        let jv = json_value_from_sql(&args[0], is_json)?;
+        self.est_bytes = self
+            .est_bytes
+            .saturating_add(crate::utf8::estimate_value_bytes(&args[0]));
+        if let Some(m) = ctx.meter {
+            m.reserve_memory(self.est_bytes)?;
+            m.release_memory(self.est_bytes);
+        }
+        self.items.push(jv);
         Ok(())
     }
 
@@ -643,32 +687,35 @@ impl AggregateAcc for JsonGroupArrayAcc {
         true
     }
 
-    fn inverse(&mut self, _args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
+    fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
         if !self.items.is_empty() {
             self.items.remove(0);
+            self.est_bytes = self
+                .est_bytes
+                .saturating_sub(crate::utf8::estimate_value_bytes(&args[0]));
         }
         Ok(())
     }
 
     fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
-        let mut out = String::new();
-        render_json_compact(&crate::functions::json::JsonVal::Array(self.items.clone()), &mut out);
-        if out.len() > ctx.limits.max_length {
-            return Err(SqlError::too_big());
-        }
-        Ok(SqlValue::text(out))
+        crate::functions::json::render_json_value_metered(
+            &crate::functions::json::JsonVal::Array(self.items.clone()),
+            ctx,
+        )
     }
 }
 
 #[derive(Debug)]
 struct JsonGroupObjectAcc {
     entries: Vec<(String, crate::functions::json::JsonVal)>,
+    est_bytes: u64,
 }
 
 impl JsonGroupObjectAcc {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            est_bytes: 0,
         }
     }
 }
@@ -680,6 +727,13 @@ impl AggregateAcc for JsonGroupObjectAcc {
         };
         let key = String::from_utf8_lossy(&k_bytes).into_owned();
         let val = json_value_from_sql(&args[1], ctx.arg_is_json(1))?;
+        self.est_bytes = self
+            .est_bytes
+            .saturating_add(key.len() as u64 + crate::utf8::estimate_value_bytes(&args[1]) + 32);
+        if let Some(m) = ctx.meter {
+            m.reserve_memory(self.est_bytes)?;
+            m.release_memory(self.est_bytes);
+        }
         self.entries.push((key, val));
         Ok(())
     }
@@ -690,21 +744,19 @@ impl AggregateAcc for JsonGroupObjectAcc {
 
     fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
         if !args[0].is_null() && !self.entries.is_empty() {
-            self.entries.remove(0);
+            let (k, _) = self.entries.remove(0);
+            self.est_bytes = self
+                .est_bytes
+                .saturating_sub(k.len() as u64 + crate::utf8::estimate_value_bytes(&args[1]) + 32);
         }
         Ok(())
     }
 
     fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
-        let mut out = String::new();
-        render_json_compact(
+        crate::functions::json::render_json_value_metered(
             &crate::functions::json::JsonVal::Object(self.entries.clone()),
-            &mut out,
-        );
-        if out.len() > ctx.limits.max_length {
-            return Err(SqlError::too_big());
-        }
-        Ok(SqlValue::text(out))
+            ctx,
+        )
     }
 }
 

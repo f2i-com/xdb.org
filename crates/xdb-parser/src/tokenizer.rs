@@ -137,7 +137,9 @@ const fn char_class(c: u8) -> u8 {
 /// True if `bytes[i..i+5]` is ASCII case-insensitively `"ilike"`.
 #[inline]
 pub fn is_ilike(bytes: &[u8], i: usize) -> bool {
-    bytes.get(i..i + 5).is_some_and(|s| s.eq_ignore_ascii_case(b"ilike"))
+    i.checked_add(5)
+        .and_then(|end| bytes.get(i..end))
+        .is_some_and(|s| s.eq_ignore_ascii_case(b"ilike"))
 }
 
 /// Effective end of SQL input as SQLite sees it: index of the first NUL byte, or `sql.len()`.
@@ -736,6 +738,12 @@ pub fn parser_tokens(sql: &str, dialect: Dialect) -> Vec<Token> {
         if t != tk::SPACE && t != tk::COMMENT {
             if t == tk::WINDOW || t == tk::OVER || t == tk::FILTER {
                 t = classify_context_keyword(&mut probe, t, end, last);
+            } else if t == tk::ID
+                && dialect == Dialect::Xdb
+                && end - i == 5
+                && is_ilike(sql.as_bytes(), i)
+            {
+                t = classify_ilike(&mut probe, end);
             }
             out.push(Token {
                 kind: t,

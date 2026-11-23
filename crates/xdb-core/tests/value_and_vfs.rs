@@ -203,3 +203,155 @@ fn memory_vfs_locking_and_sandbox_quotas() {
     assert!(h1.lock(LockLevel::Exclusive).unwrap());
     assert_eq!(h1.lock_level(), LockLevel::Exclusive);
 }
+
+#[test]
+fn memory_vfs_quota_and_unlinked_open_handle_accounting() {
+    let vfs = MemoryVfs::new(MemoryVfsOptions {
+        lock_manager: None,
+        max_file_size: 100,
+        max_total_bytes: Some(100),
+    });
+
+    // set_file exceeding quota must not leave behind a phantom empty file.
+    let err = vfs.set_file("too_big.db", vec![0u8; 101]).unwrap_err();
+    assert_eq!(err.code, IoErrorCode::Full);
+    assert!(!vfs.exists("too_big.db").unwrap());
+    assert_eq!(vfs.total_bytes(), 0);
+
+    // Deleting an open file must keep its bytes charged until the last handle closes.
+    let mut h1 = vfs.open("live.db", OpenFlags::create(FileKind::MainDb)).unwrap();
+    h1.write(&[1u8; 60], 0).unwrap();
+    assert_eq!(vfs.total_bytes(), 60);
+    vfs.delete("live.db", false).unwrap();
+    assert!(!vfs.exists("live.db").unwrap());
+    assert_eq!(vfs.total_bytes(), 60);
+
+    // Another file cannot bypass the aggregate quota while the unlinked handle holds 60B.
+    let mut h2 = vfs.open("other.db", OpenFlags::create(FileKind::MainDb)).unwrap();
+    let err = h2.write(&[2u8; 41], 0).unwrap_err();
+    assert_eq!(err.code, IoErrorCode::Full);
+    h2.write(&[2u8; 40], 0).unwrap();
+    assert_eq!(vfs.total_bytes(), 100);
+
+    // Truncating or closing the unlinked handle updates only its own bytes, never corrupting h2.
+    h1.truncate(10).unwrap();
+    assert_eq!(vfs.total_bytes(), 50);
+    h1.close().unwrap();
+    assert_eq!(vfs.total_bytes(), 40);
+    h2.close().unwrap();
+    assert_eq!(vfs.total_bytes(), 40);
+    vfs.delete("other.db", false).unwrap();
+    assert_eq!(vfs.total_bytes(), 0);
+}
+
+#[test]
+fn lock_upgrade_shared_to_exclusive_holds_pending_against_new_readers() {
+    let lm = LockManager::new();
+    let mut r1 = lm.open_handle("db");
+    let mut r2 = lm.open_handle("db");
+    let mut r3 = lm.open_handle("db");
+
+    assert!(r1.lock(LockLevel::Shared).unwrap());
+    assert!(r2.lock(LockLevel::Shared).unwrap());
+    // Direct SHARED -> EXCLUSIVE while r2 holds SHARED must acquire PENDING and block new readers.
+    assert!(!r1.lock(LockLevel::Exclusive).unwrap());
+    assert_eq!(r1.level(), LockLevel::Pending);
+    assert!(!r3.lock(LockLevel::Shared).unwrap());
+
+    r2.unlock(LockLevel::None).unwrap();
+    assert!(r1.lock(LockLevel::Exclusive).unwrap());
+    assert_eq!(r1.level(), LockLevel::Exclusive);
+}
+
+#[test]
+fn budget_meter_overflow_safe_and_non_wrapping() {
+    use xdb_core::{BudgetMeter, LimitKind, Meter, ResourceLimits};
+
+    let m_steps = BudgetMeter::new(ResourceLimits {
+        max_steps: Some(100),
+        max_memory_bytes: None,
+        max_page_reads: None,
+    });
+    m_steps.charge_steps(50).unwrap();
+    // Adding u64::MAX must not wrap around to a value <= 100.
+    let err = m_steps.charge_steps(u64::MAX).unwrap_err();
+    assert_eq!(err.kind, LimitKind::Steps);
+    assert_eq!(m_steps.usage().steps, 50);
+
+    let m_mem = BudgetMeter::new(ResourceLimits {
+        max_steps: None,
+        max_memory_bytes: Some(100),
+        max_page_reads: None,
+    });
+    m_mem.reserve_memory(50).unwrap();
+    let err = m_mem.reserve_memory(u64::MAX).unwrap_err();
+    assert_eq!(err.kind, LimitKind::Memory);
+    assert_eq!(m_mem.usage().memory_bytes, 50);
+}
+
+#[test]
+fn value_utf16_binary_collation_nan_and_fp_edge_cases() {
+    // SQLite UTF-16 BINARY ordering compares UTF-16 code units:
+    // U+10000 (surrogate 0xD800 0xDC00) < U+E000 (0xE000) in UTF-16, opposite of UTF-8!
+    let utf16_bin = Collation::builtin(BuiltinCollation::Binary, xdb_core::TextEncoding::Utf16Le);
+    let utf8_bin = Collation::builtin(BuiltinCollation::Binary, xdb_core::TextEncoding::Utf8);
+    assert_eq!(
+        utf8_bin.compare_utf8("\u{10000}".as_bytes(), "\u{E000}".as_bytes()),
+        Ordering::Greater
+    );
+    assert_eq!(
+        utf16_bin.compare_utf8("\u{10000}".as_bytes(), "\u{E000}".as_bytes()),
+        Ordering::Less
+    );
+
+    // SQLite ticket #3922: Real(-2^63) has fractional-safe exact representation as float but
+    // must_be_int rejects -9223372036854775808.0 just like SQLite's sqlite3VdbeIntValue / mustBeInt.
+    assert_eq!(must_be_int(&SqlValue::Real(-9223372036854775808.0)), None);
+    assert_eq!(must_be_int(&SqlValue::Real(42.0)), Some(42));
+
+    // atof trailing exponent sign without digits stops before 'e' (matching C SQLite).
+    let res = atof(b"1e+");
+    assert_eq!(res.value, 1.0);
+    assert_eq!(res.end, 1);
+    assert_eq!(atof(b"1e-").end, 1);
+
+    // fp_core edge cases must never panic with overflow-checks=true.
+    assert_eq!(fp10_convert2_full(0, 0), 0.0);
+    let dec = fp_decode(1.0, i32::MIN, 0);
+    assert_eq!(dec.special, FpSpecial::Finite);
+
+    // mem_compare strict weak ordering if a raw Real(NaN) ever slips in.
+    let nan = SqlValue::Real(f64::NAN);
+    assert_eq!(mem_compare(&nan, &SqlValue::Null, Some(&utf8_bin)), Ordering::Equal);
+    assert_eq!(mem_compare(&SqlValue::Null, &nan, Some(&utf8_bin)), Ordering::Equal);
+    assert_eq!(mem_compare(&nan, &SqlValue::Int(0), Some(&utf8_bin)), Ordering::Less);
+    assert_eq!(mem_compare(&SqlValue::Int(0), &nan, Some(&utf8_bin)), Ordering::Greater);
+}
+
+#[test]
+fn memory_vfs_lock_key_matches_open_and_tracks_recreate() {
+    let lm = LockManager::new();
+    let vfs = MemoryVfs::new(MemoryVfsOptions {
+        lock_manager: Some(lm.clone()),
+        max_file_size: 1024 * 1024,
+        max_total_bytes: None,
+    });
+
+    let mut f1 = vfs.open("app.db", OpenFlags::create(FileKind::MainDb)).unwrap();
+    let k1 = vfs.lock_key("app.db");
+    assert!(f1.lock(LockLevel::Shared).unwrap());
+    assert!(f1.lock(LockLevel::Exclusive).unwrap());
+
+    // An external handle created via `vfs.lock_key("app.db")` must collide with `f1`'s lock!
+    let mut ext = lm.open_handle(&k1);
+    assert!(!ext.lock(LockLevel::Shared).unwrap());
+    f1.unlock(LockLevel::None).unwrap();
+    assert!(ext.lock(LockLevel::Shared).unwrap());
+    ext.unlock(LockLevel::None).unwrap();
+
+    // Unlink and recreate at the same path -> new node gets a distinct lock key.
+    vfs.delete("app.db", false).unwrap();
+    let _f2 = vfs.open("app.db", OpenFlags::create(FileKind::MainDb)).unwrap();
+    let k2 = vfs.lock_key("app.db");
+    assert_ne!(k1, k2);
+}

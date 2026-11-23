@@ -475,6 +475,12 @@ pub fn str_appendf(
                     digits.push_str(suffix);
                 }
                 if precision > 0 && (precision as usize) > digits.len() {
+                    let est = (precision as usize).saturating_add(if c_thousand {
+                        (precision as usize) / 3
+                    } else {
+                        0
+                    });
+                    acc.check_scratch(est)?;
                     let pad = precision as usize - digits.len();
                     let mut padded = String::with_capacity(precision as usize);
                     for _ in 0..pad {
@@ -485,8 +491,10 @@ pub fn str_appendf(
                 }
                 if c_thousand && digits.len() > 3 {
                     let len = digits.len();
+                    let grouped_len = len.saturating_add(len / 3);
+                    acc.check_scratch(grouped_len)?;
                     let mut k = ((len - 1) % 3) + 1;
-                    let mut grouped = String::with_capacity(len + len / 3);
+                    let mut grouped = String::with_capacity(grouped_len);
                     grouped.push_str(&digits[..k]);
                     while k < len {
                         grouped.push(',');
@@ -608,6 +616,11 @@ pub fn str_appendf(
             }
             XType::EscapeQ | XType::EscapeBigQ | XType::EscapeW => {
                 let t = a.text();
+                if let Some(raw) = t.as_deref() {
+                    let worst_factor = if flag_alternateform { 6usize } else { 2usize };
+                    let est = raw.len().saturating_mul(worst_factor).saturating_add(16);
+                    acc.check_scratch(est.min(acc.limit))?;
+                }
                 out_bytes = escape_quote(
                     acc.limit,
                     t.as_deref(),
@@ -816,13 +829,15 @@ fn render_float(
 
     let length = out.len() as i32;
     if length < width {
+        let w_usize = width as usize;
+        acc.check_scratch(w_usize)?;
         let n_pad = (width - length) as usize;
         if flag_leftjustify {
             for _ in 0..n_pad {
                 out.push(' ');
             }
         } else if !flag_zeropad {
-            let mut padded = String::with_capacity(width as usize);
+            let mut padded = String::with_capacity(w_usize);
             for _ in 0..n_pad {
                 padded.push(' ');
             }
@@ -830,7 +845,7 @@ fn render_float(
             out = padded;
         } else {
             let adj = usize::from(prefix != 0);
-            let mut padded = String::with_capacity(width as usize);
+            let mut padded = String::with_capacity(w_usize);
             padded.push_str(&out[..adj]);
             for _ in 0..n_pad {
                 padded.push('0');
@@ -904,9 +919,11 @@ fn escape_quote(
             }
         }
         if n_ctrl > 0 || xtype == XType::EscapeQ {
-            n += n_back + 5 * n_ctrl;
+            n = n
+                .saturating_add(n_back)
+                .saturating_add(n_ctrl.saturating_mul(5));
             if xtype == XType::EscapeBigQ {
-                n += 10;
+                n = n.saturating_add(10);
                 need_quote = 2;
             }
         } else {

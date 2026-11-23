@@ -185,9 +185,9 @@ pub fn recover_wal(file: &mut dyn VfsFile, file_size: u64) -> IoResult<WalRecove
     }
 
     let sz_frame = page_size as u64 + WAL_FRAME_HEADER_SIZE;
-    let frame_slots = ((file_size - WAL_HEADER_SIZE) / sz_frame) as u32;
+    let frame_slots = u32::try_from((file_size - WAL_HEADER_SIZE) / sz_frame).unwrap_or(u32::MAX);
     let mut frame = vec![0u8; sz_frame as usize];
-    let mut pgnos = Vec::with_capacity(frame_slots as usize);
+    let mut pgnos = Vec::with_capacity((frame_slots as usize).min(1024));
 
     let mut valid_frames: u32 = 0;
     let mut mx_frame: u32 = 0;

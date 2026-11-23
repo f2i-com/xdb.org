@@ -46,6 +46,8 @@ impl ByteImage for MemImage {
     }
 
     fn close(&mut self) -> IoResult<()> {
+        self.bytes.clear();
+        self.bytes.shrink_to_fit();
         Ok(())
     }
 }
@@ -80,6 +82,12 @@ impl ByteImage for FileImage {
 
     fn close(&mut self) -> IoResult<()> {
         self.unlock_and_close()
+    }
+}
+
+impl Drop for FileImage {
+    fn drop(&mut self) {
+        let _ = self.unlock_and_close();
     }
 }
 
@@ -178,5 +186,11 @@ impl ByteImage for JournalImage {
         let r1 = self.journal.close();
         let r2 = self.base.close();
         r1.and(r2)
+    }
+}
+
+impl Drop for JournalImage {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }

@@ -321,6 +321,12 @@ impl RecordView {
             self.ovfl.push(read_u32_be(&self.page, p));
         }
         while self.ovfl.len() <= k {
+            if self.ovfl.len() as u32 > self.pager.page_count() {
+                return Err(SqliteError::corrupt(format!(
+                    "page {}: overflow chain cycle detected",
+                    self.pgno
+                )));
+            }
             let j = self.ovfl.len() - 1;
             let prev = self.check_overflow_pgno(self.ovfl[j], j)?;
             let data = self
@@ -367,7 +373,12 @@ impl RecordView {
         let mut z = self.i_hdr;
         let mut off64 = self.offsets[i];
 
+        let mut parsed_this_call = 0usize;
         loop {
+            parsed_this_call += 1;
+            if (parsed_this_call & 31) == 0 {
+                self.pager.meter().charge_steps(1)?;
+            }
             let buf: &[u8] = if self.hdr_in_page {
                 &self.page
             } else {

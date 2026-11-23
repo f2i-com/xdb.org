@@ -50,4 +50,5 @@ pub use snapshot::{
 pub use write::{
     ConnectionOptions, ExecResult, SeedInsertMode, SeedReport, SqliteConnection, WritePager,
 };
+pub use xdb_core::SqlValue;
 pub use xdb_sql::{QueryOptions, QueryParams, QueryResult};

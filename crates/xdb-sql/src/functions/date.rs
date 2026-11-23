@@ -194,10 +194,14 @@ fn parse_hh_mm_ss(z: &[u8], mut i: usize, p: &mut DateTime) -> bool {
         i += 2;
         if at(z, i) == b'.' && at(z, i + 1).is_ascii_digit() {
             let mut r_scale = 1.0;
+            let mut frac_digits = 0usize;
             i += 1;
             while at(z, i).is_ascii_digit() {
-                ms = ms * 10.0 + f64::from(at(z, i) - b'0');
-                r_scale *= 10.0;
+                if frac_digits < 9 {
+                    ms = ms * 10.0 + f64::from(at(z, i) - b'0');
+                    r_scale *= 10.0;
+                    frac_digits += 1;
+                }
                 i += 1;
             }
             ms /= r_scale;
@@ -1063,9 +1067,26 @@ fn strftime_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlVal
     compute_jd(&mut x);
     compute_ymd_hms(&mut x);
 
-    let mut out: Vec<u8> = Vec::with_capacity(z_fmt.len() + 16);
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    let init_cap = z_fmt.len().min(ctx.limits.max_length).saturating_add(16);
+    mem.reserve(init_cap as u64)?;
+    let mut out: Vec<u8> = Vec::with_capacity(init_cap);
+    let mut charged_len = init_cap;
     let mut i = 0;
+    let mut steps = 0u64;
     while i < z_fmt.len() {
+        steps += 1;
+        if (steps & 127) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        if out.len() > ctx.limits.max_length {
+            return Err(SqlError::too_big());
+        }
+        if out.len() > charged_len {
+            let extra = (out.len() - charged_len).max(256);
+            mem.reserve(extra as u64)?;
+            charged_len += extra;
+        }
         if z_fmt[i] != b'%' {
             out.push(z_fmt[i]);
             i += 1;
@@ -1161,6 +1182,9 @@ fn strftime_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlVal
             b'%' => out.push(b'%'),
             _ => return Ok(SqlValue::Null),
         }
+    }
+    if out.len() > ctx.limits.max_length {
+        return Err(SqlError::too_big());
     }
     Ok(SqlValue::Text(out.into_boxed_slice()))
 }

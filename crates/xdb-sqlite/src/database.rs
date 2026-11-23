@@ -683,8 +683,23 @@ impl RowCursor {
         Ok(self.valid)
     }
 
+    /// Seek to the row with smallest rowid `>= rowid` (rowid tables only).
+    pub fn seek(&mut self, rowid: i64) -> SqliteResult<SeekResult> {
+        self.check_open()?;
+        self.started = true;
+        let res = match &mut self.cur {
+            RowCursorInner::Rowid(c) => c.seek(rowid)?,
+            RowCursorInner::WithoutRowid(_) => {
+                return Err(SqliteError::misuse("a WITHOUT ROWID table has no rowid"));
+            }
+        };
+        self.valid = res != SeekResult::Eof;
+        Ok(res)
+    }
+
     /// Rowid of the current row (rowid tables only).
     pub fn rowid(&mut self) -> SqliteResult<i64> {
+        self.check_open()?;
         match &mut self.cur {
             RowCursorInner::Rowid(c) => c.rowid(),
             RowCursorInner::WithoutRowid(_) => {
@@ -695,6 +710,7 @@ impl RowCursor {
 
     /// Decode the `j`-th projected value of the current row lazily.
     pub fn value(&mut self, j: usize) -> SqliteResult<SqlValue> {
+        self.check_open()?;
         if j >= self.plan.src.len() {
             return Err(SqliteError::misuse(format!(
                 "no value {j} (row width {})",
@@ -715,6 +731,7 @@ impl RowCursor {
 
     /// Decode all projected values of the current row.
     pub fn row(&mut self) -> SqliteResult<Vec<SqlValue>> {
+        self.check_open()?;
         let rowid = if self.plan.needs_rowid {
             self.rowid()?
         } else {
@@ -878,6 +895,7 @@ impl IndexEntryCursor {
 
     /// Decode the `i`-th column of the current index entry (record order).
     pub fn value(&mut self, i: usize) -> SqliteResult<SqlValue> {
+        self.check_open()?;
         if i >= self.plan.read.len() {
             return Err(SqliteError::misuse(format!("no index column {i}")));
         }
@@ -896,6 +914,7 @@ impl IndexEntryCursor {
 
     /// Decode all columns of the current index entry.
     pub fn row(&mut self) -> SqliteResult<Vec<SqlValue>> {
+        self.check_open()?;
         let n = self.plan.read.len();
         let mut out = Vec::with_capacity(n);
         for i in 0..n {

@@ -86,6 +86,9 @@ fn parse_statement_inner(
     let mut s = Scanner::new(sql, options.dialect);
     let mut i = end;
     loop {
+        if let Some(m) = meter {
+            m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+        }
         s.scan(i);
         if s.kind == tk::EOF {
             break;
@@ -123,7 +126,11 @@ fn parse_expression_inner(
     meter: Option<&dyn Meter>,
 ) -> ParseResult<Expr> {
     let select = Parser::new(sql, options, meter).parse_wrapped_expression()?;
-    if select.with.is_some() {
+    if select.with.is_some()
+        || select.order_by.is_some()
+        || select.order_by_all.is_some()
+        || select.limit.is_some()
+    {
         return Err(SqlParseError::new(
             "not an expression",
             SqlParseErrorKind::Syntax,

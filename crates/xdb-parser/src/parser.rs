@@ -134,7 +134,7 @@ impl<'a> Parser<'a> {
         let scanner = Scanner::new(sql, options.dialect);
         let probe = Scanner::new(sql, options.dialect);
         let limit = scanner.limit;
-        let init_cap = tables.yy_stack_depth;
+        let init_cap = tables.yy_stack_depth.min(options.max_parser_depth.max(1));
         let mut v = Vec::with_capacity(init_cap);
         v.resize_with(init_cap, || SemVal::Empty);
         Self {
@@ -246,10 +246,16 @@ impl<'a> Parser<'a> {
         loop {
             self.scanner.scan(i);
             if self.scanner.kind == tk::SPACE || self.scanner.kind == tk::COMMENT {
+                if let Some(m) = self.meter {
+                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                }
                 i = self.scanner.end;
                 continue;
             }
             if self.scanner.kind == tk::SEMI {
+                if let Some(m) = self.meter {
+                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                }
                 return Ok(ParsedAt {
                     statement: None,
                     end: self.scanner.end,
@@ -270,6 +276,9 @@ impl<'a> Parser<'a> {
             let mut kind = self.scanner.kind;
             let mut end = self.scanner.end;
             if kind == tk::SPACE || kind == tk::COMMENT {
+                if let Some(m) = self.meter {
+                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                }
                 i = end;
                 continue;
             }
@@ -375,6 +384,14 @@ impl<'a> Parser<'a> {
             }
         }
         if self.done {
+            if !closed {
+                return Err(SqlParseError::new(
+                    "not an expression",
+                    SqlParseErrorKind::Syntax,
+                    Some(i),
+                    Some(self.limit),
+                ));
+            }
             if let Some(Statement::Select(sel)) = self.result.take() {
                 return Ok(*sel);
             }
@@ -391,7 +408,7 @@ impl<'a> Parser<'a> {
 
     fn reset_stack(&mut self) {
         self.top = 0;
-        let init_len = self.tables.yy_stack_depth;
+        let init_len = self.tables.yy_stack_depth.min(self.max_depth.max(1));
         self.stack_end = init_len - 1;
         if self.state.len() < init_len {
             self.state.resize(init_len, 0);

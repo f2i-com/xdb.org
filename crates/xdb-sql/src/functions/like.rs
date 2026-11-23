@@ -87,6 +87,16 @@ enum ScanKind {
 /// `patternCompare(zPattern, zString, pInfo, matchOther) == SQLITE_MATCH`.
 /// Both slices must be NUL-terminated.
 pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_other: u32) -> bool {
+    pattern_match_metered(pat, str_chars, info, match_other, None).unwrap_or(false)
+}
+
+fn pattern_match_metered(
+    pat: &[u32],
+    str_chars: &[u32],
+    info: CompareInfo,
+    match_other: u32,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> SqlResult<bool> {
     let match_one = info.match_one;
     let match_all = info.match_all;
     let no_case = info.no_case;
@@ -100,10 +110,17 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
     let mut scan_si: usize = 0;
     let mut scan_c: u32 = 0;
     let mut scan_c2: u32 = 0;
+    let mut ticks: u64 = 0;
 
     loop {
         let mut matched = false;
         loop {
+            ticks += 1;
+            if (ticks & 63) == 0 {
+                if let Some(m) = meter {
+                    m.charge_steps(1)?;
+                }
+            }
             let mut c = pat[pi];
             pi += 1;
             if c == 0 {
@@ -119,7 +136,7 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
                     }
                     if c == match_one && match_one != 0 {
                         if str_chars[si] == 0 {
-                            return false;
+                            return Ok(false);
                         }
                         si += 1;
                         continue;
@@ -127,14 +144,14 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
                     break;
                 }
                 if c == 0 {
-                    return true;
+                    return Ok(true);
                 }
                 if c == match_other && match_other != 0 {
                     if info.match_set == 0 {
                         c = pat[pi];
                         pi += 1;
                         if c == 0 {
-                            return false;
+                            return Ok(false);
                         }
                     } else {
                         scan = ScanKind::Set;
@@ -227,15 +244,21 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
             break;
         }
         if matched {
-            return true;
+            return Ok(true);
         }
         match scan {
             ScanKind::Ascii => {
                 let mut k = scan_si;
                 loop {
+                    ticks += 1;
+                    if (ticks & 63) == 0 {
+                        if let Some(m) = meter {
+                            m.charge_steps(1)?;
+                        }
+                    }
                     let x = str_chars[k];
                     if x == 0 {
-                        return false;
+                        return Ok(false);
                     }
                     if x == scan_c || x == scan_c2 {
                         break;
@@ -248,10 +271,16 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
             ScanKind::Char => {
                 let mut k = scan_si;
                 loop {
+                    ticks += 1;
+                    if (ticks & 63) == 0 {
+                        if let Some(m) = meter {
+                            m.charge_steps(1)?;
+                        }
+                    }
                     let x = str_chars[k];
                     k += 1;
                     if x == 0 {
-                        return false;
+                        return Ok(false);
                     }
                     if x == scan_c {
                         break;
@@ -262,12 +291,12 @@ pub fn pattern_match(pat: &[u32], str_chars: &[u32], info: CompareInfo, match_ot
             }
             ScanKind::Set => {
                 if str_chars[scan_si] == 0 {
-                    return false;
+                    return Ok(false);
                 }
                 si = scan_si;
                 scan_si += 1;
             }
-            ScanKind::None => return false,
+            ScanKind::None => return Ok(false),
         }
         pi = scan_pi;
         z_escaped = None;
@@ -319,13 +348,16 @@ pub fn like_invoke(
         return Ok(SqlValue::Null);
     };
 
-    ctx.charge_steps((pat_bytes.len().min(4096) + str_bytes.len().min(4096)) as u64 / 16 + 1)?;
+    ctx.charge_steps((pat_bytes.len() + str_bytes.len()) as u64 / 16 + 1)?;
+    let scratch_bytes = (pat_bytes.len().saturating_add(str_bytes.len()) as u64).saturating_mul(4);
+    if let Some(m) = ctx.meter {
+        m.reserve_memory(scratch_bytes)?;
+    }
     let pat_chars = to_chars(&pat_bytes);
     let str_chars = to_chars(&str_bytes);
-    Ok(SqlValue::Int(i64::from(pattern_match(
-        &pat_chars,
-        &str_chars,
-        info,
-        match_other,
-    ))))
+    let res = pattern_match_metered(&pat_chars, &str_chars, info, match_other, ctx.meter);
+    if let Some(m) = ctx.meter {
+        m.release_memory(scratch_bytes);
+    }
+    Ok(SqlValue::Int(i64::from(res?)))
 }

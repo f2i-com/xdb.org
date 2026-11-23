@@ -9,9 +9,9 @@ pub mod math;
 pub mod printf;
 pub mod window;
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use xdb_core::value::Collation;
@@ -64,9 +64,11 @@ pub struct FunctionContext<'a> {
     pub pure_context: Option<&'a str>,
     /// Per-argument JSON subtype bitmask (for `json_array`, `json_object`, `json_set`, etc.).
     pub arg_json_mask: u64,
-    /// Deterministic PRNG state for `random()` / `randomblob()`.
-    rng_state: Cell<u64>,
+    /// Shared PRNG state for `random()` / `randomblob()` (survives `with_collation_and_json_mask`).
+    rng_state: Arc<AtomicU64>,
 }
+
+static RNG_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl<'a> fmt::Debug for FunctionContext<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -80,6 +82,9 @@ impl<'a> fmt::Debug for FunctionContext<'a> {
 
 impl<'a> FunctionContext<'a> {
     pub fn new(meter: Option<&'a dyn Meter>, now_julian_ms: i64) -> Self {
+        let nonce = RNG_SEED_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
         Self {
             collation: None,
             limits: FunctionLimits::default(),
@@ -91,7 +96,7 @@ impl<'a> FunctionContext<'a> {
             last_insert_rowid: 0,
             pure_context: None,
             arg_json_mask: 0,
-            rng_state: Cell::new(0x9e37_79b9_7f4a_7c15 ^ (now_julian_ms as u64)),
+            rng_state: Arc::new(AtomicU64::new(nonce ^ (now_julian_ms as u64))),
         }
     }
 
@@ -118,12 +123,14 @@ impl<'a> FunctionContext<'a> {
         idx < 64 && ((self.arg_json_mask >> idx) & 1) != 0
     }
 
-    /// SplitMix64 deterministic PRNG for `random()` / `randomblob()` (WASM-safe, zero OS deps).
+    /// SplitMix64 PRNG for `random()` / `randomblob()` (WASM-safe, zero OS deps).
     pub fn fill_random(&self, out: &mut [u8]) {
-        let mut s = self.rng_state.get();
         let mut i = 0;
         while i < out.len() {
-            s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let s = self
+                .rng_state
+                .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+                .wrapping_add(0x9e37_79b9_7f4a_7c15);
             let mut z = s;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -133,7 +140,6 @@ impl<'a> FunctionContext<'a> {
             out[i..i + take].copy_from_slice(&bytes[..take]);
             i += take;
         }
-        self.rng_state.set(s);
     }
 
     pub fn with_collation_and_json_mask(
@@ -152,7 +158,7 @@ impl<'a> FunctionContext<'a> {
             last_insert_rowid: self.last_insert_rowid,
             pure_context: self.pure_context,
             arg_json_mask,
-            rng_state: Cell::new(self.rng_state.get()),
+            rng_state: Arc::clone(&self.rng_state),
         }
     }
 }
@@ -187,6 +193,13 @@ impl FunctionRegistry {
         func: CustomScalarFn,
     ) {
         self.scalars.insert((name.into().to_ascii_lowercase(), arity), func);
+    }
+
+    /// Returns true if a custom scalar function is registered for `(name, arity)`.
+    pub fn has_custom_scalar(&self, name: &str, arity: usize) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.scalars.contains_key(&(lower.clone(), Some(arity)))
+            || self.scalars.contains_key(&(lower, None))
     }
 
     /// Invoke a scalar function (custom overrides built-in).
