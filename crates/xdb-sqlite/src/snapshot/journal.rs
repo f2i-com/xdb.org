@@ -155,7 +155,11 @@ pub fn playback_journal(
             stop_reason = JournalStopReason::NoMoreHeaders;
             break;
         }
-        file.read(&mut hdr, hdr_off)?;
+        let got = file.read(&mut hdr, hdr_off)?;
+        if got < 28 {
+            stop_reason = JournalStopReason::NoMoreHeaders;
+            break;
+        }
         if &hdr[..8] != JOURNAL_MAGIC {
             stop_reason = JournalStopReason::BadMagic;
             break;

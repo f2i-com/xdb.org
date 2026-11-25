@@ -36,6 +36,14 @@ pub struct KeyInfo {
     pub desc: Vec<bool>,
 }
 
+impl KeyInfo {
+    /// True when this index has exactly 2 fields both sorted `ASC` (e.g. single-column index + rowid).
+    #[inline]
+    pub fn is_two_int_asc(&self) -> bool {
+        self.n_all_field == 2 && self.desc.len() >= 2 && !self.desc[0] && !self.desc[1]
+    }
+}
+
 /// Resolve a collation name for `encoding` (`BINARY` returns `None`).
 pub fn resolve_collation(
     name: &str,
@@ -175,6 +183,7 @@ impl SearchKey {
             let f = match v {
                 SqlValue::Null => PreparedField::Null,
                 SqlValue::Int(i) => PreparedField::Int(*i),
+                SqlValue::Real(r) if r.is_nan() => PreparedField::Null,
                 SqlValue::Real(r) => PreparedField::Real(*r),
                 SqlValue::Text(b) => PreparedField::Text {
                     stored_bytes: encode_utf8_to_stored_text(b, enc),
@@ -241,7 +250,7 @@ impl RecordKey for SearchKey {
             (v as usize, l)
         };
         let mut d1 = sz_hdr;
-        if d1 > n {
+        if idx1 >= sz_hdr || d1 > n {
             self.corrupt = true;
             return 0;
         }

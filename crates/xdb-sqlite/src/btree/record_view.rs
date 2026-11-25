@@ -19,6 +19,7 @@ pub const MAX_RECORD_HEADER: usize = 98_307;
 #[derive(Debug)]
 pub struct RecordView {
     pager: Pager,
+    noop_meter: bool,
     enc: TextEncoding,
     ovfl_size: usize,
     usable: usize,
@@ -50,10 +51,12 @@ pub struct RecordView {
 
 impl RecordView {
     pub fn new(pager: Pager, encoding: TextEncoding) -> Self {
+        let noop_meter = pager.is_noop_meter();
         let usable = pager.db().usable_size as usize;
         let max_record = u64::from(pager.page_size()) * u64::from(pager.page_count());
         Self {
             pager,
+            noop_meter,
             enc: encoding,
             ovfl_size: usable - 4,
             usable,
@@ -91,6 +94,38 @@ impl RecordView {
         let room = page.len().saturating_sub(local_offset);
         self.pgno = pgno;
         self.page = page;
+        self.local0 = local_offset;
+        self.n_local = local_size;
+        self.sz_row = local_size.min(room);
+        self.n_payload = payload_size as usize;
+        self.ovfl.clear();
+        self.n_ovfl = if self.n_payload > local_size {
+            ((self.n_payload - local_size).div_ceil(self.ovfl_size)) as u32
+        } else {
+            0
+        };
+        self.hdr_read = false;
+        self.hdr_size = 0;
+        self.hdr_buf.clear();
+        self.hdr_in_page = true;
+        self.hdr_base = 0;
+        self.i_hdr = 0;
+        self.n_parsed = 0;
+        self.complete = false;
+        self.types.clear();
+        self.offsets.clear();
+        self.offsets.push(0);
+    }
+
+    #[inline]
+    pub fn pgno(&self) -> u32 {
+        self.pgno
+    }
+
+    /// Re-point this view at another cell on the SAME already-held page (avoids `Arc::clone`).
+    #[inline]
+    pub fn reset_same_page(&mut self, local_offset: usize, local_size: usize, payload_size: u32) {
+        let room = self.page.len().saturating_sub(local_offset);
         self.local0 = local_offset;
         self.n_local = local_size;
         self.sz_row = local_size.min(room);
@@ -153,7 +188,9 @@ impl RecordView {
 
     /// Decode column `i`'s value (`SqlValue::Null` when absent from a short record).
     pub fn value(&mut self, i: usize) -> SqliteResult<SqlValue> {
-        self.pager.meter().charge_steps(1)?;
+        if !self.noop_meter {
+            self.pager.meter().charge_steps(1)?;
+        }
         self.parse_through(i)?;
         if i >= self.n_parsed {
             return Ok(SqlValue::Null);
@@ -165,7 +202,7 @@ impl RecordView {
             if len == 0 {
                 return Ok(decode_fixed(&[], 0, t));
             }
-            if start + len <= self.sz_row {
+            if start.checked_add(len).is_some_and(|e| e <= self.sz_row) {
                 return Ok(decode_fixed(&self.page, self.local0 + start, t));
             }
             let buf = self.read_range(start, len, 0, true)?;
@@ -176,21 +213,27 @@ impl RecordView {
             if len == 0 {
                 return Ok(SqlValue::Text(Box::new([])));
             }
-            if start + len <= self.sz_row {
+            if start.checked_add(len).is_some_and(|e| e <= self.sz_row) {
                 let a = self.local0 + start;
+                if self.enc == TextEncoding::Utf8 {
+                    return Ok(SqlValue::Text(Box::from(&self.page[a..a + len])));
+                }
                 let decoded = decode_stored_text_to_utf8(&self.page[a..a + len], self.enc);
                 return Ok(SqlValue::Text(decoded.into_boxed_slice()));
             }
             let buf = self.read_range(start, len, 0, true)?;
+            if self.enc == TextEncoding::Utf8 {
+                return Ok(SqlValue::Text(buf.into_boxed_slice()));
+            }
             let decoded = decode_stored_text_to_utf8(&buf, self.enc);
             return Ok(SqlValue::Text(decoded.into_boxed_slice()));
         }
         if len == 0 {
             return Ok(SqlValue::Blob(Box::new([])));
         }
-        if start + len <= self.sz_row {
+        if start.checked_add(len).is_some_and(|e| e <= self.sz_row) {
             let a = self.local0 + start;
-            return Ok(SqlValue::Blob(self.page[a..a + len].to_vec().into_boxed_slice()));
+            return Ok(SqlValue::Blob(Box::from(&self.page[a..a + len])));
         }
         let buf = self.read_range(start, len, 0, true)?;
         Ok(SqlValue::Blob(buf.into_boxed_slice()))
@@ -376,7 +419,7 @@ impl RecordView {
         let mut parsed_this_call = 0usize;
         loop {
             parsed_this_call += 1;
-            if (parsed_this_call & 31) == 0 {
+            if !self.noop_meter && (parsed_this_call & 31) == 0 {
                 self.pager.meter().charge_steps(1)?;
             }
             let buf: &[u8] = if self.hdr_in_page {
@@ -393,27 +436,31 @@ impl RecordView {
                 z += len;
                 v
             };
+            if z > end {
+                return Err(SqliteError::corrupt(format!(
+                    "page {}: record header overruns its declared size {end}",
+                    self.pgno
+                )));
+            }
+            let Some(next_off) = off64.checked_add(serial_type_length(t)) else {
+                return Err(SqliteError::corrupt(format!(
+                    "page {}: record body offset overflows payload size {payload}",
+                    self.pgno
+                )));
+            };
+            if next_off > payload || (z == end && next_off != payload) {
+                return Err(SqliteError::corrupt(format!(
+                    "page {}: record bodies end at {next_off}, payload is {payload} bytes",
+                    self.pgno
+                )));
+            }
             self.types.push(t);
-            off64 = off64.saturating_add(serial_type_length(t));
+            off64 = next_off;
             i += 1;
             self.offsets.push(off64);
             if i > p2 || z >= end {
                 break;
             }
-        }
-
-        if (z >= end && (z > end || off64 != payload)) || off64 > payload {
-            return Err(SqliteError::corrupt(if z > end {
-                format!(
-                    "page {}: record header overruns its declared size {end}",
-                    self.pgno
-                )
-            } else {
-                format!(
-                    "page {}: record bodies end at {off64}, payload is {payload} bytes",
-                    self.pgno
-                )
-            }));
         }
 
         self.n_parsed = i;
@@ -425,7 +472,12 @@ impl RecordView {
     }
 
     fn read_header(&mut self) -> SqliteResult<()> {
-        self.hdr_read = true;
+        if self.n_payload == 0 || self.sz_row == 0 {
+            return Err(SqliteError::corrupt(format!(
+                "page {}: empty record payload has no header",
+                self.pgno
+            )));
+        }
         let p = self.local0;
         let Some(&b0) = self.page.get(p) else {
             return Err(SqliteError::corrupt(format!(
@@ -449,6 +501,7 @@ impl RecordView {
         if hdr_size == 0 {
             self.hdr_size = 0;
             self.complete = true;
+            self.hdr_read = true;
             return Ok(());
         }
         if hdr_size <= self.sz_row {
@@ -480,6 +533,7 @@ impl RecordView {
         self.hdr_size = hdr_size;
         self.i_hdr = len;
         self.offsets[0] = hdr_size;
+        self.hdr_read = true;
         Ok(())
     }
 }

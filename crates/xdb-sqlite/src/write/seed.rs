@@ -27,14 +27,16 @@
 //!    Any table missing from `sqlite_schema` is automatically created with column types
 //!    inferred from the seed rows.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use xdb_core::SqlValue;
-use xdb_sql::functions::json::{parse_json, JsonVal};
+use xdb_core::{SqlValue, TextEncoding};
+use xdb_parser::ConflictAction;
+use xdb_sql::functions::json::{parse_json_metered_with, JsonVal};
 use xdb_sql::QueryParams;
 
 use crate::errors::{SqliteError, SqliteResult};
 use crate::write::connection::SqliteConnection;
+use crate::write::record::BorrowedRecordVal;
 
 /// Conflict resolution strategy used for row inserts during JSON seeding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,6 +56,14 @@ impl SeedInsertMode {
             SeedInsertMode::Ignore => "INSERT OR IGNORE INTO ",
             SeedInsertMode::Replace => "INSERT OR REPLACE INTO ",
             SeedInsertMode::Insert => "INSERT INTO ",
+        }
+    }
+
+    fn conflict_action(self) -> Option<ConflictAction> {
+        match self {
+            SeedInsertMode::Ignore => Some(ConflictAction::Ignore),
+            SeedInsertMode::Replace => Some(ConflictAction::Replace),
+            SeedInsertMode::Insert => None,
         }
     }
 
@@ -90,8 +100,18 @@ impl SqliteConnection {
         if trimmed.is_empty() {
             return Ok(SeedReport::default());
         }
-        let root = parse_json(trimmed, false)
-            .map_err(|e| SqliteError::Misuse(format!("invalid seed JSON: {e}")))?;
+        if self.encoding() == TextEncoding::Utf8 {
+            if let Some(report) = self.try_seed_shorthand_streaming(trimmed)? {
+                return Ok(report);
+            }
+        }
+        let meter_arc = self.meter().clone();
+        let root = parse_json_metered_with(trimmed, false, Some(meter_arc.as_ref())).map_err(
+            |e| match e {
+                xdb_sql::SqlError::ResourceLimit(r) => SqliteError::ResourceLimit(r),
+                other => SqliteError::Misuse(format!("invalid seed JSON: {other}")),
+            },
+        )?;
         let entries = match root {
             JsonVal::Object(entries) => entries,
             _ => {
@@ -105,7 +125,7 @@ impl SqliteConnection {
         if started_tx {
             self.execute("BEGIN")?;
         }
-        let result = self.apply_seed_entries(entries);
+        let result = self.apply_seed_entries(entries, started_tx);
         match result {
             Ok(report) => {
                 if started_tx {
@@ -127,16 +147,114 @@ impl SqliteConnection {
         }
     }
 
-    fn apply_seed_entries(&mut self, entries: Vec<(String, JsonVal)>) -> SqliteResult<SeedReport> {
-        let mut report = SeedReport::default();
-        let has_structured_keys = entries.iter().any(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "schema" | "tables" | "statements" | "mode" | "pragmas"
-            )
-        });
+    fn try_seed_shorthand_streaming(
+        &mut self,
+        trimmed: &str,
+    ) -> SqliteResult<Option<SeedReport>> {
+        let meter_arc = self.meter().clone();
+        let Some(specs) = scan_shorthand_specs(trimmed, meter_arc.as_ref())? else {
+            return Ok(None);
+        };
+        for spec in &specs {
+            if self.table_exists(spec.name)? {
+                return Ok(None);
+            }
+        }
 
-        if !has_structured_keys {
+        let started_tx = !self.in_transaction();
+        if started_tx {
+            self.execute("BEGIN")?;
+        }
+        let result: SqliteResult<SeedReport> = (|| {
+            let mut report = SeedReport::default();
+            let bytes = trimmed.as_bytes();
+            for spec in &specs {
+                let owned_cols: Vec<(String, InferredType)> = spec
+                    .cols
+                    .iter()
+                    .map(|&(k, ty)| (k.to_string(), ty))
+                    .collect();
+                let ddl = build_create_table_ddl(spec.name, &owned_cols);
+                self.execute(&ddl)?;
+                report.tables_created += 1;
+                report.statements_executed += 1;
+
+                let ncols = spec.cols.len();
+                let body_start = spec.array_body_start;
+                let body_end = spec.array_body_end;
+                let inserted =
+                    self.stream_insert_new_seed_table(spec.name, started_tx, |emit| {
+                        let mut pos = body_start;
+                        let mut row_vals = [BorrowedRecordVal::Null; 16];
+                        loop {
+                            pos = skip_json_ws(bytes, pos);
+                            debug_assert!(pos < body_end && bytes[pos] == b'{');
+                            pos += 1;
+                            for (ci, slot) in row_vals.iter_mut().enumerate().take(ncols) {
+                                pos = skip_json_ws(bytes, pos);
+                                // Skip verified unescaped key `"..."`
+                                debug_assert!(bytes[pos] == b'"');
+                                pos += 1 + spec.cols[ci].0.len() + 1;
+                                pos = skip_json_ws(bytes, pos);
+                                debug_assert!(bytes[pos] == b':');
+                                pos += 1;
+                                pos = skip_json_ws(bytes, pos);
+                                let (val, _, next_pos) = scan_simple_scalar(trimmed, bytes, pos)
+                                    .expect("Pass 1 verified scalar");
+                                *slot = val;
+                                pos = skip_json_ws(bytes, next_pos);
+                                if ci + 1 < ncols {
+                                    debug_assert!(bytes[pos] == b',');
+                                    pos += 1;
+                                }
+                            }
+                            debug_assert!(bytes[pos] == b'}');
+                            pos += 1;
+                            emit(&mut row_vals[..ncols])?;
+                            pos = skip_json_ws(bytes, pos);
+                            if pos >= body_end {
+                                break;
+                            }
+                            debug_assert!(bytes[pos] == b',');
+                            pos += 1;
+                        }
+                        Ok(())
+                    })?;
+                report.statements_executed += 1;
+                report.rows_inserted += inserted;
+                report.tables_seeded += 1;
+            }
+            Ok(report)
+        })();
+
+        match result {
+            Ok(report) => {
+                if started_tx {
+                    if let Err(err) = self.execute("COMMIT") {
+                        if self.in_transaction() {
+                            let _ = self.execute("ROLLBACK");
+                        }
+                        return Err(err);
+                    }
+                }
+                Ok(Some(report))
+            }
+            Err(err) => {
+                if started_tx && self.in_transaction() {
+                    let _ = self.execute("ROLLBACK");
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn apply_seed_entries(
+        &mut self,
+        entries: Vec<(String, JsonVal)>,
+        owned_outer_tx: bool,
+    ) -> SqliteResult<SeedReport> {
+        let mut report = SeedReport::default();
+        if !is_structured_seed(&entries) {
             // Shorthand form: { "table_name": [ { col: val }, ... ], ... }
             for (table_name, rows_val) in entries {
                 if table_name.starts_with('$') {
@@ -152,7 +270,14 @@ impl SqliteConnection {
                         )));
                     }
                 };
-                self.seed_table_rows(&table_name, None, &rows, SeedInsertMode::Ignore, &mut report)?;
+                self.seed_table_rows(
+                    &table_name,
+                    None,
+                    rows,
+                    SeedInsertMode::Ignore,
+                    owned_outer_tx,
+                    &mut report,
+                )?;
             }
             return Ok(report);
         }
@@ -197,10 +322,23 @@ impl SqliteConnection {
                     for (table_name, rows_val) in tbl_entries {
                         match rows_val {
                             JsonVal::Array(rows) => {
-                                self.seed_table_rows(&table_name, None, &rows, mode, &mut report)?;
+                                self.seed_table_rows(
+                                    &table_name,
+                                    None,
+                                    rows,
+                                    mode,
+                                    owned_outer_tx,
+                                    &mut report,
+                                )?;
                             }
                             JsonVal::Object(spec_fields) => {
-                                self.seed_table_spec(Some(table_name), spec_fields, mode, &mut report)?;
+                                self.seed_table_spec(
+                                    Some(table_name),
+                                    spec_fields,
+                                    mode,
+                                    owned_outer_tx,
+                                    &mut report,
+                                )?;
                             }
                             JsonVal::Null => {}
                             _ => {
@@ -218,7 +356,13 @@ impl SqliteConnection {
                                 "each entry in seed 'tables' array must be an object".to_string(),
                             ));
                         };
-                        self.seed_table_spec(None, spec_fields, mode, &mut report)?;
+                        self.seed_table_spec(
+                            None,
+                            spec_fields,
+                            mode,
+                            owned_outer_tx,
+                            &mut report,
+                        )?;
                     }
                 }
                 _ => {
@@ -240,6 +384,7 @@ impl SqliteConnection {
         default_name: Option<String>,
         fields: Vec<(String, JsonVal)>,
         default_mode: SeedInsertMode,
+        owned_outer_tx: bool,
         report: &mut SeedReport,
     ) -> SqliteResult<()> {
         let mut name = default_name;
@@ -294,7 +439,14 @@ impl SqliteConnection {
         let table_name = name.ok_or_else(|| {
             SqliteError::Misuse("seed table spec is missing 'name'".to_string())
         })?;
-        self.seed_table_rows(&table_name, columns.as_deref(), &rows, mode, report)
+        self.seed_table_rows(
+            &table_name,
+            columns.as_deref(),
+            rows,
+            mode,
+            owned_outer_tx,
+            report,
+        )
     }
 
     fn run_seed_sql_list(&mut self, val: JsonVal, report: &mut SeedReport) -> SqliteResult<()> {
@@ -302,8 +454,13 @@ impl SqliteConnection {
             JsonVal::Null => Ok(()),
             JsonVal::Str(sql) => {
                 if !sql.trim().is_empty() {
-                    self.execute(&sql)?;
+                    let before = self.total_changes();
+                    let _ = self.execute(&sql)?;
                     report.statements_executed += 1;
+                    let delta = self.total_changes().saturating_sub(before);
+                    if delta > 0 {
+                        report.rows_inserted += delta as usize;
+                    }
                 }
                 Ok(())
             }
@@ -312,8 +469,13 @@ impl SqliteConnection {
                     match item {
                         JsonVal::Str(sql) => {
                             if !sql.trim().is_empty() {
-                                self.execute(&sql)?;
+                                let before = self.total_changes();
+                                let _ = self.execute(&sql)?;
                                 report.statements_executed += 1;
+                                let delta = self.total_changes().saturating_sub(before);
+                                if delta > 0 {
+                                    report.rows_inserted += delta as usize;
+                                }
                             }
                         }
                         JsonVal::Object(fields) => {
@@ -339,10 +501,12 @@ impl SqliteConnection {
                                 )
                             })?;
                             if !sql.trim().is_empty() {
-                                let res = self.execute_with_params(&sql, &params)?;
+                                let before = self.total_changes();
+                                let _ = self.execute_with_params(&sql, &params)?;
                                 report.statements_executed += 1;
-                                if res.changes > 0 {
-                                    report.rows_inserted += res.changes as usize;
+                                let delta = self.total_changes().saturating_sub(before);
+                                if delta > 0 {
+                                    report.rows_inserted += delta as usize;
                                 }
                             }
                         }
@@ -363,20 +527,16 @@ impl SqliteConnection {
     }
 
     fn table_exists(&mut self, table_name: &str) -> SqliteResult<bool> {
-        let params = QueryParams::positional(vec![SqlValue::text(table_name)]);
-        let res = self.execute_with_params(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?) LIMIT 1",
-            &params,
-        )?;
-        Ok(!res.rows.is_empty())
+        Ok(self.schema_arc()?.table(table_name).is_some())
     }
 
     fn seed_table_rows(
         &mut self,
         table_name: &str,
         explicit_columns: Option<&[String]>,
-        rows: &[JsonVal],
+        mut rows: Vec<JsonVal>,
         mode: SeedInsertMode,
+        owned_outer_tx: bool,
         report: &mut SeedReport,
     ) -> SqliteResult<()> {
         if table_name.trim().is_empty() {
@@ -385,7 +545,7 @@ impl SqliteConnection {
 
         // Auto-create table if it does not yet exist and we have columns or row objects.
         if !self.table_exists(table_name)? {
-            let inferred_cols = infer_columns_from_rows(explicit_columns, rows)?;
+            let inferred_cols = infer_columns_from_rows(explicit_columns, &rows)?;
             if !inferred_cols.is_empty() {
                 let ddl = build_create_table_ddl(table_name, &inferred_cols);
                 self.execute(&ddl)?;
@@ -401,86 +561,554 @@ impl SqliteConnection {
 
         let quoted_table = quote_ident(table_name);
         let prefix = mode.sql_prefix();
+        const MAX_BATCH_ROWS: usize = 100;
+        const MAX_BATCH_PARAMS: usize = 900;
 
-        for row in rows {
-            match row {
-                JsonVal::Object(fields) => {
-                    if fields.is_empty() {
-                        let sql = format!("{prefix}{quoted_table} DEFAULT VALUES");
-                        let res = self.execute(&sql)?;
-                        report.statements_executed += 1;
-                        if res.changes > 0 {
-                            report.rows_inserted += res.changes as usize;
-                        }
-                        continue;
+        let mut i = 0usize;
+        while i < rows.len() {
+            let is_obj = matches!(rows[i], JsonVal::Object(_));
+            let is_arr = matches!(rows[i], JsonVal::Array(_));
+            if is_obj {
+                let ncols = match &rows[i] {
+                    JsonVal::Object(f) => f.len(),
+                    _ => unreachable!(),
+                };
+                if ncols == 0 {
+                    let sql = format!("{prefix}{quoted_table} DEFAULT VALUES");
+                    let res = self.execute(&sql)?;
+                    report.statements_executed += 1;
+                    if res.changes > 0 {
+                        report.rows_inserted += res.changes as usize;
                     }
+                    i += 1;
+                    continue;
+                }
+                let mut batch_end = i + 1;
+                {
+                    let JsonVal::Object(ref fields) = rows[i] else {
+                        unreachable!();
+                    };
+                    while batch_end < rows.len() {
+                        let JsonVal::Object(ref next_fields) = rows[batch_end] else {
+                            break;
+                        };
+                        if next_fields.len() != ncols
+                            || !next_fields
+                                .iter()
+                                .zip(fields.iter())
+                                .all(|((a, _), (b, _))| a == b)
+                        {
+                            break;
+                        }
+                        batch_end += 1;
+                    }
+                }
+
+                // Direct insertion path: moves JSON strings straight into `self.row_scratch` on
+                // the fly with zero intermediate `Vec<Vec<SqlValue>>` and avoids SQL re-parsing!
+                let col_names_owned: Vec<String> = match &rows[i] {
+                    JsonVal::Object(f) => f.iter().map(|(c, _)| c.clone()).collect(),
+                    _ => unreachable!(),
+                };
+                let col_names: Vec<&str> = col_names_owned.iter().map(String::as_str).collect();
+                if let Some(inserted) = self.try_insert_seed_json_batch_direct(
+                    table_name,
+                    Some(&col_names),
+                    &mut rows[i..batch_end],
+                    true,
+                    mode.conflict_action(),
+                    owned_outer_tx,
+                )? {
+                    report.statements_executed += 1;
+                    report.rows_inserted += inserted;
+                    i = batch_end;
+                    continue;
+                }
+
+                // Fallback SQL path for exotic tables (GENERATED/CHECK/STRICT/WITHOUT ROWID):
+                let mut batch_rows = Vec::with_capacity(batch_end - i);
+                for row_item in &mut rows[i..batch_end] {
+                    if let JsonVal::Object(f) = std::mem::replace(row_item, JsonVal::Null) {
+                        let mut r = Vec::with_capacity(ncols);
+                        for (_, val) in f {
+                            r.push(seed_json_to_sql_value_owned(val));
+                        }
+                        batch_rows.push(r);
+                    }
+                }
+                let max_rows = (MAX_BATCH_PARAMS / ncols.max(1)).clamp(1, MAX_BATCH_ROWS);
+                let mut sub_start = 0usize;
+                while sub_start < batch_rows.len() {
+                    let sub_end = (sub_start + max_rows).min(batch_rows.len());
+                    let sub_len = sub_end - sub_start;
                     let mut cols_sql = String::new();
-                    let mut placeholders = String::new();
-                    let mut values = Vec::with_capacity(fields.len());
-                    for (i, (col, val)) in fields.iter().enumerate() {
-                        if i > 0 {
+                    let mut row_ph = String::with_capacity(ncols * 3);
+                    for (ci, col) in col_names_owned.iter().enumerate() {
+                        if ci > 0 {
                             cols_sql.push_str(", ");
-                            placeholders.push_str(", ");
+                            row_ph.push_str(", ");
                         }
                         cols_sql.push_str(&quote_ident(col));
-                        placeholders.push('?');
-                        values.push(seed_json_to_sql_value(val));
+                        row_ph.push('?');
                     }
-                    let sql = format!(
-                        "{prefix}{quoted_table} ({cols_sql}) VALUES ({placeholders})"
+                    let mut sql = String::with_capacity(
+                        prefix.len()
+                            + quoted_table.len()
+                            + cols_sql.len()
+                            + sub_len * (row_ph.len() + 4)
+                            + 16,
                     );
+                    sql.push_str(prefix);
+                    sql.push_str(&quoted_table);
+                    sql.push_str(" (");
+                    sql.push_str(&cols_sql);
+                    sql.push_str(") VALUES ");
+                    let mut values = Vec::with_capacity(sub_len * ncols);
+                    for (bi, r) in batch_rows[sub_start..sub_end].iter_mut().enumerate() {
+                        if bi > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push('(');
+                        sql.push_str(&row_ph);
+                        sql.push(')');
+                        values.append(r);
+                    }
                     let params = QueryParams::positional(values);
                     let res = self.execute_with_params(&sql, &params)?;
                     report.statements_executed += 1;
                     if res.changes > 0 {
                         report.rows_inserted += res.changes as usize;
                     }
+                    sub_start = sub_end;
                 }
-                JsonVal::Array(cells) => {
-                    let mut placeholders = String::new();
-                    let mut values = Vec::with_capacity(cells.len());
-                    for (i, cell) in cells.iter().enumerate() {
-                        if i > 0 {
-                            placeholders.push_str(", ");
-                        }
-                        placeholders.push('?');
-                        values.push(seed_json_to_sql_value(cell));
+                i = batch_end;
+            } else if is_arr {
+                let ncols = match &rows[i] {
+                    JsonVal::Array(c) => c.len(),
+                    _ => unreachable!(),
+                };
+                if let Some(cols) = explicit_columns {
+                    if cols.len() != ncols {
+                        return Err(SqliteError::Misuse(format!(
+                            "seed row for '{table_name}' has {} values but {} columns were declared",
+                            ncols,
+                            cols.len()
+                        )));
                     }
-                    let sql = if let Some(cols) = explicit_columns {
-                        if cols.len() != cells.len() {
-                            return Err(SqliteError::Misuse(format!(
-                                "seed row for '{table_name}' has {} values but {} columns were declared",
-                                cells.len(),
-                                cols.len()
-                            )));
-                        }
-                        let cols_sql = cols
-                            .iter()
-                            .map(|c| quote_ident(c))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("{prefix}{quoted_table} ({cols_sql}) VALUES ({placeholders})")
-                    } else {
-                        format!("{prefix}{quoted_table} VALUES ({placeholders})")
+                }
+                if ncols == 0 {
+                    let sql = format!("{prefix}{quoted_table} DEFAULT VALUES");
+                    let res = self.execute(&sql)?;
+                    report.statements_executed += 1;
+                    if res.changes > 0 {
+                        report.rows_inserted += res.changes as usize;
+                    }
+                    i += 1;
+                    continue;
+                }
+                let mut batch_end = i + 1;
+                while batch_end < rows.len() {
+                    let JsonVal::Array(ref next_cells) = rows[batch_end] else {
+                        break;
                     };
+                    if next_cells.len() != ncols {
+                        break;
+                    }
+                    batch_end += 1;
+                }
+                let col_refs: Option<Vec<&str>> =
+                    explicit_columns.map(|cs| cs.iter().map(String::as_str).collect());
+                if let Some(inserted) = self.try_insert_seed_json_batch_direct(
+                    table_name,
+                    col_refs.as_deref(),
+                    &mut rows[i..batch_end],
+                    false,
+                    mode.conflict_action(),
+                    owned_outer_tx,
+                )? {
+                    report.statements_executed += 1;
+                    report.rows_inserted += inserted;
+                    i = batch_end;
+                    continue;
+                }
+                let mut batch_rows = Vec::with_capacity(batch_end - i);
+                for row_item in &mut rows[i..batch_end] {
+                    if let JsonVal::Array(cells) = std::mem::replace(row_item, JsonVal::Null) {
+                        let mut r = Vec::with_capacity(ncols);
+                        for cell in cells {
+                            r.push(seed_json_to_sql_value_owned(cell));
+                        }
+                        batch_rows.push(r);
+                    }
+                }
+                let max_rows = (MAX_BATCH_PARAMS / ncols.max(1)).clamp(1, MAX_BATCH_ROWS);
+                let mut sub_start = 0usize;
+                while sub_start < batch_rows.len() {
+                    let sub_end = (sub_start + max_rows).min(batch_rows.len());
+                    let sub_len = sub_end - sub_start;
+                    let mut row_ph = String::with_capacity(ncols * 3);
+                    for ci in 0..ncols {
+                        if ci > 0 {
+                            row_ph.push_str(", ");
+                        }
+                        row_ph.push('?');
+                    }
+                    let mut sql = String::new();
+                    sql.push_str(prefix);
+                    sql.push_str(&quoted_table);
+                    if let Some(cols) = explicit_columns {
+                        sql.push_str(" (");
+                        for (ci, c) in cols.iter().enumerate() {
+                            if ci > 0 {
+                                sql.push_str(", ");
+                            }
+                            sql.push_str(&quote_ident(c));
+                        }
+                        sql.push(')');
+                    }
+                    sql.push_str(" VALUES ");
+                    let mut values = Vec::with_capacity(sub_len * ncols);
+                    for (bi, r) in batch_rows[sub_start..sub_end].iter_mut().enumerate() {
+                        if bi > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push('(');
+                        sql.push_str(&row_ph);
+                        sql.push(')');
+                        values.append(r);
+                    }
                     let params = QueryParams::positional(values);
                     let res = self.execute_with_params(&sql, &params)?;
                     report.statements_executed += 1;
                     if res.changes > 0 {
                         report.rows_inserted += res.changes as usize;
                     }
+                    sub_start = sub_end;
                 }
-                _ => {
-                    return Err(SqliteError::Misuse(format!(
-                        "seed rows for '{table_name}' must be objects or arrays"
-                    )));
-                }
+                i = batch_end;
+            } else {
+                return Err(SqliteError::Misuse(format!(
+                    "seed rows for '{table_name}' must be objects or arrays"
+                )));
             }
         }
 
         report.tables_seeded += 1;
         Ok(())
     }
+}
+
+struct StreamTableSpec<'a> {
+    name: &'a str,
+    cols: Vec<(&'a str, InferredType)>,
+    array_body_start: usize,
+    array_body_end: usize,
+}
+
+#[inline]
+fn skip_json_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    pos
+}
+
+#[inline]
+fn scan_simple_str<'a>(src: &'a str, bytes: &[u8], pos: usize) -> Option<(&'a str, usize)> {
+    if pos >= bytes.len() || bytes[pos] != b'"' {
+        return None;
+    }
+    let start = pos + 1;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            return Some((&src[start..i], i + 1));
+        }
+        if b == b'\\' || b < 0x20 {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn scan_simple_scalar<'a>(
+    src: &'a str,
+    bytes: &[u8],
+    pos: usize,
+) -> Option<(BorrowedRecordVal<'a>, InferredType, usize)> {
+    let b = *bytes.get(pos)?;
+    match b {
+        b'"' => {
+            let (s, next) = scan_simple_str(src, bytes, pos)?;
+            Some((BorrowedRecordVal::Text(s.as_bytes()), InferredType::Text, next))
+        }
+        b'n' => bytes[pos..]
+            .starts_with(b"null")
+            .then_some((BorrowedRecordVal::Null, InferredType::Unknown, pos + 4)),
+        b't' => bytes[pos..]
+            .starts_with(b"true")
+            .then_some((BorrowedRecordVal::Int(1), InferredType::Integer, pos + 4)),
+        b'f' => bytes[pos..]
+            .starts_with(b"false")
+            .then_some((BorrowedRecordVal::Int(0), InferredType::Integer, pos + 5)),
+        b'-' | b'0'..=b'9' => {
+            let start = pos;
+            let mut i = pos;
+            let neg = if bytes[i] == b'-' {
+                i += 1;
+                true
+            } else {
+                false
+            };
+            let int_start = i;
+            let first_d = *bytes.get(i)?;
+            if !first_d.is_ascii_digit() {
+                return None;
+            }
+            if first_d == b'0' {
+                if neg {
+                    // Defer `-0` / `-0.x` to full parser for exact sign parity.
+                    return None;
+                }
+                i += 1;
+                if bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+            } else {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            let mut is_float = false;
+            if bytes.get(i) == Some(&b'.') {
+                is_float = true;
+                i += 1;
+                let frac_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == frac_start {
+                    return None;
+                }
+            }
+            if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                is_float = true;
+                i += 1;
+                if matches!(bytes.get(i), Some(b'+' | b'-')) {
+                    i += 1;
+                }
+                let exp_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == exp_start {
+                    return None;
+                }
+            }
+            if is_float {
+                let f = src[start..i].parse::<f64>().ok()?;
+                if !f.is_finite() {
+                    return None;
+                }
+                Some((BorrowedRecordVal::Real(f), InferredType::Real, i))
+            } else {
+                let mut acc = 0i64;
+                if neg {
+                    for &d in &bytes[int_start..i] {
+                        acc = acc.checked_mul(10)?.checked_sub(i64::from(d - b'0'))?;
+                    }
+                } else {
+                    for &d in &bytes[int_start..i] {
+                        acc = acc.checked_mul(10)?.checked_add(i64::from(d - b'0'))?;
+                    }
+                }
+                Some((BorrowedRecordVal::Int(acc), InferredType::Integer, i))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn scan_shorthand_specs<'a>(
+    src: &'a str,
+    meter: &dyn xdb_core::Meter,
+) -> SqliteResult<Option<Vec<StreamTableSpec<'a>>>> {
+    let bytes = src.as_bytes();
+    let metered = !meter.is_noop();
+    let mut pos = skip_json_ws(bytes, 0);
+    if pos >= bytes.len() || bytes[pos] != b'{' {
+        return Ok(None);
+    }
+    pos = skip_json_ws(bytes, pos + 1);
+    if pos < bytes.len() && bytes[pos] == b'}' {
+        return Ok(None);
+    }
+
+    let mut specs: Vec<StreamTableSpec<'a>> = Vec::new();
+    let mut rows_scanned = 0u64;
+    loop {
+        let Some((tname, next)) = scan_simple_str(src, bytes, pos) else {
+            return Ok(None);
+        };
+        if tname.trim().is_empty()
+            || tname.starts_with('$')
+            || matches!(
+                tname,
+                "mode" | "schema" | "tables" | "statements" | "pragmas"
+            )
+            || tname.len() >= 7 && tname[..7].eq_ignore_ascii_case("sqlite_")
+            || specs.iter().any(|s| s.name.eq_ignore_ascii_case(tname))
+        {
+            return Ok(None);
+        }
+        pos = skip_json_ws(bytes, next);
+        if bytes.get(pos) != Some(&b':') {
+            return Ok(None);
+        }
+        pos = skip_json_ws(bytes, pos + 1);
+        if bytes.get(pos) != Some(&b'[') {
+            return Ok(None);
+        }
+        let array_body_start = skip_json_ws(bytes, pos + 1);
+        pos = array_body_start;
+        if bytes.get(pos) != Some(&b'{') {
+            // Empty array or array of non-objects -> defer to full parser.
+            return Ok(None);
+        }
+
+        let mut cols: Vec<(&'a str, InferredType)> = Vec::new();
+        let mut is_first_row = true;
+        let array_body_end;
+        loop {
+            if metered {
+                rows_scanned += 1;
+                if (rows_scanned & 31) == 0 {
+                    meter.charge_steps(1)?;
+                }
+            }
+            if bytes.get(pos) != Some(&b'{') {
+                return Ok(None);
+            }
+            pos = skip_json_ws(bytes, pos + 1);
+            if bytes.get(pos) == Some(&b'}') {
+                return Ok(None);
+            }
+            if is_first_row {
+                loop {
+                    let Some((k, next_k)) = scan_simple_str(src, bytes, pos) else {
+                        return Ok(None);
+                    };
+                    if k.is_empty()
+                        || cols.len() >= 16
+                        || cols.iter().any(|&(ec, _)| ec.eq_ignore_ascii_case(k))
+                    {
+                        return Ok(None);
+                    }
+                    pos = skip_json_ws(bytes, next_k);
+                    if bytes.get(pos) != Some(&b':') {
+                        return Ok(None);
+                    }
+                    pos = skip_json_ws(bytes, pos + 1);
+                    let Some((_, ty, next_v)) = scan_simple_scalar(src, bytes, pos) else {
+                        return Ok(None);
+                    };
+                    cols.push((k, ty));
+                    pos = skip_json_ws(bytes, next_v);
+                    match bytes.get(pos) {
+                        Some(&b',') => {
+                            pos = skip_json_ws(bytes, pos + 1);
+                        }
+                        Some(&b'}') => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                is_first_row = false;
+            } else {
+                let ncols = cols.len();
+                for (ci, (col_name, col_ty)) in cols.iter_mut().enumerate() {
+                    let Some((k, next_k)) = scan_simple_str(src, bytes, pos) else {
+                        return Ok(None);
+                    };
+                    if k != *col_name {
+                        return Ok(None);
+                    }
+                    pos = skip_json_ws(bytes, next_k);
+                    if bytes.get(pos) != Some(&b':') {
+                        return Ok(None);
+                    }
+                    pos = skip_json_ws(bytes, pos + 1);
+                    let Some((_, ty, next_v)) = scan_simple_scalar(src, bytes, pos) else {
+                        return Ok(None);
+                    };
+                    let prev = *col_ty;
+                    let merged = prev.merge(ty);
+                    // Defer mixed numeric+text columns so full affinity formatting matches exactly.
+                    if merged == InferredType::Text
+                        && ((prev != InferredType::Unknown && prev != InferredType::Text)
+                            || (ty != InferredType::Unknown && ty != InferredType::Text))
+                    {
+                        return Ok(None);
+                    }
+                    *col_ty = merged;
+                    pos = skip_json_ws(bytes, next_v);
+                    if ci + 1 < ncols {
+                        if bytes.get(pos) != Some(&b',') {
+                            return Ok(None);
+                        }
+                        pos = skip_json_ws(bytes, pos + 1);
+                    }
+                }
+                if bytes.get(pos) != Some(&b'}') {
+                    return Ok(None);
+                }
+                pos += 1;
+            }
+
+            let after_obj = pos;
+            pos = skip_json_ws(bytes, pos);
+            match bytes.get(pos) {
+                Some(&b',') => {
+                    pos = skip_json_ws(bytes, pos + 1);
+                }
+                Some(&b']') => {
+                    array_body_end = after_obj;
+                    pos += 1;
+                    break;
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        specs.push(StreamTableSpec {
+            name: tname,
+            cols,
+            array_body_start,
+            array_body_end,
+        });
+
+        pos = skip_json_ws(bytes, pos);
+        match bytes.get(pos) {
+            Some(&b',') => {
+                pos = skip_json_ws(bytes, pos + 1);
+            }
+            Some(&b'}') => {
+                pos = skip_json_ws(bytes, pos + 1);
+                break;
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    if pos != bytes.len() || specs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(specs))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,18 +1159,80 @@ fn infer_value_type(v: &JsonVal) -> InferredType {
     }
 }
 
+fn is_structured_seed(entries: &[(String, JsonVal)]) -> bool {
+    let mut has_structured_key = false;
+    for (k, v) in entries {
+        match k.as_str() {
+            "mode" => {
+                if matches!(v, JsonVal::Array(_)) {
+                    return false;
+                }
+                has_structured_key = true;
+            }
+            "tables" => {
+                if let JsonVal::Array(items) = v {
+                    // A structured `tables` array holds table-spec objects (`{name/table, rows/data/schema/ddl/columns}`).
+                    let looks_like_specs = !items.is_empty()
+                        && items.iter().all(|it| match it {
+                            JsonVal::Object(fs) => {
+                                let has_name =
+                                    fs.iter().any(|(fk, _)| matches!(fk.as_str(), "name" | "table"));
+                                let has_spec = fs.iter().any(|(fk, _)| {
+                                    matches!(
+                                        fk.as_str(),
+                                        "rows" | "data" | "schema" | "ddl" | "columns" | "mode"
+                                    )
+                                });
+                                has_name && has_spec
+                            }
+                            _ => false,
+                        });
+                    if !looks_like_specs {
+                        return false;
+                    }
+                }
+                has_structured_key = true;
+            }
+            "schema" | "pragmas" | "statements" => {
+                if let JsonVal::Array(items) = v {
+                    let looks_like_sql = items.iter().all(|it| match it {
+                        JsonVal::Str(_) => true,
+                        JsonVal::Object(fs) => fs.iter().any(|(fk, _)| fk == "sql"),
+                        _ => false,
+                    });
+                    if !looks_like_sql {
+                        return false;
+                    }
+                }
+                has_structured_key = true;
+            }
+            other if !other.starts_with('$') => {
+                // If any sibling key holds an array (table rows), treat the document as a
+                // shorthand table map rather than silently ignoring user tables!
+                if matches!(v, JsonVal::Array(_)) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    has_structured_key
+}
+
 fn infer_columns_from_rows(
     explicit_columns: Option<&[String]>,
     rows: &[JsonVal],
 ) -> SqliteResult<Vec<(String, InferredType)>> {
     let mut order: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut types: Vec<InferredType> = Vec::new();
 
     if let Some(cols) = explicit_columns {
         for c in cols {
             let key = c.to_ascii_lowercase();
-            if seen.insert(key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+                let idx = order.len();
+                e.insert(idx);
                 order.push(c.clone());
                 types.push(InferredType::Unknown);
             }
@@ -552,12 +1242,20 @@ fn infer_columns_from_rows(
     for row in rows {
         match row {
             JsonVal::Object(fields) => {
-                for (k, v) in fields {
+                for (fi, (k, v)) in fields.iter().enumerate() {
                     let t = infer_value_type(v);
-                    if let Some(idx) = order.iter().position(|existing| existing.eq_ignore_ascii_case(k)) {
+                    if let Some(existing) = order.get(fi) {
+                        if existing.eq_ignore_ascii_case(k) {
+                            types[fi] = types[fi].merge(t);
+                            continue;
+                        }
+                    }
+                    let key = k.to_ascii_lowercase();
+                    if let Some(&idx) = seen.get(&key) {
                         types[idx] = types[idx].merge(t);
                     } else {
-                        seen.insert(k.to_ascii_lowercase());
+                        let idx = order.len();
+                        seen.insert(key, idx);
                         order.push(k.clone());
                         types.push(t);
                     }
@@ -627,6 +1325,17 @@ fn json_val_to_query_params(val: JsonVal) -> SqliteResult<QueryParams> {
         _ => Err(SqliteError::Misuse(
             "seed statement 'params' must be an array or object".to_string(),
         )),
+    }
+}
+
+pub(crate) fn seed_json_to_sql_value_owned(v: JsonVal) -> SqlValue {
+    match v {
+        JsonVal::Null => SqlValue::Null,
+        JsonVal::Bool(b) => SqlValue::Int(i64::from(b)),
+        JsonVal::Int(i) => SqlValue::Int(i),
+        JsonVal::Real(r) => SqlValue::real(r),
+        JsonVal::Str(s) => SqlValue::Text(s.into_bytes().into_boxed_slice()),
+        other => seed_json_to_sql_value(&other),
     }
 }
 

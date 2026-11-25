@@ -39,7 +39,13 @@ pub fn boolean_value(v: &SqlValue, if_null: bool) -> bool {
     match v {
         SqlValue::Null => if_null,
         SqlValue::Int(i) => *i != 0,
-        SqlValue::Real(r) => *r != 0.0,
+        SqlValue::Real(r) => {
+            if r.is_nan() {
+                if_null
+            } else {
+                *r != 0.0
+            }
+        }
         SqlValue::Text(b) | SqlValue::Blob(b) => atof(b).value != 0.0,
     }
 }

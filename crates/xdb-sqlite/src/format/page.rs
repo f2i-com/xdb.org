@@ -281,9 +281,17 @@ impl BtreePage {
                 out.cell_size = 4 + len;
                 return Ok(out);
             }
-            let (n, n_len) = get_payload_size_varint(data, pc);
+            let (n, n_len) = if pc < end && data[pc] < 0x80 {
+                (u32::from(data[pc]), 1usize)
+            } else {
+                get_payload_size_varint(data, pc)
+            };
             let p0 = pc + n_len;
-            let (key, k_len) = get_varint(data, p0);
+            let (key, k_len) = if p0 < end && data[p0] < 0x80 {
+                (i64::from(data[p0]), 1usize)
+            } else {
+                get_varint(data, p0)
+            };
             let p = p0 + k_len;
             if p > end {
                 return Err(self.past_buffer(i));

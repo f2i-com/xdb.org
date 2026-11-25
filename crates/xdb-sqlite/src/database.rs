@@ -19,7 +19,11 @@ use crate::btree::{
     Btree, BtreeOptions, IndexCursor, RecordKey, RecordView, SeekOp, SeekResult, TableCursor,
 };
 use crate::errors::{SqliteError, SqliteResult};
-use crate::format::RawDbHeader;
+use crate::format::{
+    decode_serial_value, get_payload_size_varint, get_varint, get_varint32, serial_type_length,
+    RawDbHeader,
+};
+use crate::format::page::read_u16_be;
 use crate::schema::{
     ascii_fold, load_schema, real_read_back, ColumnHiddenKind, ColumnInfo, IndexInfo,
     LoadSchemaOptions, SchemaCatalog, SchemaObject, TableInfo,
@@ -130,17 +134,27 @@ pub fn open_database_from_bytes(
     journal: Option<&[u8]>,
     options: OpenOptions,
 ) -> SqliteResult<SqliteDatabase> {
+    open_database_from_owned_bytes(
+        main.to_vec(),
+        wal.map(|b| b.to_vec()),
+        journal.map(|b| b.to_vec()),
+        options,
+    )
+}
+
+/// Open a SQLite database from owned raw byte buffers (avoids cloning `wal`/`journal`).
+pub fn open_database_from_owned_bytes(
+    main: Vec<u8>,
+    wal: Option<Vec<u8>>,
+    journal: Option<Vec<u8>>,
+    options: OpenOptions,
+) -> SqliteResult<SqliteDatabase> {
     let snap_opts = SnapshotOptions {
         wal: options.wal,
         hot_journal: options.hot_journal,
         max_pathname: options.max_pathname,
     };
-    let snapshot = open_snapshot_from_bytes(
-        main.to_vec(),
-        wal.map(|b| b.to_vec()),
-        journal.map(|b| b.to_vec()),
-        snap_opts,
-    )?;
+    let snapshot = open_snapshot_from_bytes(main, wal, journal, snap_opts)?;
     open_from_snapshot(snapshot, None, options.cache_pages, options.meter)
 }
 
@@ -180,7 +194,7 @@ pub(crate) fn open_from_page_source_cached(
     let ps = source.page_size();
     let pc = source.page_count();
     let header = if pc > 0 {
-        let p1 = source.read_page(1)?;
+        let p1 = source.read_page_shared(1)?;
         crate::format::read_raw_header(&p1)
     } else {
         None
@@ -419,6 +433,8 @@ struct ScanPlan {
     real_back: Vec<bool>,
     dflt: Vec<SqlValue>,
     needs_rowid: bool,
+    any_field: bool,
+    max_field: usize,
 }
 
 /// Handle for reading rows from one SQLite table.
@@ -523,6 +539,8 @@ impl TableReader {
             real_back.push(false);
             dflt.push(SqlValue::Null);
         }
+        let mut any_field = false;
+        let mut max_field = 0usize;
         for c in &cols {
             if c.rowid_alias {
                 src.push(ValueSrc::Rowid);
@@ -531,10 +549,15 @@ impl TableReader {
                 dflt.push(SqlValue::Null);
                 needs_rowid = true;
             } else {
+                let f = c.storage_index.expect("stored column has storage_index");
                 src.push(ValueSrc::Field);
-                field.push(c.storage_index.expect("stored column has storage_index"));
+                field.push(f);
                 real_back.push(c.affinity == Affinity::Real);
                 dflt.push(c.default_value.clone());
+                any_field = true;
+                if f > max_field {
+                    max_field = f;
+                }
             }
         }
 
@@ -545,6 +568,74 @@ impl TableReader {
             real_back,
             dflt,
             needs_rowid,
+            any_field,
+            max_field,
+        })
+    }
+
+    /// Open an internal forward cursor over specific stored column indices `cids` without
+    /// cloning `ColumnInfo` strings (used by the SQL scan bridge where `columns()` is unused).
+    pub(crate) fn cursor_cids(&self, cids: &[usize]) -> SqliteResult<RowCursor> {
+        self.check_open()?;
+        let all = &self.info.columns;
+        let n = cids.len();
+        let mut src = Vec::with_capacity(n);
+        let mut field = Vec::with_capacity(n);
+        let mut real_back = Vec::with_capacity(n);
+        let mut dflt = Vec::with_capacity(n);
+        let mut needs_rowid = false;
+        let mut any_field = false;
+        let mut max_field = 0usize;
+        for &cid in cids {
+            let Some(c) = all.get(cid) else {
+                return Err(SqliteError::misuse(format!(
+                    "table {} has no column {cid}",
+                    self.info.name
+                )));
+            };
+            if c.hidden == ColumnHiddenKind::Virtual {
+                return Err(SqliteError::virtual_column(&self.info.name, &c.name));
+            }
+            if c.rowid_alias {
+                src.push(ValueSrc::Rowid);
+                field.push(0);
+                real_back.push(false);
+                dflt.push(SqlValue::Null);
+                needs_rowid = true;
+            } else {
+                let f = c.storage_index.expect("stored column has storage_index");
+                src.push(ValueSrc::Field);
+                field.push(f);
+                real_back.push(c.affinity == Affinity::Real);
+                dflt.push(c.default_value.clone());
+                any_field = true;
+                if f > max_field {
+                    max_field = f;
+                }
+            }
+        }
+        let plan = ScanPlan {
+            columns: Vec::new(),
+            src,
+            field,
+            real_back,
+            dflt,
+            needs_rowid,
+            any_field,
+            max_field,
+        };
+        let cur = if self.info.without_rowid {
+            RowCursorInner::WithoutRowid(Box::new(self.btree.index_cursor(self.info.root_page)?))
+        } else {
+            RowCursorInner::Rowid(Box::new(self.btree.table_cursor(self.info.root_page)?))
+        };
+        Ok(RowCursor {
+            closed: self.closed.clone(),
+            cur,
+            plan,
+            fast_slots: [(0, 0, 0); 32],
+            started: false,
+            valid: false,
         })
     }
 
@@ -561,6 +652,7 @@ impl TableReader {
             closed: self.closed.clone(),
             cur,
             plan,
+            fast_slots: [(0, 0, 0); 32],
             started: false,
             valid: false,
         })
@@ -631,6 +723,57 @@ fn decode_row(plan: &ScanPlan, rec: &mut RecordView, rowid: i64) -> SqliteResult
     Ok(out)
 }
 
+/// Fast stack-only peek result for single-column key reads (`TopK` heap filtering).
+pub(crate) enum FastPeekVal {
+    Int(i64),
+    Other(SqlValue),
+}
+
+#[inline]
+fn decode_int_serial_inline(payload: &[u8], st: u32, off: usize) -> Option<i64> {
+    match st {
+        8 => Some(0),
+        9 => Some(1),
+        1 => Some(i64::from(payload[off] as i8)),
+        2 => Some(i64::from(i16::from_be_bytes([
+            payload[off],
+            payload[off + 1],
+        ]))),
+        3 => {
+            let v = ((i32::from(payload[off] as i8)) << 16)
+                | (i32::from(payload[off + 1]) << 8)
+                | i32::from(payload[off + 2]);
+            Some(i64::from(v))
+        }
+        4 => Some(i64::from(i32::from_be_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]))),
+        5 => {
+            let v = ((i64::from(payload[off] as i8)) << 40)
+                | (i64::from(payload[off + 1]) << 32)
+                | (i64::from(payload[off + 2]) << 24)
+                | (i64::from(payload[off + 3]) << 16)
+                | (i64::from(payload[off + 4]) << 8)
+                | i64::from(payload[off + 5]);
+            Some(v)
+        }
+        6 => Some(i64::from_be_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+            payload[off + 4],
+            payload[off + 5],
+            payload[off + 6],
+            payload[off + 7],
+        ])),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 enum RowCursorInner {
     Rowid(Box<TableCursor>),
@@ -643,6 +786,7 @@ pub struct RowCursor {
     closed: Arc<AtomicBool>,
     cur: RowCursorInner,
     plan: ScanPlan,
+    fast_slots: [(u32, u32, u32); 32],
     started: bool,
     valid: bool,
 }
@@ -683,6 +827,32 @@ impl RowCursor {
         Ok(self.valid)
     }
 
+    /// Position on the last row in B-tree order; `false` if the table is empty.
+    pub fn last(&mut self) -> SqliteResult<bool> {
+        self.check_open()?;
+        self.started = true;
+        self.valid = match &mut self.cur {
+            RowCursorInner::Rowid(c) => c.last()?,
+            RowCursorInner::WithoutRowid(c) => c.last()?,
+        };
+        Ok(self.valid)
+    }
+
+    /// Move to the previous row in B-tree order; `false` at BOF.
+    pub fn prev(&mut self) -> SqliteResult<bool> {
+        self.check_open()?;
+        if !self.started {
+            return self.last();
+        }
+        if self.valid {
+            self.valid = match &mut self.cur {
+                RowCursorInner::Rowid(c) => c.prev()?,
+                RowCursorInner::WithoutRowid(c) => c.prev()?,
+            };
+        }
+        Ok(self.valid)
+    }
+
     /// Seek to the row with smallest rowid `>= rowid` (rowid tables only).
     pub fn seek(&mut self, rowid: i64) -> SqliteResult<SeekResult> {
         self.check_open()?;
@@ -717,16 +887,14 @@ impl RowCursor {
                 self.plan.src.len()
             )));
         }
-        let rowid = if self.plan.needs_rowid {
-            self.rowid()?
-        } else {
-            0
-        };
+        if matches!(self.plan.src[j], ValueSrc::Rowid) {
+            return Ok(SqlValue::Int(self.rowid()?));
+        }
         let rec = match &mut self.cur {
             RowCursorInner::Rowid(c) => c.record()?,
             RowCursorInner::WithoutRowid(c) => c.record()?,
         };
-        decode_value(&self.plan, j, rec, rowid)
+        decode_value(&self.plan, j, rec, 0)
     }
 
     /// Decode all projected values of the current row.
@@ -742,6 +910,482 @@ impl RowCursor {
             RowCursorInner::WithoutRowid(c) => c.record()?,
         };
         decode_row(&self.plan, rec, rowid)
+    }
+
+    /// Decode projected values directly into a `total_cols`-wide vector at positions `cids`
+    /// (single allocation, leaving unrequested slots as `SqlValue::Null`).
+    pub(crate) fn row_into_sparse(
+        &mut self,
+        total_cols: usize,
+        cids: &[usize],
+    ) -> SqliteResult<Vec<SqlValue>> {
+        let mut out = vec![SqlValue::Null; total_cols];
+        self.decode_into_sparse_buf(&mut out, cids)?;
+        Ok(out)
+    }
+
+    /// Advance to the next row and immediately peek key column `j` with a single `check_open()`.
+    #[inline]
+    pub(crate) fn next_peek_key_fast(&mut self, j: usize) -> SqliteResult<Option<FastPeekVal>> {
+        if !self.next()? {
+            return Ok(None);
+        }
+        self.peek_key_fast_checked(j).map(Some)
+    }
+
+    /// Fast stack-only single-column key peek for `TopK` scans (bypasses `RecordView` and
+    /// `SqlValue` allocation on local rowid-table integer fields!).
+    #[inline]
+    fn peek_key_fast_checked(&mut self, j: usize) -> SqliteResult<FastPeekVal> {
+        if matches!(self.plan.src[j], ValueSrc::Rowid) {
+            return Ok(FastPeekVal::Int(self.rowid()?));
+        }
+        let target_f = self.plan.field[j];
+        let real_back = self.plan.real_back[j];
+        if let RowCursorInner::Rowid(ref mut tc) = self.cur {
+            if let Some((_rid, payload, enc)) = tc.current_local_payload()? {
+                if !payload.is_empty() {
+                    let b0 = payload[0];
+                    let (hdr_len_u32, mut hpos) = if b0 < 0x80 {
+                        (u32::from(b0), 1usize)
+                    } else {
+                        get_varint32(payload, 0)
+                    };
+                    let hdr_len = hdr_len_u32 as usize;
+                    if hdr_len > hpos && hdr_len <= payload.len() {
+                        let mut boff = hdr_len;
+                        let mut col = 0usize;
+                        let mut ok = true;
+                        while hpos < hdr_len {
+                            let hb = payload[hpos];
+                            let (st, n) = if hb < 0x80 {
+                                (u32::from(hb), 1usize)
+                            } else {
+                                get_varint32(payload, hpos)
+                            };
+                            hpos += n;
+                            if hpos > hdr_len {
+                                ok = false;
+                                break;
+                            }
+                            let blen = serial_type_length(st);
+                            let Some(end) = boff.checked_add(blen) else {
+                                ok = false;
+                                break;
+                            };
+                            if end > payload.len() {
+                                ok = false;
+                                break;
+                            }
+                            if col == target_f {
+                                if hpos == hdr_len && end != payload.len() {
+                                    ok = false;
+                                    break;
+                                }
+                                if !real_back {
+                                    if let Some(iv) = decode_int_serial_inline(payload, st, boff) {
+                                        return Ok(FastPeekVal::Int(iv));
+                                    }
+                                }
+                                let v = decode_serial_value(&payload[boff..end], st, enc);
+                                let v = if real_back { real_read_back(v) } else { v };
+                                return Ok(match v {
+                                    SqlValue::Int(iv) => FastPeekVal::Int(iv),
+                                    other => FastPeekVal::Other(other),
+                                });
+                            }
+                            boff = end;
+                            col += 1;
+                        }
+                        if ok && hpos == hdr_len && boff == payload.len() && col <= target_f {
+                            // Column past record end -> default value (matches `decode_value`).
+                            let v = self.plan.dflt[j].clone();
+                            return Ok(match v {
+                                SqlValue::Int(iv) => FastPeekVal::Int(iv),
+                                other => FastPeekVal::Other(other),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let v = self.value(j)?;
+        Ok(match v {
+            SqlValue::Int(iv) => FastPeekVal::Int(iv),
+            other => FastPeekVal::Other(other),
+        })
+    }
+
+    /// Fast inline local-payload decoder writing directly into `buf[cids[j]]` using the cursor's
+    /// preallocated `fast_slots` scratch buffer (zero per-row `RecordView` or stack array memset).
+    #[inline]
+    fn decode_local_payload_into_sparse(
+        plan: &ScanPlan,
+        slots: &mut [(u32, u32, u32); 32],
+        rid: i64,
+        payload: &[u8],
+        enc: TextEncoding,
+        buf: &mut [SqlValue],
+        cids: &[usize],
+    ) -> bool {
+        if !plan.any_field {
+            for &cid in cids {
+                buf[cid] = SqlValue::Int(rid);
+            }
+            return true;
+        }
+        let max_f = plan.max_field;
+        if max_f >= 32 || payload.is_empty() || payload.len() > u32::MAX as usize {
+            return false;
+        }
+        let b0 = payload[0];
+        let (hdr_len_u32, mut hpos) = if b0 < 0x80 {
+            (u32::from(b0), 1usize)
+        } else {
+            get_varint32(payload, 0)
+        };
+        let hdr_len = hdr_len_u32 as usize;
+        if hdr_len <= hpos || hdr_len > payload.len() {
+            return false;
+        }
+        let mut boff = hdr_len;
+        let mut col = 0usize;
+        while hpos < hdr_len && col <= max_f {
+            let hb = payload[hpos];
+            let (st, n) = if hb < 0x80 {
+                (u32::from(hb), 1usize)
+            } else {
+                get_varint32(payload, hpos)
+            };
+            hpos += n;
+            if hpos > hdr_len {
+                return false;
+            }
+            let blen = serial_type_length(st);
+            let Some(end) = boff.checked_add(blen) else {
+                return false;
+            };
+            if end > payload.len() {
+                return false;
+            }
+            slots[col] = (st, boff as u32, end as u32);
+            boff = end;
+            col += 1;
+        }
+        if hpos == hdr_len && boff != payload.len() {
+            return false;
+        }
+        for (j, &cid) in cids.iter().enumerate() {
+            if plan.src[j] == ValueSrc::Rowid {
+                buf[cid] = SqlValue::Int(rid);
+            } else {
+                let f = plan.field[j];
+                if f < col {
+                    let (st, s_off, e_off) = slots[f];
+                    let s_off = s_off as usize;
+                    let e_off = e_off as usize;
+                    let v = if let Some(iv) = decode_int_serial_inline(payload, st, s_off) {
+                        SqlValue::Int(iv)
+                    } else {
+                        decode_serial_value(&payload[s_off..e_off], st, enc)
+                    };
+                    buf[cid] = if plan.real_back[j] {
+                        real_read_back(v)
+                    } else {
+                        v
+                    };
+                } else {
+                    buf[cid] = plan.dflt[j].clone();
+                }
+            }
+        }
+        true
+    }
+
+    /// Decode projected values into an existing `buf` slice at positions `cids` AND return
+    /// `Some(rowid)` (for rowid tables) or `None` (for `WITHOUT ROWID`), using a zero-`RecordView`
+    /// fast path for inline local rows.
+    pub(crate) fn decode_into_sparse_buf_with_rowid(
+        &mut self,
+        buf: &mut [SqlValue],
+        cids: &[usize],
+    ) -> SqliteResult<Option<i64>> {
+        self.check_open()?;
+        if let RowCursorInner::Rowid(ref mut tc) = self.cur {
+            if cids.is_empty() {
+                return Ok(Some(tc.rowid()?));
+            }
+            if let Some((rid, payload, enc)) = tc.current_local_payload()? {
+                if Self::decode_local_payload_into_sparse(
+                    &self.plan,
+                    &mut self.fast_slots,
+                    rid,
+                    payload,
+                    enc,
+                    buf,
+                    cids,
+                ) {
+                    return Ok(Some(rid));
+                }
+            }
+            let rid = tc.rowid()?;
+            let rec = tc.record()?;
+            for (j, &cid) in cids.iter().enumerate() {
+                buf[cid] = decode_value(&self.plan, j, rec, rid)?;
+            }
+            return Ok(Some(rid));
+        }
+
+        if cids.is_empty() {
+            return Ok(None);
+        }
+        let RowCursorInner::WithoutRowid(ref mut ic) = self.cur else {
+            unreachable!();
+        };
+        let rec = ic.record()?;
+        for (j, &cid) in cids.iter().enumerate() {
+            buf[cid] = decode_value(&self.plan, j, rec, 0)?;
+        }
+        Ok(None)
+    }
+
+    /// Decode projected values into `buf` only when current `rowid <= hi` (or `hi.is_none()`),
+    /// parsing the leaf cell header only ONCE on local rows.
+    /// Returns `Ok(Some(rid))` when decoded, or `Ok(None)` when `rid > hi`.
+    #[inline]
+    pub(crate) fn decode_into_sparse_buf_if_rowid_le(
+        &mut self,
+        buf: &mut [SqlValue],
+        cids: &[usize],
+        hi: Option<i64>,
+    ) -> SqliteResult<Option<i64>> {
+        self.check_open()?;
+        if let RowCursorInner::Rowid(ref mut tc) = self.cur {
+            if let Some((rid, payload, enc)) = tc.current_local_payload()? {
+                if let Some(h) = hi {
+                    if rid > h {
+                        return Ok(None);
+                    }
+                }
+                if cids.is_empty()
+                    || Self::decode_local_payload_into_sparse(
+                        &self.plan,
+                        &mut self.fast_slots,
+                        rid,
+                        payload,
+                        enc,
+                        buf,
+                        cids,
+                    )
+                {
+                    return Ok(Some(rid));
+                }
+            } else {
+                let rid = tc.rowid()?;
+                if let Some(h) = hi {
+                    if rid > h {
+                        return Ok(None);
+                    }
+                }
+                if cids.is_empty() {
+                    return Ok(Some(rid));
+                }
+            }
+            let rid = tc.rowid()?;
+            let rec = tc.record()?;
+            for (j, &cid) in cids.iter().enumerate() {
+                buf[cid] = decode_value(&self.plan, j, rec, rid)?;
+            }
+            return Ok(Some(rid));
+        }
+        Ok(None)
+    }
+
+    /// Decode projected values into an existing `buf` slice at positions `cids`
+    /// without allocating a new `Vec<SqlValue>`.
+    pub(crate) fn decode_into_sparse_buf(
+        &mut self,
+        buf: &mut [SqlValue],
+        cids: &[usize],
+    ) -> SqliteResult<()> {
+        let _ = self.decode_into_sparse_buf_with_rowid(buf, cids)?;
+        Ok(())
+    }
+
+    /// Whole-leaf batch scan over a rowid table (full scan or `[lo, hi]` rowid range):
+    /// locks onto each leaf page's raw bytes ONCE per page, checks `closed` ONCE per page,
+    /// and decodes local inline records directly into `buf[cids[j]]` without per-row
+    /// `CellInfo` construction or `CursorCore::next()` overhead. Falls back cleanly per row
+    /// for overflow payloads / >32-col tables, and falls back to normal cursor stepping for
+    /// `WITHOUT ROWID` tables or metered B-trees.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn visit_sparse_range<E>(
+        &mut self,
+        buf: &mut [SqlValue],
+        cids: &[usize],
+        lo: Option<i64>,
+        hi: Option<i64>,
+        meter: Option<&dyn Meter>,
+        map_err: fn(SqliteError) -> E,
+        map_limit: fn(xdb_core::ResourceLimitError) -> E,
+        visit: &mut dyn FnMut(Option<i64>, &[SqlValue]) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let positioned = if let Some(l) = lo {
+            self.seek(l).map_err(map_err)? != SeekResult::Eof
+        } else {
+            self.next().map_err(map_err)?
+        };
+        if !positioned {
+            return Ok(());
+        }
+
+        if let RowCursorInner::Rowid(ref mut tc) = self.cur {
+            let mut batch_ready = tc.current_leaf_batch();
+            if batch_ready.is_some() {
+                while let Some((page, start_ci, n_cell, usable, limits, enc)) = batch_ready.take() {
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(map_err(SqliteError::DatabaseClosed));
+                    }
+                    let data: &[u8] = &page.data;
+                    let bound = (usable as usize).min(data.len());
+                    let ptr_off = page.hdr_offset + 8;
+                    if ptr_off + 2 * n_cell > bound {
+                        return Err(map_err(SqliteError::corrupt(format!(
+                            "page {}: leaf cell pointers out of bounds",
+                            page.pgno
+                        ))));
+                    }
+                    let max_leaf = limits.max_leaf;
+                    for ci in start_ci..n_cell {
+                        if let Some(m) = meter {
+                            m.charge_steps(1).map_err(map_limit)?;
+                        }
+                        let pc = usize::from(read_u16_be(data, ptr_off + 2 * ci));
+                        if pc >= bound {
+                            return Err(map_err(SqliteError::corrupt(format!(
+                                "page {}: leaf cell {ci} offset out of bounds",
+                                page.pgno
+                            ))));
+                        }
+                        let (psize_u32, n1) = if data[pc] < 0x80 {
+                            (u32::from(data[pc]), 1usize)
+                        } else {
+                            get_payload_size_varint(data, pc)
+                        };
+                        let rid_off = pc + n1;
+                        if rid_off >= bound {
+                            return Err(map_err(SqliteError::corrupt(format!(
+                                "page {}: leaf cell {ci} truncated before rowid",
+                                page.pgno
+                            ))));
+                        }
+                        let (rid, n2) = if data[rid_off] < 0x80 {
+                            (i64::from(data[rid_off]), 1usize)
+                        } else if rid_off + 1 < bound && data[rid_off + 1] < 0x80 {
+                            (
+                                (i64::from(data[rid_off] & 0x7f) << 7)
+                                    | i64::from(data[rid_off + 1]),
+                                2usize,
+                            )
+                        } else {
+                            get_varint(data, rid_off)
+                        };
+                        let local_start = rid_off + n2;
+                        if local_start > bound {
+                            return Err(map_err(SqliteError::corrupt(format!(
+                                "page {}: leaf cell {ci} rowid varint runs past usable page end",
+                                page.pgno
+                            ))));
+                        }
+                        let cell_end = if psize_u32 <= max_leaf {
+                            local_start.saturating_add(psize_u32 as usize)
+                        } else {
+                            let local = crate::format::local_payload_size(
+                                psize_u32,
+                                limits.max_leaf,
+                                limits.min_local,
+                                usable,
+                            );
+                            local_start.saturating_add(local).saturating_add(4)
+                        };
+                        if cell_end > bound {
+                            return Err(map_err(SqliteError::corrupt(format!(
+                                "page {}: local payload runs past usable page end",
+                                page.pgno
+                            ))));
+                        }
+                        if let Some(h) = hi {
+                            if rid > h {
+                                return Ok(());
+                            }
+                        }
+                        if cids.is_empty() {
+                            if !visit(Some(rid), buf)? {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        let inline_decoded = if psize_u32 <= max_leaf {
+                            Self::decode_local_payload_into_sparse(
+                                &self.plan,
+                                &mut self.fast_slots,
+                                rid,
+                                &data[local_start..cell_end],
+                                enc,
+                                buf,
+                                cids,
+                            )
+                        } else {
+                            false
+                        };
+                        if !inline_decoded {
+                            tc.set_leaf_cell_index(ci);
+                            let r_rid = tc.rowid().map_err(map_err)?;
+                            let rec = tc.record().map_err(map_err)?;
+                            for (j, &cid) in cids.iter().enumerate() {
+                                buf[cid] =
+                                    decode_value(&self.plan, j, rec, r_rid).map_err(map_err)?;
+                            }
+                        }
+                        if !visit(Some(rid), buf)? {
+                            return Ok(());
+                        }
+                    }
+                    drop(page);
+                    if !tc.advance_to_next_leaf().map_err(map_err)? {
+                        self.valid = false;
+                        return Ok(());
+                    }
+                    batch_ready = tc.current_leaf_batch();
+                }
+            }
+        }
+
+        // Fallback row-by-row path (metered B-tree or WITHOUT ROWID table).
+        loop {
+            if let Some(m) = meter {
+                m.charge_steps(1).map_err(map_limit)?;
+            }
+            let rid_opt = if hi.is_some() {
+                match self
+                    .decode_into_sparse_buf_if_rowid_le(buf, cids, hi)
+                    .map_err(map_err)?
+                {
+                    Some(rid) => Some(rid),
+                    None => break,
+                }
+            } else {
+                self.decode_into_sparse_buf_with_rowid(buf, cids)
+                    .map_err(map_err)?
+            };
+            if !visit(rid_opt, buf)? {
+                break;
+            }
+            if !self.next().map_err(map_err)? {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -881,6 +1525,26 @@ impl IndexEntryCursor {
             self.valid = self.cur.first()?;
         } else if self.valid {
             self.valid = self.cur.next()?;
+        }
+        Ok(self.valid)
+    }
+
+    /// Position on the last entry in index B-tree order; `false` if the index is empty.
+    pub fn last(&mut self) -> SqliteResult<bool> {
+        self.check_open()?;
+        self.started = true;
+        self.valid = self.cur.last()?;
+        Ok(self.valid)
+    }
+
+    /// Move to the previous entry in index B-tree order; `false` at BOF.
+    pub fn prev(&mut self) -> SqliteResult<bool> {
+        self.check_open()?;
+        if !self.started {
+            return self.last();
+        }
+        if self.valid {
+            self.valid = self.cur.prev()?;
         }
         Ok(self.valid)
     }

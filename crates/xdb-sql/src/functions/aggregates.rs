@@ -5,11 +5,10 @@
 use std::cmp::Ordering;
 
 use xdb_core::value::{
-    add_i64, int_value, mem_compare, numeric_value, real_value, sub_i64, Collation, SqlValue,
+    apply_numeric_affinity, mem_compare, real_value, Collation, SqlValue,
 };
 
 use crate::errors::{SqlError, SqlResult};
-use crate::functions::json::json_value_from_sql;
 use crate::functions::FunctionContext;
 use crate::utf8::{text_bytes_of, value_byte_len};
 
@@ -40,6 +39,11 @@ pub trait AggregateAcc: std::fmt::Debug {
     /// true if the most recent `step()` did NOT establish a new minimum/maximum.
     fn skip_bare_column_load(&self) -> bool {
         false
+    }
+
+    /// Estimated live heap bytes held by this accumulator for cumulative sandbox memory tracking.
+    fn heap_bytes(&self) -> u64 {
+        0
     }
 }
 
@@ -169,33 +173,165 @@ impl AggregateAcc for CountAcc {
 // ───────────────────────────── sum / total / avg ─────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
-enum SumKind {
+pub(crate) enum SumKind {
     Sum,
     Total,
     Avg,
 }
 
-#[derive(Debug)]
-struct SumAcc {
+#[derive(Debug, Clone)]
+pub(crate) struct SumAcc {
     kind: SumKind,
     r_sum: f64,
     r_err: f64,
-    i_sum: i64,
+    i_sum_64: i64,
+    i_sum_hi: i64,
     cnt: i64,
-    approx: bool,
+    real_cnt: i64,
     ovrfl: bool,
+    approx: bool,
 }
 
 impl SumAcc {
-    fn new(kind: SumKind) -> Self {
+    pub(crate) fn new(kind: SumKind) -> Self {
         Self {
             kind,
             r_sum: 0.0,
             r_err: 0.0,
-            i_sum: 0,
+            i_sum_64: 0,
+            i_sum_hi: 0,
             cnt: 0,
-            approx: false,
+            real_cnt: 0,
             ovrfl: false,
+            approx: false,
+        }
+    }
+
+    #[inline]
+    fn exact_i128(&self) -> i128 {
+        (i128::from(self.i_sum_hi) << 64) + i128::from(self.i_sum_64)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_int_overflow(&mut self, iv: i64) {
+        if !self.approx {
+            self.ovrfl = true;
+        }
+        if iv >= 0 {
+            self.i_sum_hi = self.i_sum_hi.wrapping_add(1);
+        } else {
+            self.i_sum_hi = self.i_sum_hi.wrapping_sub(1);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn step_value(&mut self, v: &SqlValue) {
+        match v {
+            SqlValue::Null => {}
+            SqlValue::Int(iv) => {
+                self.cnt += 1;
+                let (sum, ov) = self.i_sum_64.overflowing_add(*iv);
+                self.i_sum_64 = sum;
+                if ov {
+                    self.record_int_overflow(*iv);
+                }
+            }
+            SqlValue::Real(r) => {
+                if r.is_nan() {
+                    return;
+                }
+                self.cnt += 1;
+                self.real_cnt += 1;
+                self.approx = true;
+                self.kbn_step(*r);
+            }
+            SqlValue::Text(b) => {
+                // SQLite `sumStep` (`func.c:1954`): `sqlite3_value_numeric_type` converts only
+                // well-formed numeric TEXT; any non-integer result sets sticky `approx = true`.
+                if let Some(SqlValue::Int(iv)) = apply_numeric_affinity(b, false) {
+                    self.cnt += 1;
+                    let (sum, ov) = self.i_sum_64.overflowing_add(iv);
+                    self.i_sum_64 = sum;
+                    if ov {
+                        self.record_int_overflow(iv);
+                    }
+                } else {
+                    self.cnt += 1;
+                    self.real_cnt += 1;
+                    self.approx = true;
+                    self.kbn_step(real_value(v));
+                }
+            }
+            SqlValue::Blob(_) => {
+                // `sqlite3_value_numeric_type` leaves BLOB as BLOB -> non-integer real path.
+                self.cnt += 1;
+                self.real_cnt += 1;
+                self.approx = true;
+                self.kbn_step(real_value(v));
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn inverse_value(&mut self, v: &SqlValue) {
+        match v {
+            SqlValue::Null => {}
+            SqlValue::Int(iv) => {
+                self.cnt -= 1;
+                let (sum, ov) = self.i_sum_64.overflowing_sub(*iv);
+                self.i_sum_64 = sum;
+                if ov {
+                    if *iv >= 0 {
+                        self.i_sum_hi = self.i_sum_hi.wrapping_sub(1);
+                    } else {
+                        self.i_sum_hi = self.i_sum_hi.wrapping_add(1);
+                    }
+                }
+            }
+            SqlValue::Real(r) => {
+                if r.is_nan() {
+                    return;
+                }
+                self.cnt -= 1;
+                self.real_cnt -= 1;
+                self.kbn_step(-*r);
+                if self.real_cnt == 0 {
+                    self.r_sum = 0.0;
+                    self.r_err = 0.0;
+                }
+            }
+            SqlValue::Text(b) => {
+                if let Some(SqlValue::Int(iv)) = apply_numeric_affinity(b, false) {
+                    self.cnt -= 1;
+                    let (sum, ov) = self.i_sum_64.overflowing_sub(iv);
+                    self.i_sum_64 = sum;
+                    if ov {
+                        if iv >= 0 {
+                            self.i_sum_hi = self.i_sum_hi.wrapping_sub(1);
+                        } else {
+                            self.i_sum_hi = self.i_sum_hi.wrapping_add(1);
+                        }
+                    }
+                } else {
+                    self.cnt -= 1;
+                    self.real_cnt -= 1;
+                    self.kbn_step(-real_value(v));
+                    if self.real_cnt == 0 {
+                        self.r_sum = 0.0;
+                        self.r_err = 0.0;
+                    }
+                }
+            }
+            SqlValue::Blob(_) => {
+                self.cnt -= 1;
+                self.real_cnt -= 1;
+                self.kbn_step(-real_value(v));
+                if self.real_cnt == 0 {
+                    self.r_sum = 0.0;
+                    self.r_err = 0.0;
+                }
+            }
         }
     }
 
@@ -210,69 +346,104 @@ impl SumAcc {
         self.r_sum = t;
     }
 
-    fn kbn_step_i64(&mut self, i_val: i64) {
-        const TWO52: i64 = 1 << 52;
-        if i_val <= -TWO52 || i_val >= TWO52 {
-            let sm = i_val % 16384;
-            self.kbn_step((i_val - sm) as f64);
-            self.kbn_step(sm as f64);
+    #[inline]
+    fn kbn_add(s: &mut f64, err: &mut f64, r: f64) {
+        let old = *s;
+        let t = old + r;
+        if old.abs() > r.abs() {
+            *err += (old - t) + r;
         } else {
-            self.kbn_step(i_val as f64);
+            *err += (r - t) + old;
         }
-    }
-
-    fn kbn_init(&mut self, i_val: i64) {
-        const TWO52: i64 = 1 << 52;
-        if i_val <= -TWO52 || i_val >= TWO52 {
-            let sm = i_val % 16384;
-            self.r_sum = (i_val - sm) as f64;
-            self.r_err = sm as f64;
-        } else {
-            self.r_sum = i_val as f64;
-            self.r_err = 0.0;
-        }
+        *s = t;
     }
 
     fn kbn_total(&self) -> f64 {
-        if self.r_err.is_finite() {
-            self.r_sum + self.r_err
+        let mut s = self.r_sum;
+        let mut err = self.r_err;
+        if self.i_sum_hi == 0 {
+            if self.i_sum_64 != 0 {
+                // Split into two bit-exact f64 parts (|hi| multiple of 2^14 -> <= 49 sig bits, |lo| < 2^14).
+                let hi = (self.i_sum_64 / 16384) * 16384;
+                let lo = self.i_sum_64 - hi;
+                if hi != 0 {
+                    Self::kbn_add(&mut s, &mut err, hi as f64);
+                }
+                if lo != 0 {
+                    Self::kbn_add(&mut s, &mut err, lo as f64);
+                }
+            }
         } else {
-            self.r_sum
+            // Split exact 128-bit integer sum into three <=44-bit power-of-2-scaled chunks
+            // so every chunk converts to f64 without rounding before KBN compensation!
+            const C1: i128 = 1i128 << 44;
+            const C2: i128 = 1i128 << 88;
+            let full = self.exact_i128();
+            let top = full / C2;
+            let rem1 = full - top * C2;
+            let mid = rem1 / C1;
+            let lo = rem1 - mid * C1;
+            if top != 0 {
+                Self::kbn_add(&mut s, &mut err, (top as f64) * (C2 as f64));
+            }
+            if mid != 0 {
+                Self::kbn_add(&mut s, &mut err, (mid as f64) * (C1 as f64));
+            }
+            if lo != 0 {
+                Self::kbn_add(&mut s, &mut err, lo as f64);
+            }
+        }
+        if err.is_finite() {
+            s + err
+        } else {
+            s
+        }
+    }
+    #[inline]
+    pub(crate) fn value_as(&self, kind: SumKind) -> SqlResult<SqlValue> {
+        match kind {
+            SumKind::Sum => {
+                if self.cnt <= 0 {
+                    Ok(SqlValue::Null)
+                } else if self.approx || self.real_cnt > 0 {
+                    Ok(SqlValue::real(self.kbn_total()))
+                } else if self.ovrfl || self.i_sum_hi != 0 {
+                    Err(SqlError::runtime("integer overflow"))
+                } else {
+                    Ok(SqlValue::Int(self.i_sum_64))
+                }
+            }
+            SumKind::Total => {
+                let r = if self.approx || self.real_cnt > 0 {
+                    self.kbn_total()
+                } else if self.i_sum_hi == 0 {
+                    self.i_sum_64 as f64
+                } else {
+                    self.exact_i128() as f64
+                };
+                Ok(SqlValue::real(r))
+            }
+            SumKind::Avg => {
+                if self.cnt <= 0 {
+                    Ok(SqlValue::Null)
+                } else {
+                    let r = if self.approx || self.real_cnt > 0 {
+                        self.kbn_total()
+                    } else if self.i_sum_hi == 0 {
+                        self.i_sum_64 as f64
+                    } else {
+                        self.exact_i128() as f64
+                    };
+                    Ok(SqlValue::real(r / (self.cnt as f64)))
+                }
+            }
         }
     }
 }
 
 impl AggregateAcc for SumAcc {
     fn step(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        let t = numeric_value(&args[0]);
-        if t.is_null() {
-            return Ok(());
-        }
-        self.cnt += 1;
-        if !self.approx {
-            match t {
-                SqlValue::Int(iv) => {
-                    if let Some(x) = add_i64(self.i_sum, iv) {
-                        self.i_sum = x;
-                    } else {
-                        self.ovrfl = true;
-                        self.kbn_init(self.i_sum);
-                        self.approx = true;
-                        self.kbn_step_i64(iv);
-                    }
-                }
-                _ => {
-                    self.kbn_init(self.i_sum);
-                    self.approx = true;
-                    self.kbn_step(real_value(&t));
-                }
-            }
-        } else if let SqlValue::Int(iv) = t {
-            self.kbn_step_i64(iv);
-        } else {
-            self.ovrfl = false;
-            self.kbn_step(real_value(&t));
-        }
+        self.step_value(&args[0]);
         Ok(())
     }
 
@@ -281,69 +452,12 @@ impl AggregateAcc for SumAcc {
     }
 
     fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        let t = numeric_value(&args[0]);
-        if t.is_null() {
-            return Ok(());
-        }
-        self.cnt -= 1;
-        if !self.approx {
-            if let Some(x) = sub_i64(self.i_sum, int_value(&t)) {
-                self.i_sum = x;
-                return Ok(());
-            }
-            self.ovrfl = true;
-            self.approx = true;
-            self.kbn_init(self.i_sum);
-        }
-        if let SqlValue::Int(iv) = t {
-            if iv != i64::MIN {
-                self.kbn_step_i64(-iv);
-            } else {
-                self.kbn_step_i64(i64::MAX);
-                self.kbn_step_i64(1);
-            }
-        } else {
-            self.kbn_step(-real_value(&t));
-        }
+        self.inverse_value(&args[0]);
         Ok(())
     }
 
     fn value(&self, _ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
-        match self.kind {
-            SumKind::Sum => {
-                if self.cnt <= 0 {
-                    Ok(SqlValue::Null)
-                } else if self.approx {
-                    if self.ovrfl {
-                        Err(SqlError::runtime("integer overflow"))
-                    } else {
-                        Ok(SqlValue::real(self.kbn_total()))
-                    }
-                } else {
-                    Ok(SqlValue::Int(self.i_sum))
-                }
-            }
-            SumKind::Total => {
-                let r = if self.approx {
-                    self.kbn_total()
-                } else {
-                    self.i_sum as f64
-                };
-                Ok(SqlValue::real(r))
-            }
-            SumKind::Avg => {
-                if self.cnt <= 0 {
-                    Ok(SqlValue::Null)
-                } else {
-                    let r = if self.approx {
-                        self.kbn_total()
-                    } else {
-                        self.i_sum as f64
-                    };
-                    Ok(SqlValue::real(r / (self.cnt as f64)))
-                }
-            }
-        }
+        self.value_as(self.kind)
     }
 }
 
@@ -403,7 +517,8 @@ struct GroupConcatAcc {
     allocated: bool,
     too_big: bool,
     buf: Vec<u8>,
-    /// Byte lengths of each appended `(sep_len, val_len)` pair to support exact O(1) `inverse()`.
+    head: usize,
+    /// Byte lengths of each appended `(sep_len, val_len)` pair to support amortized O(1) `inverse()`.
     items: std::collections::VecDeque<(usize, usize)>,
 }
 
@@ -413,8 +528,14 @@ impl GroupConcatAcc {
             allocated: false,
             too_big: false,
             buf: Vec::new(),
+            head: 0,
             items: std::collections::VecDeque::new(),
         }
+    }
+
+    #[inline]
+    fn active_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.head)
     }
 }
 
@@ -438,13 +559,14 @@ impl AggregateAcc for GroupConcatAcc {
         };
         let sep_len = sep_bytes.as_ref().map_or(0, |s| s.len());
         let add_len = sep_len.saturating_add(val_bytes.len());
-        if self.buf.len().saturating_add(add_len).saturating_add(1) > limit {
+        if self.active_len().saturating_add(add_len).saturating_add(1) > limit {
             self.too_big = true;
             self.buf.clear();
+            self.head = 0;
             return Ok(());
         }
         if let Some(m) = ctx.meter {
-            let total = (self.buf.len() + add_len + self.items.len() * 16) as u64;
+            let total = (self.active_len() + add_len + self.items.len() * 16) as u64;
             m.reserve_memory(total)?;
             m.release_memory(total);
             if add_len >= 256 {
@@ -474,10 +596,15 @@ impl AggregateAcc for GroupConcatAcc {
                 *s = 0;
                 prev
             });
-            let remove = (val_len + next_sep).min(self.buf.len());
-            self.buf.drain(..remove);
+            let remove = (val_len + next_sep).min(self.active_len());
+            self.head += remove;
             if self.items.is_empty() {
+                self.buf.clear();
+                self.head = 0;
                 self.allocated = false;
+            } else if self.head >= 4096 && self.head * 2 >= self.buf.len() {
+                self.buf.drain(..self.head);
+                self.head = 0;
             }
         }
         Ok(())
@@ -490,7 +617,11 @@ impl AggregateAcc for GroupConcatAcc {
         if !self.allocated {
             return Ok(SqlValue::Null);
         }
-        Ok(SqlValue::Text(self.buf.clone().into_boxed_slice()))
+        Ok(SqlValue::Text(self.buf[self.head..].to_vec().into_boxed_slice()))
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        (self.buf.len() as u64).saturating_add((self.items.len() as u64).saturating_mul(16))
     }
 }
 
@@ -571,7 +702,7 @@ impl AggregateAcc for PercentileAcc {
                 PercentileKind::Median => unreachable!(),
             };
             if let Some(prev) = self.p {
-                if (prev - frac).abs() > 1e-12 {
+                if (prev - frac).abs() > 1e-5 {
                     return Err(SqlError::runtime(
                         "2nd argument to percentile() is not the same for all input rows",
                     ));
@@ -581,34 +712,43 @@ impl AggregateAcc for PercentileAcc {
             }
         }
 
+        let fn_name = match self.kind {
+            PercentileKind::Percentile => "percentile",
+            PercentileKind::Median => "median",
+            PercentileKind::Cont => "percentile_cont",
+            PercentileKind::Disc => "percentile_disc",
+        };
         let v = &args[0];
         if v.is_null() {
             return Ok(());
         }
         match v {
             SqlValue::Int(i) => self.values.push(*i as f64),
-            SqlValue::Real(r) => self.values.push(*r),
+            SqlValue::Real(r) => {
+                if !r.is_finite() {
+                    return Err(SqlError::runtime(format!("Inf input to {fn_name}()")));
+                }
+                self.values.push(*r);
+            }
             SqlValue::Text(_) | SqlValue::Blob(_) => {
-                if self.kind == PercentileKind::Percentile {
-                    return Err(SqlError::runtime(
-                        "1st argument to percentile() is not numeric",
-                    ));
-                }
-                let r = xdb_core::value::atof(v.as_text_bytes().or(v.as_blob()).unwrap_or(b""));
-                if r.rc > 0 {
-                    self.values.push(r.value);
-                }
+                return Err(SqlError::runtime(format!(
+                    "input to {fn_name}() is not numeric"
+                )));
             }
             SqlValue::Null => {}
         }
         if let Some(m) = ctx.meter {
             let total = (self.values.len().saturating_mul(std::mem::size_of::<f64>())) as u64;
-            if total > 0 && self.values.len().is_multiple_of(32) {
+            if total > 0 {
                 m.reserve_memory(total)?;
                 m.release_memory(total);
             }
         }
         Ok(())
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        (self.values.len().saturating_mul(std::mem::size_of::<f64>())) as u64
     }
 
     fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
@@ -629,13 +769,8 @@ impl AggregateAcc for PercentileAcc {
         let mut sorted = self.values.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         if self.kind == PercentileKind::Disc {
-            let idx = if frac <= 0.0 {
-                0
-            } else {
-                ((frac * (n as f64)).ceil() as usize)
-                    .saturating_sub(1)
-                    .min(n - 1)
-            };
+            // SQLite 3.54.1 `percentCompute` (`func.c:3118-3130`): floor((n - 1) * frac).
+            let idx = ((frac * ((n - 1) as f64)) as usize).min(n - 1);
             return Ok(SqlValue::real(sorted[idx]));
         }
         let pos = frac * ((n - 1) as f64);
@@ -655,14 +790,14 @@ impl AggregateAcc for PercentileAcc {
 
 #[derive(Debug)]
 struct JsonGroupArrayAcc {
-    items: Vec<crate::functions::json::JsonVal>,
+    items: std::collections::VecDeque<crate::functions::json::JsonVal>,
     est_bytes: u64,
 }
 
 impl JsonGroupArrayAcc {
     fn new() -> Self {
         Self {
-            items: Vec::new(),
+            items: std::collections::VecDeque::new(),
             est_bytes: 0,
         }
     }
@@ -671,7 +806,7 @@ impl JsonGroupArrayAcc {
 impl AggregateAcc for JsonGroupArrayAcc {
     fn step(&mut self, args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<()> {
         let is_json = ctx.arg_is_json(0);
-        let jv = json_value_from_sql(&args[0], is_json)?;
+        let jv = crate::functions::json::json_value_from_sql_metered(&args[0], is_json, ctx)?;
         self.est_bytes = self
             .est_bytes
             .saturating_add(crate::utf8::estimate_value_bytes(&args[0]));
@@ -679,7 +814,7 @@ impl AggregateAcc for JsonGroupArrayAcc {
             m.reserve_memory(self.est_bytes)?;
             m.release_memory(self.est_bytes);
         }
-        self.items.push(jv);
+        self.items.push_back(jv);
         Ok(())
     }
 
@@ -688,8 +823,7 @@ impl AggregateAcc for JsonGroupArrayAcc {
     }
 
     fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        if !self.items.is_empty() {
-            self.items.remove(0);
+        if self.items.pop_front().is_some() {
             self.est_bytes = self
                 .est_bytes
                 .saturating_sub(crate::utf8::estimate_value_bytes(&args[0]));
@@ -698,23 +832,24 @@ impl AggregateAcc for JsonGroupArrayAcc {
     }
 
     fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
-        crate::functions::json::render_json_value_metered(
-            &crate::functions::json::JsonVal::Array(self.items.clone()),
-            ctx,
-        )
+        crate::functions::json::render_json_array_iter_metered(self.items.iter(), ctx)
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        self.est_bytes
     }
 }
 
 #[derive(Debug)]
 struct JsonGroupObjectAcc {
-    entries: Vec<(String, crate::functions::json::JsonVal)>,
+    entries: std::collections::VecDeque<(String, crate::functions::json::JsonVal)>,
     est_bytes: u64,
 }
 
 impl JsonGroupObjectAcc {
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: std::collections::VecDeque::new(),
             est_bytes: 0,
         }
     }
@@ -726,7 +861,8 @@ impl AggregateAcc for JsonGroupObjectAcc {
             return Ok(());
         };
         let key = String::from_utf8_lossy(&k_bytes).into_owned();
-        let val = json_value_from_sql(&args[1], ctx.arg_is_json(1))?;
+        let val =
+            crate::functions::json::json_value_from_sql_metered(&args[1], ctx.arg_is_json(1), ctx)?;
         self.est_bytes = self
             .est_bytes
             .saturating_add(key.len() as u64 + crate::utf8::estimate_value_bytes(&args[1]) + 32);
@@ -734,7 +870,7 @@ impl AggregateAcc for JsonGroupObjectAcc {
             m.reserve_memory(self.est_bytes)?;
             m.release_memory(self.est_bytes);
         }
-        self.entries.push((key, val));
+        self.entries.push_back((key, val));
         Ok(())
     }
 
@@ -743,20 +879,25 @@ impl AggregateAcc for JsonGroupObjectAcc {
     }
 
     fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        if !args[0].is_null() && !self.entries.is_empty() {
-            let (k, _) = self.entries.remove(0);
-            self.est_bytes = self
-                .est_bytes
-                .saturating_sub(k.len() as u64 + crate::utf8::estimate_value_bytes(&args[1]) + 32);
+        if !args[0].is_null() {
+            if let Some((k, _)) = self.entries.pop_front() {
+                self.est_bytes = self
+                    .est_bytes
+                    .saturating_sub(k.len() as u64 + crate::utf8::estimate_value_bytes(&args[1]) + 32);
+            }
         }
         Ok(())
     }
 
     fn value(&self, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
-        crate::functions::json::render_json_value_metered(
-            &crate::functions::json::JsonVal::Object(self.entries.clone()),
+        crate::functions::json::render_json_object_iter_metered(
+            self.entries.iter().map(|(k, v)| (k.as_str(), v)),
             ctx,
         )
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        self.est_bytes
     }
 }
 

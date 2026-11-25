@@ -9,9 +9,9 @@ use xdb_core::{Meter, NoopMeter, TextEncoding};
 
 use crate::errors::{SqliteError, SqliteResult};
 use crate::format::{
-    empty_database_info, header_page_size, is_valid_page_size, lock_byte_page,
-    validate_database_header, BtreePageType, DatabaseInfo, HEADER_SIZE, MAX_SCHEMA_FORMAT,
-    SQLITE_HEADER_MAGIC,
+    empty_database_info, header_page_size, is_valid_page_size, lock_byte_page, payload_limits,
+    validate_database_header, BtreePageType, DatabaseInfo, PayloadLimits, HEADER_SIZE,
+    MAX_SCHEMA_FORMAT, SQLITE_HEADER_MAGIC,
 };
 use crate::page_source::PageSource;
 use crate::snapshot::{
@@ -22,14 +22,125 @@ use crate::snapshot::{
 /// SQLite 3.54.1 version number written into header bytes 96..100 (`3054001`).
 pub const SQLITE_VERSION_NUMBER: u32 = 3_054_001;
 const JOURNAL_SECTOR_SIZE: u32 = 4096;
+/// Direct-indexed page table ceiling (4 GiB at 4 KiB pages); larger sparse page numbers
+/// transparently fall back to a `BTreeMap`.
+const DIRECT_PAGE_LIMIT: usize = 1_048_576;
+
+/// O(1) direct-indexed resident page store with copy-on-write sharing (`Arc<[u8]>`).
+#[derive(Debug, Clone, Default)]
+struct PageStore {
+    direct: Vec<Option<Arc<[u8]>>>,
+    overflow: BTreeMap<u32, Arc<[u8]>>,
+}
+
+impl PageStore {
+    #[inline]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn get(&self, pgno: u32) -> Option<&Arc<[u8]>> {
+        let idx = pgno.checked_sub(1)? as usize;
+        if idx < DIRECT_PAGE_LIMIT {
+            self.direct.get(idx).and_then(Option::as_ref)
+        } else {
+            self.overflow.get(&pgno)
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, pgno: u32) -> Option<&mut Arc<[u8]>> {
+        let idx = pgno.checked_sub(1)? as usize;
+        if idx < DIRECT_PAGE_LIMIT {
+            self.direct.get_mut(idx).and_then(Option::as_mut)
+        } else {
+            self.overflow.get_mut(&pgno)
+        }
+    }
+
+    #[inline]
+    fn contains_key(&self, pgno: u32) -> bool {
+        self.get(pgno).is_some()
+    }
+
+    #[inline]
+    fn insert(&mut self, pgno: u32, data: Arc<[u8]>) {
+        if let Some(idx) = pgno.checked_sub(1).map(|v| v as usize) {
+            if idx < DIRECT_PAGE_LIMIT {
+                if idx >= self.direct.len() {
+                    self.direct.resize(idx + 1, None);
+                }
+                self.direct[idx] = Some(data);
+                return;
+            }
+        }
+        self.overflow.insert(pgno, data);
+    }
+
+    #[inline]
+    fn remove(&mut self, pgno: u32) -> Option<Arc<[u8]>> {
+        if let Some(idx) = pgno.checked_sub(1).map(|v| v as usize) {
+            if idx < DIRECT_PAGE_LIMIT {
+                return self.direct.get_mut(idx).and_then(Option::take);
+            }
+        }
+        self.overflow.remove(&pgno)
+    }
+
+    fn total_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for p in self.direct.iter().flatten() {
+            total = total.saturating_add(p.len() as u64);
+        }
+        for p in self.overflow.values() {
+            total = total.saturating_add(p.len() as u64);
+        }
+        total
+    }
+
+    fn clear(&mut self) {
+        self.direct.clear();
+        self.overflow.clear();
+    }
+
+    fn for_each<F: FnMut(u32, &[u8])>(&self, mut f: F) {
+        for (idx, slot) in self.direct.iter().enumerate() {
+            if let Some(p) = slot {
+                f((idx + 1) as u32, p);
+            }
+        }
+        for (&pgno, p) in &self.overflow {
+            f(pgno, p);
+        }
+    }
+}
+
+/// Obtain a mutable slice into an `Arc<[u8]>`, mutating strictly in-place with zero copies
+/// when uniquely owned (`strong_count == 1`), or copying on write when shared.
+#[inline]
+fn arc_bytes_make_mut(slot: &mut Arc<[u8]>) -> &mut [u8] {
+    if Arc::get_mut(slot).is_none() {
+        *slot = Arc::from(slot.as_ref());
+    }
+    Arc::get_mut(slot).expect("unique Arc<[u8]> after COW copy")
+}
 
 /// Saved pre-mutation state for one transaction or savepoint frame.
+const UNDO_BITMAP_MAX_PGNO: u32 = 65_536;
+
 #[derive(Debug, Clone)]
 struct UndoFrame {
     /// Savepoint name (`None` for the top-level transaction or implicit statement savepoint).
     name: Option<String>,
+    /// Flat 1-bit-per-page presence bitmap for `pgno <= UNDO_BITMAP_MAX_PGNO` (2 L1 ops, 0 hashing).
+    saved_bitmap: Vec<u64>,
     /// Original page content before the first write in this frame (`None` = page did not exist).
-    saved_pages: HashMap<u32, Option<Arc<Vec<u8>>>>,
+    saved_pages: Vec<(u32, Option<Arc<[u8]>>)>,
+    /// Sparse overflow map for rare `pgno > UNDO_BITMAP_MAX_PGNO`.
+    saved_overflow: HashMap<u32, Option<Arc<[u8]>>>,
+    /// Bytes reserved in `WritePager::meter` / `tracked_bytes` for `Some(_)` COW undo snapshots.
+    saved_bytes: u64,
     page_count: u32,
     freelist_trunk: u32,
     freelist_count: u32,
@@ -38,6 +149,33 @@ struct UndoFrame {
     application_id: i32,
     change_counter: u32,
     initialized: bool,
+}
+
+impl UndoFrame {
+    #[inline]
+    fn is_saved(&self, pgno: u32) -> bool {
+        if pgno <= UNDO_BITMAP_MAX_PGNO {
+            let w = (pgno >> 6) as usize;
+            w < self.saved_bitmap.len() && (self.saved_bitmap[w] & (1u64 << (pgno & 63))) != 0
+        } else {
+            self.saved_overflow.contains_key(&pgno)
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, pgno: u32, orig: Option<Arc<[u8]>>, sz: u64) {
+        if pgno <= UNDO_BITMAP_MAX_PGNO {
+            let w = (pgno >> 6) as usize;
+            if w >= self.saved_bitmap.len() {
+                self.saved_bitmap.resize(w + 1, 0);
+            }
+            self.saved_bitmap[w] |= 1u64 << (pgno & 63);
+            self.saved_pages.push((pgno, orig));
+        } else {
+            self.saved_overflow.insert(pgno, orig);
+        }
+        self.saved_bytes += sz;
+    }
 }
 
 /// Optional backing store for durable commits via rollback journal.
@@ -59,8 +197,10 @@ impl std::fmt::Debug for VfsBacking {
 pub struct WritePager {
     backing: Option<VfsBacking>,
     meter: Arc<dyn Meter>,
+    noop_meter: bool,
     page_size: u32,
     reserved_bytes: u8,
+    limits: PayloadLimits,
     encoding: TextEncoding,
     page_count: u32,
     freelist_trunk: u32,
@@ -71,12 +211,17 @@ pub struct WritePager {
     user_version: i32,
     application_id: i32,
     /// Full set of resident pages (1-based page number -> `page_size` bytes),
-    /// copy-on-write via `Arc` so `snapshot_page_source()` is O(1) with zero page cloning.
-    pages: Arc<BTreeMap<u32, Arc<Vec<u8>>>>,
+    /// direct-indexed & copy-on-write via `Arc` so `snapshot_page_source()` is O(1)
+    /// and page reads share `Arc<[u8]>` buffers with zero 4 KiB copies!
+    pages: Arc<PageStore>,
     /// Monotonic generation bumped whenever `sqlite_schema` or schema state may have changed.
     schema_gen: u64,
+    /// Monotonic generation bumped on every page mutation or rollback (for warm view caching).
+    mut_gen: u64,
     /// Pages modified since the last VFS commit (and their original pre-commit image for journaling).
-    dirty_originals: HashMap<u32, Option<Arc<Vec<u8>>>>,
+    dirty_originals: HashMap<u32, Option<Arc<[u8]>>>,
+    /// Fast dirty flag for in-memory (`backing.is_none()`) databases, avoiding per-write HashMap ops.
+    dirty_in_memory: bool,
     /// Original page count at the start of the uncommitted VFS write batch.
     commit_orig_page_count: u32,
     /// Active undo frames (index 0 = explicit transaction or auto-commit; 1+ = savepoints).
@@ -104,11 +249,13 @@ impl Drop for WritePager {
 impl WritePager {
     /// Release all resident pages, undo buffers, and metered memory.
     pub fn close(&mut self) {
-        self.pages = Arc::new(BTreeMap::new());
+        self.pages = Arc::new(PageStore::new());
         self.dirty_originals.clear();
+        self.dirty_in_memory = false;
         self.undo_stack.clear();
         self.in_explicit_tx = false;
         self.page_count = 0;
+        self.mut_gen = self.mut_gen.wrapping_add(1);
         if self.tracked_bytes > 0 {
             self.meter.release_memory(self.tracked_bytes);
             self.tracked_bytes = 0;
@@ -123,11 +270,14 @@ impl WritePager {
             4096
         };
         let meter = meter.unwrap_or_else(|| Arc::new(NoopMeter));
+        let noop_meter = meter.is_noop();
         Ok(Self {
             backing: None,
             meter,
+            noop_meter,
             page_size: ps,
             reserved_bytes: 0,
+            limits: payload_limits(ps),
             encoding: TextEncoding::Utf8,
             page_count: 0,
             freelist_trunk: 0,
@@ -137,9 +287,11 @@ impl WritePager {
             change_counter: 0,
             user_version: 0,
             application_id: 0,
-            pages: Arc::new(BTreeMap::new()),
+            pages: Arc::new(PageStore::new()),
             schema_gen: 1,
+            mut_gen: 1,
             dirty_originals: HashMap::new(),
+            dirty_in_memory: false,
             commit_orig_page_count: 0,
             undo_stack: Vec::new(),
             in_explicit_tx: false,
@@ -216,6 +368,7 @@ impl WritePager {
         )?;
         if pager.page_count == 0 && is_valid_page_size(page_size) {
             pager.page_size = page_size;
+            pager.limits = payload_limits(pager.usable_size());
         }
         // Materialize any recovered hot-journal (including rollback-to-empty `db_size == 0`
         // and stale journal left alongside an empty 0-byte main file!) or WAL state onto the
@@ -253,7 +406,7 @@ impl WritePager {
 
         let page_size = snap.page_size();
         let page_count = snap.page_count();
-        let mut pages = BTreeMap::new();
+        let mut pages = PageStore::new();
         let mut guard = TrackedGuard {
             meter: meter.clone(),
             bytes: 0,
@@ -268,7 +421,7 @@ impl WritePager {
                 meter.reserve_memory(u64::from(page_size))?;
                 guard.bytes += u64::from(page_size);
                 let buf = snap.read_page(pgno)?;
-                pages.insert(pgno, Arc::new(buf));
+                pages.insert(pgno, Arc::from(buf));
             }
         }
         // Release the snapshot's read locks and file handles now that pages are in memory.
@@ -284,7 +437,7 @@ impl WritePager {
             change_counter,
             user_version,
             application_id,
-        ) = if let Some(p1) = pages.get(&1) {
+        ) = if let Some(p1) = pages.get(1) {
             let info = validate_database_header(p1, page_count, page_size, Some(page_count))?;
             let h = info.header.expect("header present");
             if info.auto_vacuum {
@@ -324,8 +477,8 @@ impl WritePager {
         // Normalize in-memory writable copies loaded from WAL-mode bytes to rollback mode (1/1)
         // so exported single-file `.db` images are self-contained rollback databases.
         if backing.is_none() {
-            if let Some(p1_arc) = pages.get_mut(&1) {
-                let p1 = Arc::make_mut(p1_arc);
+            if let Some(p1_arc) = pages.get_mut(1) {
+                let p1 = arc_bytes_make_mut(p1_arc);
                 if p1[18] == 2 || p1[19] == 2 {
                     p1[18] = 1;
                     p1[19] = 1;
@@ -335,12 +488,15 @@ impl WritePager {
 
         let tracked = guard.bytes;
         guard.bytes = 0;
+        let noop_meter = meter.is_noop();
 
         Ok(Self {
             backing,
             meter,
+            noop_meter,
             page_size,
             reserved_bytes,
+            limits: payload_limits(page_size - u32::from(reserved_bytes)),
             encoding,
             page_count,
             freelist_trunk,
@@ -352,7 +508,9 @@ impl WritePager {
             application_id,
             pages: Arc::new(pages),
             schema_gen: 1,
+            mut_gen: 1,
             dirty_originals: HashMap::new(),
+            dirty_in_memory: false,
             commit_orig_page_count: page_count,
             undo_stack: Vec::new(),
             in_explicit_tx: false,
@@ -376,26 +534,22 @@ impl WritePager {
         let main_path = backing.path.clone();
         let ps = self.page_size;
 
-        if clear_wal && self.page_count > 0 {
-            if let Some(p1_arc) = Arc::make_mut(&mut self.pages).get_mut(&1) {
-                let p1 = Arc::make_mut(p1_arc);
-                if p1[18] == 2 || p1[19] == 2 {
-                    p1[18] = 1;
-                    p1[19] = 1;
-                }
-            }
-        }
-
         let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
-        acquire_exclusive_lock(main_file.as_mut(), &main_path)?;
+        if let Err(e) = acquire_exclusive_lock(main_file.as_mut(), &main_path) {
+            let _ = main_file.close();
+            return Err(e);
+        }
 
         let write_res: SqliteResult<()> = (|| {
             let lbp = lock_byte_page(ps);
-            for pgno in 1..=self.page_count {
+            // Write and sync data pages 2..=page_count BEFORE updating page 1 to rollback
+            // mode (`1/1`) and removing `-wal`/`-journal`, so a mid-recovery crash leaves
+            // the original header & companion log intact for full replay.
+            for pgno in 2..=self.page_count {
                 if pgno == lbp {
                     continue;
                 }
-                if let Some(bytes) = self.pages.get(&pgno) {
+                if let Some(bytes) = self.pages.get(pgno) {
                     let off = u64::from(pgno - 1) * u64::from(ps);
                     main_file.write(bytes, off)?;
                 }
@@ -403,6 +557,21 @@ impl WritePager {
             let target_size = u64::from(self.page_count) * u64::from(ps);
             if main_file.size()? != target_size {
                 main_file.truncate(target_size)?;
+            }
+            if self.page_count > 1 {
+                main_file.sync(false)?;
+            }
+            if clear_wal && self.page_count > 0 {
+                if let Some(p1_arc) = Arc::make_mut(&mut self.pages).get_mut(1) {
+                    let p1 = arc_bytes_make_mut(p1_arc);
+                    if p1[18] == 2 || p1[19] == 2 {
+                        p1[18] = 1;
+                        p1[19] = 1;
+                    }
+                }
+            }
+            if let Some(bytes) = self.pages.get(1) {
+                main_file.write(bytes, 0)?;
             }
             main_file.sync(false)?;
             if clear_hot_journal {
@@ -437,8 +606,19 @@ impl WritePager {
         Ok(())
     }
 
+    #[inline]
     pub fn meter(&self) -> &Arc<dyn Meter> {
         &self.meter
+    }
+
+    #[inline]
+    pub fn is_noop_meter(&self) -> bool {
+        self.noop_meter
+    }
+
+    #[inline]
+    pub fn mut_gen(&self) -> u64 {
+        self.mut_gen
     }
 
     pub fn path(&self) -> &str {
@@ -457,11 +637,19 @@ impl WritePager {
             return Err(SqliteError::misuse(format!("invalid page_size {new_size}")));
         }
         self.page_size = new_size;
+        self.limits = payload_limits(self.usable_size());
+        self.mut_gen = self.mut_gen.wrapping_add(1);
         Ok(())
     }
 
+    #[inline]
     pub fn usable_size(&self) -> u32 {
         self.page_size - u32::from(self.reserved_bytes)
+    }
+
+    #[inline]
+    pub fn payload_limits(&self) -> PayloadLimits {
+        self.limits
     }
 
     pub fn page_count(&self) -> u32 {
@@ -475,6 +663,8 @@ impl WritePager {
     pub fn set_encoding(&mut self, enc: TextEncoding) {
         if self.page_count == 0 {
             self.encoding = enc;
+            self.schema_gen = self.schema_gen.wrapping_add(1);
+            self.mut_gen = self.mut_gen.wrapping_add(1);
         }
     }
 
@@ -537,7 +727,7 @@ impl WritePager {
         if self.page_count == 0 {
             return empty_database_info(self.page_size);
         }
-        let p1 = self.pages.get(&1).expect("page 1 exists");
+        let p1 = self.pages.get(1).expect("page 1 exists");
         validate_database_header(p1, self.page_count, self.page_size, Some(self.page_count))
             .expect("internal page 1 header always valid")
     }
@@ -551,7 +741,11 @@ impl WritePager {
         // Reserve memory BEFORE mutating undo/dirty state so a memory-limit error leaves pager clean.
         self.meter.reserve_memory(ps as u64)?;
         self.tracked_bytes += ps as u64;
-        self.record_undo_for_page(1);
+        if let Err(e) = self.record_undo_for_page(1) {
+            self.tracked_bytes = self.tracked_bytes.saturating_sub(ps as u64);
+            self.meter.release_memory(ps as u64);
+            return Err(e);
+        }
         self.record_dirty_original(1);
 
         let mut p1 = vec![0u8; ps];
@@ -592,52 +786,77 @@ impl WritePager {
         // Initialize empty TableLeaf B-tree header for `sqlite_schema` at offset 100
         init_empty_btree_page(&mut p1, 1, BtreePageType::TableLeaf, self.usable_size());
 
-        Arc::make_mut(&mut self.pages).insert(1, Arc::new(p1));
+        Arc::make_mut(&mut self.pages).insert(1, Arc::from(p1));
         self.page_count = 1;
         self.change_counter = 1;
+        self.mut_gen = self.mut_gen.wrapping_add(1);
         self.invalidate_schema_cache();
         Ok(())
     }
 
     /// Read page `pgno` (1-based).
+    #[inline]
     pub fn read_page(&self, pgno: u32) -> SqliteResult<&[u8]> {
-        self.meter.charge_steps(1)?;
+        if !self.noop_meter {
+            self.meter.charge_steps(1)?;
+        }
         self.pages
-            .get(&pgno)
-            .map(|p| p.as_slice())
+            .get(pgno)
+            .map(|p| p.as_ref())
             .ok_or_else(|| SqliteError::corrupt(format!("missing page {pgno}")))
     }
 
     /// Obtain mutable access to page `pgno`, recording undo & dirty state automatically.
-    pub fn write_page_mut(&mut self, pgno: u32) -> SqliteResult<&mut Vec<u8>> {
-        self.meter.charge_steps(1)?;
-        if !self.pages.contains_key(&pgno) {
+    /// Mutates strictly in place with zero 4 KiB memcpy whenever uniquely owned.
+    pub fn write_page_mut(&mut self, pgno: u32) -> SqliteResult<&mut [u8]> {
+        if !self.noop_meter {
+            self.meter.charge_steps(1)?;
+        }
+        if !self.pages.contains_key(pgno) {
             return Err(SqliteError::corrupt(format!(
                 "write to unallocated page {pgno}"
             )));
         }
-        self.record_undo_for_page(pgno);
+        self.record_undo_for_page(pgno)?;
         self.record_dirty_original(pgno);
+        self.mut_gen = self.mut_gen.wrapping_add(1);
         let entry = Arc::make_mut(&mut self.pages)
-            .get_mut(&pgno)
+            .get_mut(pgno)
             .expect("page exists");
-        Ok(Arc::make_mut(entry))
+        Ok(arc_bytes_make_mut(entry))
     }
 
     /// Replace full contents of page `pgno` (length must equal `page_size`).
     pub fn put_page(&mut self, pgno: u32, data: Vec<u8>) -> SqliteResult<()> {
+        if pgno == 0 {
+            return Err(SqliteError::corrupt("invalid page number 0"));
+        }
         if data.len() != self.page_size as usize {
             return Err(SqliteError::misuse("page write length mismatch"));
         }
-        self.meter.charge_steps(1)?;
+        if !self.noop_meter {
+            self.meter.charge_steps(1)?;
+        }
         // Reserve memory BEFORE recording undo/dirty metadata so OOM never leaves phantom state.
-        if !self.pages.contains_key(&pgno) {
-            self.meter.reserve_memory(data.len() as u64)?;
+        let is_new = !self.pages.contains_key(pgno);
+        if is_new {
+            if !self.noop_meter {
+                self.meter.reserve_memory(data.len() as u64)?;
+            }
             self.tracked_bytes += data.len() as u64;
         }
-        self.record_undo_for_page(pgno);
+        if let Err(e) = self.record_undo_for_page(pgno) {
+            if is_new {
+                self.tracked_bytes = self.tracked_bytes.saturating_sub(data.len() as u64);
+                if !self.noop_meter {
+                    self.meter.release_memory(data.len() as u64);
+                }
+            }
+            return Err(e);
+        }
         self.record_dirty_original(pgno);
-        Arc::make_mut(&mut self.pages).insert(pgno, Arc::new(data));
+        self.mut_gen = self.mut_gen.wrapping_add(1);
+        Arc::make_mut(&mut self.pages).insert(pgno, Arc::from(data));
         Ok(())
     }
 
@@ -672,7 +891,12 @@ impl WritePager {
                     trunk[off + 2],
                     trunk[off + 3],
                 ]);
-                if popped < 2 || popped > self.page_count || popped == lbp {
+                if popped < 2
+                    || popped > self.page_count
+                    || popped == lbp
+                    || popped == trunk_pgno
+                    || !self.pages.contains_key(popped)
+                {
                     return Err(SqliteError::corrupt(format!(
                         "corrupt freelist leaf page {popped} on trunk {trunk_pgno}"
                     )));
@@ -687,7 +911,12 @@ impl WritePager {
                 return Ok(popped);
             } else {
                 // Trunk itself has no leaves: pop trunk page and advance head!
-                if next_trunk != 0 && (next_trunk < 2 || next_trunk > self.page_count || next_trunk == lbp) {
+                if next_trunk != 0
+                    && (next_trunk < 2
+                        || next_trunk > self.page_count
+                        || next_trunk == lbp
+                        || next_trunk == trunk_pgno)
+                {
                     return Err(SqliteError::corrupt(format!(
                         "corrupt next freelist trunk {next_trunk} on trunk {trunk_pgno}"
                     )));
@@ -730,6 +959,11 @@ impl WritePager {
 
         if self.freelist_trunk != 0 {
             let trunk_pgno = self.freelist_trunk;
+            if trunk_pgno <= 1 || trunk_pgno > self.page_count || trunk_pgno == lbp || trunk_pgno == pgno {
+                return Err(SqliteError::corrupt(format!(
+                    "corrupt freelist trunk page number {trunk_pgno}"
+                )));
+            }
             let leaf_cnt = {
                 let t = self.read_page(trunk_pgno)?;
                 u32::from_be_bytes([t[4], t[5], t[6], t[7]]) as usize
@@ -740,26 +974,34 @@ impl WritePager {
                 )));
             }
             if leaf_cnt < max_leaves {
+                let next_fc = self
+                    .freelist_count
+                    .checked_add(1)
+                    .ok_or_else(|| SqliteError::corrupt("freelist count overflow"))?;
                 let off = 8 + leaf_cnt * 4;
                 let tbuf = self.write_page_mut(trunk_pgno)?;
                 tbuf[4..8].copy_from_slice(&((leaf_cnt + 1) as u32).to_be_bytes());
                 tbuf[off..off + 4].copy_from_slice(&pgno.to_be_bytes());
                 let zbuf = self.write_page_mut(pgno)?;
                 zbuf.fill(0);
-                self.freelist_count += 1;
+                self.freelist_count = next_fc;
                 self.sync_page1_header()?;
                 return Ok(());
             }
         }
 
         // Become the new freelist trunk page pointing to the old trunk.
+        let next_fc = self
+            .freelist_count
+            .checked_add(1)
+            .ok_or_else(|| SqliteError::corrupt("freelist count overflow"))?;
         let prev_trunk = self.freelist_trunk;
         let tbuf = self.write_page_mut(pgno)?;
         tbuf.fill(0);
         tbuf[0..4].copy_from_slice(&prev_trunk.to_be_bytes());
         tbuf[4..8].copy_from_slice(&0u32.to_be_bytes());
         self.freelist_trunk = pgno;
-        self.freelist_count += 1;
+        self.freelist_count = next_fc;
         self.sync_page1_header()?;
         Ok(())
     }
@@ -795,7 +1037,10 @@ impl WritePager {
     fn make_undo_frame(&self, name: Option<String>) -> UndoFrame {
         UndoFrame {
             name,
-            saved_pages: HashMap::new(),
+            saved_bitmap: Vec::new(),
+            saved_pages: Vec::new(),
+            saved_overflow: HashMap::new(),
+            saved_bytes: 0,
             page_count: self.page_count,
             freelist_trunk: self.freelist_trunk,
             freelist_count: self.freelist_count,
@@ -807,25 +1052,47 @@ impl WritePager {
         }
     }
 
-    fn record_undo_for_page(&mut self, pgno: u32) {
-        if let Some(frame) = self.undo_stack.last_mut() {
-            frame
-                .saved_pages
-                .entry(pgno)
-                .or_insert_with(|| self.pages.get(&pgno).cloned());
+    #[inline]
+    fn release_undo_bytes(&mut self, bytes: u64) {
+        if bytes > 0 {
+            self.tracked_bytes = self.tracked_bytes.saturating_sub(bytes);
+            if !self.noop_meter {
+                self.meter.release_memory(bytes);
+            }
         }
     }
 
+    #[inline]
+    fn record_undo_for_page(&mut self, pgno: u32) -> SqliteResult<()> {
+        if let Some(frame) = self.undo_stack.last_mut() {
+            if frame.is_saved(pgno) {
+                return Ok(());
+            }
+            let existing = self.pages.get(pgno).cloned();
+            let mut sz = 0u64;
+            if let Some(ref arc) = existing {
+                if !self.noop_meter {
+                    sz = arc.len() as u64;
+                    self.meter.reserve_memory(sz)?;
+                    self.tracked_bytes += sz;
+                }
+            }
+            frame.record(pgno, existing, sz);
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn record_dirty_original(&mut self, pgno: u32) {
         if self.backing.is_none() {
-            // In-memory / WASM mode never writes a disk rollback journal; mark dirty without
-            // holding a second `Arc` reference so `Arc::make_mut` mutates in-place!
-            self.dirty_originals.entry(pgno).or_insert(None);
+            // In-memory / WASM mode never writes a disk rollback journal; flip a bool with
+            // zero HashMap hashing and zero extra `Arc` reference count bumps!
+            self.dirty_in_memory = true;
             return;
         }
         self.dirty_originals
             .entry(pgno)
-            .or_insert_with(|| self.pages.get(&pgno).cloned());
+            .or_insert_with(|| self.pages.get(pgno).cloned());
     }
 
     /// `BEGIN [TRANSACTION]`.
@@ -849,11 +1116,29 @@ impl WritePager {
     /// any enclosing frame (so outer savepoints/ROLLBACK can still undo the statement's writes).
     pub fn commit_statement_savepoint(&mut self) {
         if let Some(inner) = self.undo_stack.pop() {
+            let mut released = 0u64;
             if let Some(parent) = self.undo_stack.last_mut() {
-                for (pgno, orig) in inner.saved_pages {
-                    parent.saved_pages.entry(pgno).or_insert(orig);
+                let metered = !self.noop_meter;
+                for (pgno, orig) in inner
+                    .saved_pages
+                    .into_iter()
+                    .chain(inner.saved_overflow.into_iter())
+                {
+                    let sz = if metered {
+                        orig.as_ref().map_or(0, |a| a.len() as u64)
+                    } else {
+                        0
+                    };
+                    if !parent.is_saved(pgno) {
+                        parent.record(pgno, orig, sz);
+                    } else {
+                        released += sz;
+                    }
                 }
+            } else {
+                released = inner.saved_bytes;
             }
+            self.release_undo_bytes(released);
         }
     }
 
@@ -864,9 +1149,12 @@ impl WritePager {
             if let Err(e) = self.flush_to_vfs() {
                 self.rollback_statement_savepoint();
                 self.dirty_originals.clear();
+                self.dirty_in_memory = false;
                 return Err(e);
             }
-            self.undo_stack.pop();
+            if let Some(frame) = self.undo_stack.pop() {
+                self.release_undo_bytes(frame.saved_bytes);
+            }
             return Ok(());
         }
         self.commit_statement_savepoint();
@@ -880,6 +1168,7 @@ impl WritePager {
         }
         if !self.in_explicit_tx && self.undo_stack.is_empty() {
             self.dirty_originals.clear();
+            self.dirty_in_memory = false;
         }
     }
 
@@ -918,17 +1207,41 @@ impl WritePager {
         };
         if !self.in_explicit_tx && pos == 0 {
             self.flush_to_vfs()?;
-            self.undo_stack.clear();
+            let mut released = 0u64;
+            for f in self.undo_stack.drain(..) {
+                released += f.saved_bytes;
+            }
+            self.release_undo_bytes(released);
             return Ok(());
         }
         let drained: Vec<UndoFrame> = self.undo_stack.drain(pos..).collect();
+        let mut released = 0u64;
         if let Some(parent) = self.undo_stack.last_mut() {
+            let metered = !self.noop_meter;
             for frame in drained {
-                for (pgno, orig) in frame.saved_pages {
-                    parent.saved_pages.entry(pgno).or_insert(orig);
+                for (pgno, orig) in frame
+                    .saved_pages
+                    .into_iter()
+                    .chain(frame.saved_overflow.into_iter())
+                {
+                    let sz = if metered {
+                        orig.as_ref().map_or(0, |a| a.len() as u64)
+                    } else {
+                        0
+                    };
+                    if !parent.is_saved(pgno) {
+                        parent.record(pgno, orig, sz);
+                    } else {
+                        released += sz;
+                    }
                 }
             }
+        } else {
+            for frame in drained {
+                released += frame.saved_bytes;
+            }
         }
+        self.release_undo_bytes(released);
         Ok(())
     }
 
@@ -942,7 +1255,11 @@ impl WritePager {
         }
         self.flush_to_vfs()?;
         self.in_explicit_tx = false;
-        self.undo_stack.clear();
+        let mut released = 0u64;
+        for f in self.undo_stack.drain(..) {
+            released += f.saved_bytes;
+        }
+        self.release_undo_bytes(released);
         Ok(())
     }
 
@@ -958,6 +1275,7 @@ impl WritePager {
             self.apply_undo_frame(frame);
         }
         self.dirty_originals.clear();
+        self.dirty_in_memory = false;
         // If a prior COMMIT failed mid-write leaving a hot journal on disk, best-effort heal
         // the backing VFS now (if still failing, `disk_needs_journal_recovery` stays true so
         // the next commit recovers BEFORE truncating `-journal`).
@@ -976,21 +1294,29 @@ impl WritePager {
     }
 
     fn apply_undo_frame(&mut self, frame: UndoFrame) {
+        let undo_bytes = frame.saved_bytes;
         let pages_map = Arc::make_mut(&mut self.pages);
-        for (pgno, orig) in frame.saved_pages {
+        for (pgno, orig) in frame
+            .saved_pages
+            .into_iter()
+            .chain(frame.saved_overflow.into_iter())
+        {
             match orig {
                 Some(bytes) => {
                     pages_map.insert(pgno, bytes);
                 }
                 None => {
-                    if let Some(removed) = pages_map.remove(&pgno) {
+                    if let Some(removed) = pages_map.remove(pgno) {
                         let sz = removed.len() as u64;
                         self.tracked_bytes = self.tracked_bytes.saturating_sub(sz);
-                        self.meter.release_memory(sz);
+                        if !self.noop_meter {
+                            self.meter.release_memory(sz);
+                        }
                     }
                 }
             }
         }
+        self.release_undo_bytes(undo_bytes);
         self.page_count = frame.page_count;
         self.freelist_trunk = frame.freelist_trunk;
         self.freelist_count = frame.freelist_count;
@@ -1000,13 +1326,16 @@ impl WritePager {
         self.change_counter = frame.change_counter;
         if !frame.initialized {
             let map = Arc::make_mut(&mut self.pages);
-            let leftover: u64 = map.values().map(|p| p.len() as u64).sum();
+            let leftover = map.total_bytes();
             map.clear();
             if leftover > 0 {
                 self.tracked_bytes = self.tracked_bytes.saturating_sub(leftover);
-                self.meter.release_memory(leftover);
+                if !self.noop_meter {
+                    self.meter.release_memory(leftover);
+                }
             }
         }
+        self.mut_gen = self.mut_gen.wrapping_add(1);
         self.invalidate_schema_cache();
     }
 
@@ -1087,7 +1416,7 @@ impl WritePager {
 
     /// Atomically flush dirty pages to the backing VFS using a genuine SQLite 3 rollback journal.
     pub fn flush_to_vfs(&mut self) -> SqliteResult<()> {
-        if self.dirty_originals.is_empty() {
+        if !self.dirty_in_memory && self.dirty_originals.is_empty() {
             if self.disk_needs_journal_recovery {
                 self.recover_hot_journal_on_vfs()?;
             }
@@ -1129,7 +1458,11 @@ impl WritePager {
         // ALWAYS records page 1's original on-disk image AND so an I/O failure restores page 1
         // cleanly without desyncing `self.pages[1]` from `self.change_counter`!
         let old_cc = self.change_counter;
-        let old_p1 = self.pages.get(&1).cloned();
+        let old_p1 = if locked_vfs.is_some() {
+            self.pages.get(1).cloned()
+        } else {
+            None
+        };
         if self.page_count > 0 {
             self.record_dirty_original(1);
             let cc = self.change_counter.wrapping_add(1);
@@ -1139,8 +1472,8 @@ impl WritePager {
             let sc = self.schema_cookie;
             let uv = self.user_version;
             let aid = self.application_id;
-            if let Some(p1_arc) = Arc::make_mut(&mut self.pages).get_mut(&1) {
-                let p1 = Arc::make_mut(p1_arc);
+            if let Some(p1_arc) = Arc::make_mut(&mut self.pages).get_mut(1) {
+                let p1 = arc_bytes_make_mut(p1_arc);
                 p1[24..28].copy_from_slice(&cc.to_be_bytes());
                 p1[28..32].copy_from_slice(&pc.to_be_bytes());
                 p1[32..36].copy_from_slice(&ft.to_be_bytes());
@@ -1152,10 +1485,12 @@ impl WritePager {
                 p1[96..100].copy_from_slice(&SQLITE_VERSION_NUMBER.to_be_bytes());
             }
             self.change_counter = cc;
+            self.mut_gen = self.mut_gen.wrapping_add(1);
         }
 
         let Some((vfs, main_path, mut main_file)) = locked_vfs else {
             self.dirty_originals.clear();
+            self.dirty_in_memory = false;
             self.commit_orig_page_count = self.page_count;
             return Ok(());
         };
@@ -1166,7 +1501,7 @@ impl WritePager {
 
         let commit_res: SqliteResult<()> = (|| {
             // Collect original pre-transaction pages that existed on disk (for rollback journal).
-            let mut journal_pages: Vec<(u32, &Vec<u8>)> = self
+            let mut journal_pages: Vec<(u32, &[u8])> = self
                 .dirty_originals
                 .iter()
                 .filter_map(|(&pgno, orig)| orig.as_ref().map(|bytes| (pgno, bytes.as_ref())))
@@ -1221,7 +1556,7 @@ impl WritePager {
             let mut dirty_pgnos: Vec<u32> = self.dirty_originals.keys().copied().collect();
             dirty_pgnos.sort_unstable();
             for pgno in dirty_pgnos {
-                if let Some(bytes) = self.pages.get(&pgno) {
+                if let Some(bytes) = self.pages.get(pgno) {
                     let off = u64::from(pgno - 1) * u64::from(ps);
                     main_file.write(bytes, off)?;
                 }
@@ -1245,6 +1580,7 @@ impl WritePager {
             if let Some(orig_p1) = old_p1 {
                 Arc::make_mut(&mut self.pages).insert(1, orig_p1);
             }
+            self.mut_gen = self.mut_gen.wrapping_add(1);
             if journal_synced {
                 self.disk_needs_journal_recovery = true;
             }
@@ -1264,12 +1600,13 @@ impl WritePager {
         }
         let ps = self.page_size as usize;
         let mut out = vec![0u8; (self.page_count as usize) * ps];
-        for (&pgno, page) in self.pages.as_ref() {
-            if pgno >= 1 && pgno <= self.page_count {
+        let pc = self.page_count;
+        self.pages.for_each(|pgno, page| {
+            if pgno >= 1 && pgno <= pc {
                 let off = ((pgno - 1) as usize) * ps;
                 out[off..off + ps].copy_from_slice(page);
             }
-        }
+        });
         // Validate header consistency in exported bytes
         let _ = header_page_size(&out);
         out
@@ -1323,7 +1660,7 @@ pub fn init_empty_btree_page(buf: &mut [u8], pgno: u32, kind: BtreePageType, usa
 struct LivePagesSource {
     page_size: u32,
     page_count: u32,
-    pages: Arc<BTreeMap<u32, Arc<Vec<u8>>>>,
+    pages: Arc<PageStore>,
 }
 
 impl PageSource for LivePagesSource {
@@ -1341,8 +1678,19 @@ impl PageSource for LivePagesSource {
         }
         Ok(self
             .pages
-            .get(&pgno)
-            .map(|p| p.as_ref().clone())
+            .get(pgno)
+            .map(|p| p.to_vec())
             .unwrap_or_else(|| vec![0u8; self.page_size as usize]))
+    }
+
+    fn read_page_shared(&mut self, pgno: u32) -> SqliteResult<Arc<[u8]>> {
+        if pgno < 1 || pgno > self.page_count {
+            return Err(SqliteError::corrupt(format!("page {pgno} out of range")));
+        }
+        Ok(self
+            .pages
+            .get(pgno)
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::from(vec![0u8; self.page_size as usize])))
     }
 }

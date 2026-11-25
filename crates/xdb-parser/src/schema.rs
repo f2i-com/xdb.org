@@ -2,7 +2,7 @@
 //! `CREATE INDEX` to the definitions SQLite keeps in memory (`struct Table` /
 //! `Column` / `Index`), ported from SQLite 3.54.1 `build.c`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use xdb_core::value::affinity_type;
 use xdb_core::Affinity;
@@ -284,6 +284,7 @@ impl SelfRefContext {
 }
 
 struct SelfRefTable<'a> {
+    schema: Option<&'a str>,
     name: &'a str,
     cols: &'a [ColumnDefinition],
     without_rowid: bool,
@@ -310,10 +311,11 @@ fn resolve_column_ref(
         ));
     }
     let n = &x.column.name;
+    let expected_schema = t.schema.unwrap_or("main");
     let table_ok = x.table.as_ref().is_none_or(|tb| same_name(&tb.name, t.name))
         && x.schema
             .as_ref()
-            .is_none_or(|sc| same_name(&sc.name, "main"));
+            .is_none_or(|sc| same_name(&sc.name, expected_schema));
     if table_ok {
         if let Some(i) = column_index(t.cols, n) {
             if let Some(err) = pending {
@@ -352,13 +354,34 @@ fn resolve_column_ref(
 }
 
 fn resolve_self_ref(e: &Expr, ctx: SelfRefContext, t: &SelfRefTable<'_>) -> ParseResult<()> {
+    let mut memo: HashMap<usize, Folded> = HashMap::new();
+    resolve_self_ref_memo(e, ctx, t, &mut memo)
+}
+
+fn fold_expr_memo(e: &Expr, schema_mode: bool, memo: &mut HashMap<usize, Folded>) -> Folded {
+    let key = e as *const Expr as usize;
+    if let Some(&cached) = memo.get(&key) {
+        return cached;
+    }
+    let val = fold_expr_with_memo(e, schema_mode, Some(memo));
+    memo.insert(key, val);
+    val
+}
+
+fn resolve_self_ref_memo(
+    e: &Expr,
+    ctx: SelfRefContext,
+    t: &SelfRefTable<'_>,
+    memo: &mut HashMap<usize, Folded>,
+) -> ParseResult<()> {
     match e {
         Expr::InList { operand, items, .. } => {
-            if items.is_empty() && !fold_expr(operand, false).has_func {
+            if items.is_empty() && !fold_expr_memo(operand, false, memo).has_func {
                 return Ok(());
             }
-            for c in expr_children(e) {
-                resolve_self_ref(c, ctx, t)?;
+            resolve_self_ref_memo(operand, ctx, t, memo)?;
+            for item in items {
+                resolve_self_ref_memo(item, ctx, t, memo)?;
             }
             Ok(())
         }
@@ -366,14 +389,14 @@ fn resolve_self_ref(e: &Expr, ctx: SelfRefContext, t: &SelfRefTable<'_>) -> Pars
             op, left, right, ..
         } => {
             if *op == BinaryOp::And {
-                let l = fold_expr(left, false);
-                let r = fold_expr(right, false);
+                let l = fold_expr_memo(left, false, memo);
+                let r = fold_expr_memo(right, false, memo);
                 if (l.is_false || r.is_false) && !l.has_func && !r.has_func {
                     return Ok(());
                 }
             }
-            resolve_self_ref(left, ctx, t)?;
-            resolve_self_ref(right, ctx, t)
+            resolve_self_ref_memo(left, ctx, t, memo)?;
+            resolve_self_ref_memo(right, ctx, t, memo)
         }
         Expr::Column(c) => {
             resolve_column_ref(c, ctx, t)?;
@@ -388,9 +411,46 @@ fn resolve_self_ref(e: &Expr, ctx: SelfRefContext, t: &SelfRefTable<'_>) -> Pars
             Some(*span),
         )),
         Expr::InSelect { span, operand, .. } | Expr::InTable { span, operand, .. } => {
-            resolve_self_ref(operand, ctx, t)?;
+            resolve_self_ref_memo(operand, ctx, t, memo)?;
             Err(def_err(
                 format!("subqueries prohibited in {}", ctx.text()),
+                Some(*span),
+            ))
+        }
+        Expr::Function(func) if func.over.is_some() => Err(def_err(
+            format!("window functions prohibited in {}", ctx.text()),
+            Some(func.span),
+        )),
+        Expr::Function(func)
+            if func.filter.is_some()
+                || func.order_by.is_some()
+                || func.star
+                || func.quantifier.is_some() =>
+        {
+            Err(def_err(
+                format!("misuse of aggregate: {}()", func.name.name),
+                Some(func.span),
+            ))
+        }
+        Expr::Raise { span, .. }
+            if matches!(
+                ctx,
+                SelfRefContext::Generated | SelfRefContext::Index | SelfRefContext::Where
+            ) =>
+        {
+            Err(def_err(
+                "RAISE() may only be used within a trigger-program",
+                Some(*span),
+            ))
+        }
+        Expr::CurrentTime { span, .. }
+            if matches!(
+                ctx,
+                SelfRefContext::Generated | SelfRefContext::Index | SelfRefContext::Where
+            ) =>
+        {
+            Err(def_err(
+                format!("non-deterministic functions prohibited in {}", ctx.text()),
                 Some(*span),
             ))
         }
@@ -400,19 +460,14 @@ fn resolve_self_ref(e: &Expr, ctx: SelfRefContext, t: &SelfRefTable<'_>) -> Pars
             escape,
             ..
         } => {
-            resolve_self_ref(right, ctx, t)?;
-            resolve_self_ref(left, ctx, t)?;
+            resolve_self_ref_memo(right, ctx, t, memo)?;
+            resolve_self_ref_memo(left, ctx, t, memo)?;
             if let Some(esc) = escape {
-                resolve_self_ref(esc, ctx, t)?;
+                resolve_self_ref_memo(esc, ctx, t, memo)?;
             }
             Ok(())
         }
-        _ => {
-            for c in expr_children(e) {
-                resolve_self_ref(c, ctx, t)?;
-            }
-            Ok(())
-        }
+        _ => try_for_each_child(e, &mut |c| resolve_self_ref_memo(c, ctx, t, memo)),
     }
 }
 
@@ -445,47 +500,56 @@ fn resolve_index_term(
     Ok(None)
 }
 
-/// Direct sub-expressions of `e` (not descending into subqueries).
-pub fn expr_children(e: &Expr) -> Vec<&Expr> {
+/// Visit direct sub-expressions of `e` without allocating (fallible).
+fn try_for_each_child<'a, E>(
+    e: &'a Expr,
+    f: &mut impl FnMut(&'a Expr) -> Result<(), E>,
+) -> Result<(), E> {
     match e {
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Cast { operand, .. }
-        | Expr::Collate { operand, .. } => vec![operand.as_ref()],
-        Expr::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+        | Expr::Collate { operand, .. }
+        | Expr::InSelect { operand, .. } => f(operand.as_ref()),
+        Expr::Binary { left, right, .. } => {
+            f(left.as_ref())?;
+            f(right.as_ref())
+        }
         Expr::Like {
             left,
             right,
             escape,
             ..
         } => {
-            let mut out = vec![left.as_ref(), right.as_ref()];
+            f(left.as_ref())?;
+            f(right.as_ref())?;
             if let Some(esc) = escape {
-                out.push(esc.as_ref());
+                f(esc.as_ref())?;
             }
-            out
+            Ok(())
         }
         Expr::Between {
             operand, low, high, ..
-        } => vec![operand.as_ref(), low.as_ref(), high.as_ref()],
-        Expr::InList { operand, items, .. } => {
-            let mut out = Vec::with_capacity(1 + items.len());
-            out.push(operand.as_ref());
-            for item in items {
-                out.push(item);
-            }
-            out
+        } => {
+            f(operand.as_ref())?;
+            f(low.as_ref())?;
+            f(high.as_ref())
         }
-        Expr::InSelect { operand, .. } => vec![operand.as_ref()],
+        Expr::InList { operand, items, .. } => {
+            f(operand.as_ref())?;
+            for item in items {
+                f(item)?;
+            }
+            Ok(())
+        }
         Expr::InTable { operand, args, .. } => {
-            let mut out = Vec::with_capacity(1 + args.as_ref().map_or(0, Vec::len));
-            out.push(operand.as_ref());
+            f(operand.as_ref())?;
             if let Some(args) = args {
                 for a in args {
-                    out.push(a);
+                    f(a)?;
                 }
             }
-            out
+            Ok(())
         }
         Expr::Case {
             operand,
@@ -493,35 +557,83 @@ pub fn expr_children(e: &Expr) -> Vec<&Expr> {
             else_expr,
             ..
         } => {
-            let mut out = Vec::new();
             if let Some(op) = operand {
-                out.push(op.as_ref());
+                f(op.as_ref())?;
             }
             for w in whens {
-                out.push(&w.when);
-                out.push(&w.then);
+                f(&w.when)?;
+                f(&w.then)?;
             }
             if let Some(el) = else_expr {
-                out.push(el.as_ref());
+                f(el.as_ref())?;
             }
-            out
+            Ok(())
         }
-        Expr::Function(f) => {
-            let mut out: Vec<&Expr> = f.args.iter().collect();
-            if let Some(ref ob) = f.order_by {
+        Expr::Function(func) => {
+            for a in &func.args {
+                f(a)?;
+            }
+            if let Some(ref ob) = func.order_by {
                 for o in ob {
-                    out.push(&o.expr);
+                    f(&o.expr)?;
                 }
             }
-            if let Some(ref flt) = f.filter {
-                out.push(flt.as_ref());
+            if let Some(ref flt) = func.filter {
+                f(flt.as_ref())?;
             }
-            out
+            if let Some(WindowRef::Spec(ref spec)) = func.over {
+                if let Some(ref pb) = spec.partition_by {
+                    for e in pb {
+                        f(e)?;
+                    }
+                }
+                if let Some(ref ob) = spec.order_by {
+                    for o in ob {
+                        f(&o.expr)?;
+                    }
+                }
+                if let Some(ref fr) = spec.frame {
+                    if let Some(ref e) = fr.from.expr {
+                        f(e.as_ref())?;
+                    }
+                    if let Some(ref to) = fr.to {
+                        if let Some(ref e) = to.expr {
+                            f(e.as_ref())?;
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
-        Expr::Vector { items, .. } => items.iter().collect(),
-        Expr::Raise { message, .. } => message.as_deref().into_iter().collect(),
-        _ => Vec::new(),
+        Expr::Vector { items, .. } => {
+            for item in items {
+                f(item)?;
+            }
+            Ok(())
+        }
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                f(m.as_ref())?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
+}
+
+/// Visit direct sub-expressions of `e` without allocating.
+fn for_each_child<'a>(e: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
+    let _ = try_for_each_child::<std::convert::Infallible>(e, &mut |c| {
+        f(c);
+        Ok(())
+    });
+}
+
+/// Direct sub-expressions of `e` (not descending into subqueries).
+pub fn expr_children(e: &Expr) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    for_each_child(e, &mut |c| out.push(c));
+    out
 }
 
 /// `sqlite3GetInt32` (`util.c:1310`) on an unsigned `INTEGER` token: its value when it fits
@@ -533,6 +645,9 @@ pub fn get_int32_token(text: &str) -> Option<i32> {
     }
     let mut i = 0usize;
     if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
+        if b.len() < 3 || !b[2].is_ascii_hexdigit() {
+            return None;
+        }
         i = 2;
         while i < b.len() && b[i] == b'0' {
             i += 1;
@@ -552,6 +667,9 @@ pub fn get_int32_token(text: &str) -> Option<i32> {
             return None;
         }
         return Some(u as i32);
+    }
+    if !b[0].is_ascii_digit() {
+        return None;
     }
     while i < b.len() && b[i] == b'0' {
         i += 1;
@@ -588,6 +706,28 @@ const NOT_CONST: Folded = Folded {
 };
 
 fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
+    fold_expr_with_memo(e, schema_mode, None)
+}
+
+fn fold_child(e: &Expr, schema_mode: bool, memo: &mut Option<&mut HashMap<usize, Folded>>) -> Folded {
+    if let Some(m) = memo.as_deref_mut() {
+        let key = e as *const Expr as usize;
+        if let Some(&cached) = m.get(&key) {
+            return cached;
+        }
+        let val = fold_expr_with_memo(e, schema_mode, Some(m));
+        m.insert(key, val);
+        val
+    } else {
+        fold_expr_with_memo(e, schema_mode, None)
+    }
+}
+
+fn fold_expr_with_memo(
+    e: &Expr,
+    schema_mode: bool,
+    mut memo: Option<&mut HashMap<usize, Folded>>,
+) -> Folded {
     match e {
         Expr::Number(n) => {
             let v = if !n.is_float && !n.separators {
@@ -661,8 +801,8 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
         Expr::Binary {
             op, left, right, ..
         } => {
-            let l = fold_expr(left, schema_mode);
-            let r = fold_expr(right, schema_mode);
+            let l = fold_child(left, schema_mode, &mut memo);
+            let r = fold_child(right, schema_mode, &mut memo);
             if *op == BinaryOp::And && (l.is_false || r.is_false) && !l.has_func && !r.has_func {
                 return Folded {
                     constant: true,
@@ -680,7 +820,8 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
             }
         }
         Expr::IsNull { not, operand, .. } => {
-            let inner = fold_expr(operand, schema_mode);
+            // Strip unary `+`/`-` FIRST and fold once so nested `(-((...) ISNULL)) ISNULL`
+            // stays O(N) instead of O(2^N). Unary `+`/`-` never changes `constant`/`has_func`.
             let mut p = operand.as_ref();
             while let Expr::Unary {
                 op: UnaryOp::Pos | UnaryOp::Neg,
@@ -690,11 +831,7 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
             {
                 p = u.as_ref();
             }
-            let pf = if std::ptr::eq(p, operand.as_ref()) {
-                inner
-            } else {
-                fold_expr(p, schema_mode)
-            };
+            let pf = fold_child(p, schema_mode, &mut memo);
             if pf.literal {
                 return Folded {
                     constant: true,
@@ -704,8 +841,8 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
                 };
             }
             Folded {
-                constant: inner.constant,
-                has_func: inner.has_func,
+                constant: pf.constant,
+                has_func: pf.has_func,
                 is_false: false,
                 literal: false,
             }
@@ -716,7 +853,7 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
             items,
             ..
         } => {
-            let op = fold_expr(operand, schema_mode);
+            let op = fold_child(operand, schema_mode, &mut memo);
             if items.is_empty() {
                 if !op.has_func {
                     return Folded {
@@ -736,7 +873,7 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
             let mut constant = op.constant;
             let mut has_func = op.has_func;
             for x in items {
-                let f = fold_expr(x, schema_mode);
+                let f = fold_child(x, schema_mode, &mut memo);
                 constant = constant && f.constant;
                 has_func = has_func || f.has_func;
             }
@@ -749,9 +886,9 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
         }
         Expr::Function(f) => {
             let mut constant = f.over.is_none() && f.filter.is_none();
-            for x in expr_children(e) {
-                constant = constant && fold_expr(x, schema_mode).constant;
-            }
+            for_each_child(e, &mut |x| {
+                constant = constant && fold_child(x, schema_mode, &mut memo).constant;
+            });
             Folded {
                 constant,
                 has_func: true,
@@ -761,9 +898,9 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
         }
         Expr::Like { .. } => {
             let mut constant = true;
-            for x in expr_children(e) {
-                constant = constant && fold_expr(x, schema_mode).constant;
-            }
+            for_each_child(e, &mut |x| {
+                constant = constant && fold_child(x, schema_mode, &mut memo).constant;
+            });
             Folded {
                 constant,
                 has_func: true,
@@ -774,11 +911,11 @@ fn fold_expr(e: &Expr, schema_mode: bool) -> Folded {
         _ => {
             let mut constant = true;
             let mut has_func = false;
-            for x in expr_children(e) {
-                let f = fold_expr(x, schema_mode);
+            for_each_child(e, &mut |x| {
+                let f = fold_child(x, schema_mode, &mut memo);
                 constant = constant && f.constant;
                 has_func = has_func || f.has_func;
-            }
+            });
             Folded {
                 constant,
                 has_func,
@@ -849,6 +986,7 @@ fn create_auto_index(
         }
         Some(terms) => {
             let self_tbl = SelfRefTable {
+                schema: None,
                 name: &st.table_name,
                 cols: &st.cols,
                 without_rowid: false,
@@ -1283,7 +1421,9 @@ pub fn build_table(
                 ColumnConstraint::References { span, clause, .. } => {
                     if let Some(ref to) = clause.columns {
                         if to.len() != 1 {
-                            let raw_tbl = &sql[clause.table.span.start..clause.table.span.end];
+                            let raw_tbl = sql
+                                .get(clause.table.span.start..clause.table.span.end)
+                                .unwrap_or(&clause.table.name);
                             return Err(def_err(
                                 format!(
                                     "foreign key on {name} should reference only one column of table {raw_tbl}"
@@ -1483,7 +1623,13 @@ pub fn build_table(
 
     // Resolve CHECK constraints and generated column expressions
     {
+        let tbl_schema = stmt
+            .schema
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .or(if stmt.temp { Some("temp") } else { None });
         let self_tbl = SelfRefTable {
+            schema: tbl_schema,
             name: &st.table_name,
             cols: &st.cols,
             without_rowid: stmt.without_rowid,
@@ -1492,9 +1638,79 @@ pub fn build_table(
         for c in &st.checks {
             resolve_self_ref(&c.expr, SelfRefContext::Check, &self_tbl)?;
         }
+        let mut has_gen = false;
         for col in &st.cols {
             if let Some(ref gen_expr) = col.generated {
+                has_gen = true;
                 resolve_self_ref(gen_expr, SelfRefContext::Generated, &self_tbl)?;
+            }
+        }
+        if has_gen {
+            // Iterative O(C + E) generated-column cycle detection (avoids stack overflow on
+            // deep 2,000-column chains and eliminates O(C * R) linear column scans).
+            let mut col_map: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::with_capacity(st.cols.len());
+            for (idx, col) in st.cols.iter().enumerate() {
+                col_map
+                    .entry(col.name.to_ascii_lowercase())
+                    .or_insert(idx);
+            }
+            let n_cols = st.cols.len();
+            let mut dep_lists: Vec<Vec<usize>> = vec![Vec::new(); n_cols];
+            let mut seen_gen = vec![0u32; n_cols];
+            let mut expr_stack: Vec<&Expr> = Vec::new();
+            for (cid, col) in st.cols.iter().enumerate() {
+                let Some(ref root_expr) = col.generated else {
+                    continue;
+                };
+                let stamp = (cid as u32) + 1;
+                expr_stack.clear();
+                expr_stack.push(root_expr);
+                while let Some(e) = expr_stack.pop() {
+                    if let Expr::Column(c) = e {
+                        if let Some(&dep) = col_map.get(&c.column.name.to_ascii_lowercase()) {
+                            if st.cols[dep].generated.is_some() && seen_gen[dep] != stamp {
+                                seen_gen[dep] = stamp;
+                                dep_lists[cid].push(dep);
+                            }
+                        }
+                        continue;
+                    }
+                    let _: Result<(), ()> = try_for_each_child(e, &mut |ch| {
+                        expr_stack.push(ch);
+                        Ok(())
+                    });
+                }
+            }
+            // Iterative 3-color DFS (0 = unvisited, 1 = on stack, 2 = done).
+            let mut color = vec![0u8; n_cols];
+            let mut dfs_stack: Vec<(usize, usize)> = Vec::new();
+            for start in 0..n_cols {
+                if st.cols[start].generated.is_none() || color[start] != 0 {
+                    continue;
+                }
+                color[start] = 1;
+                dfs_stack.push((start, 0));
+                while let Some((node, next_i)) = dfs_stack.last_mut() {
+                    let cur = *node;
+                    if *next_i < dep_lists[cur].len() {
+                        let dep = dep_lists[cur][*next_i];
+                        *next_i += 1;
+                        if color[dep] == 1 {
+                            return Err(def_err(
+                                format!("generated column loop on \"{}\"", st.cols[dep].name),
+                                None,
+                            ));
+                        }
+                        if color[dep] == 0 {
+                            color[dep] = 1;
+                            dfs_stack.push((dep, 0));
+                        }
+                    } else {
+                        color[cur] = 2;
+                        dfs_stack.pop();
+                    }
+                }
             }
         }
     }
@@ -1623,6 +1839,12 @@ pub fn build_index(
         None
     };
     let self_tbl = SelfRefTable {
+        schema: stmt
+            .schema
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .or(table.schema.as_deref())
+            .or(if table.temp { Some("temp") } else { None }),
         name: &table.name,
         cols,
         without_rowid: table.without_rowid,

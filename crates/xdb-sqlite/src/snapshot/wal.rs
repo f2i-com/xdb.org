@@ -230,18 +230,13 @@ pub fn recover_wal(file: &mut dyn VfsFile, file_size: u64) -> IoResult<WalRecove
         frame_of.insert(pgno, (idx + 1) as u32);
     }
 
-    let mut stale_salt_frames: u32 = 0;
-    if valid_frames < frame_slots {
-        let mut salts = [0u8; 8];
-        for i in (valid_frames + 1)..=frame_slots {
-            if file.read(&mut salts, wal_frame_offset(i, page_size) + 8)? < 8 {
-                break;
-            }
-            if u32_be(&salts, 0) != header.salt1 || u32_be(&salts, 4) != header.salt2 {
-                stale_salt_frames += 1;
-            }
-        }
-    }
+    // When WAL replay stops at a salt mismatch, remaining frame slots belong to a prior
+    // checkpoint cycle; avoid issuing O(frame_slots) extra VFS reads just for diagnostics.
+    let stale_salt_frames: u32 = if stop_reason == WalStopReason::SaltMismatch {
+        frame_slots.saturating_sub(valid_frames)
+    } else {
+        0
+    };
 
     let pages_in_wal = frame_of.len();
     Ok(WalRecovery {

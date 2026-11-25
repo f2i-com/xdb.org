@@ -91,10 +91,46 @@ pub enum TableScanHint {
         low: Bound,
         high: Bound,
     },
+    /// Rowid set lookup (`rowid IN (?, ?, ...)`).
+    RowidIn {
+        values: Vec<i64>,
+    },
     /// Secondary index equality prefix on `(index_name, leading key values)`.
     IndexEq {
         index_name: String,
         values: Vec<SqlValue>,
+    },
+    /// Secondary index range scan on the leading key column (`col >= ? AND col <= ?`).
+    IndexRange {
+        index_name: String,
+        low: Bound,
+        high: Bound,
+    },
+    /// Secondary index IN lookup on the leading key column (`col IN (?, ?, ...)`).
+    IndexIn {
+        index_name: String,
+        values: Vec<SqlValue>,
+    },
+    /// Ordered rowid scan capped at `limit` rows (`ORDER BY rowid [ASC|DESC] LIMIT k` or `LIMIT k`).
+    RowidOrder {
+        desc: bool,
+        limit: usize,
+    },
+    /// Ordered secondary-index scan capped at `limit` rows (`ORDER BY col [ASC|DESC] LIMIT k`).
+    IndexOrder {
+        index_name: String,
+        desc: bool,
+        limit: usize,
+    },
+    /// Unindexed single-column Top-K scan capped at `limit` rows (`ORDER BY col [ASC|DESC] LIMIT k`).
+    /// Storage decodes only the sort column per row and decodes remaining needed columns only for
+    /// rows entering the bounded Top-K heap.
+    TopK {
+        col_idx: usize,
+        desc: bool,
+        nulls_first: bool,
+        collation: String,
+        limit: usize,
     },
 }
 
@@ -109,6 +145,11 @@ pub struct ScannedRow {
 pub trait SqlCatalog {
     /// Look up a table by name (ASCII case-insensitive). `schema` is `None` or e.g. `"main"`.
     fn get_table(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<TableMeta>>;
+
+    /// Shared-ownership table metadata lookup (avoids cloning `TableMeta` on every query).
+    fn get_table_arc(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<Arc<TableMeta>>> {
+        self.get_table(schema, name).map(|opt| opt.map(Arc::new))
+    }
 
     /// Look up a view by name (ASCII case-insensitive).
     fn get_view(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<ViewMeta>> {
@@ -127,6 +168,40 @@ pub trait SqlCatalog {
         needed_columns: Option<&[usize]>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<Vec<ScannedRow>>;
+
+    /// Stream rows of a table into a callback without materializing a full `Vec<ScannedRow>`.
+    /// Returning `Ok(false)` stops the scan early. `values` always has length `table.columns.len()`,
+    /// with unrequested columns allowed to be `SqlValue::Null`.
+    #[allow(clippy::type_complexity)]
+    fn visit_table(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        hint: &TableScanHint,
+        needed_columns: Option<&[usize]>,
+        meter: Option<&dyn Meter>,
+        visit: &mut dyn FnMut(Option<i64>, &[SqlValue]) -> SqlResult<bool>,
+    ) -> SqlResult<()> {
+        let rows = self.scan_table(schema, name, hint, needed_columns, meter)?;
+        for row in rows {
+            if !visit(row.rowid, &row.values)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Optional fast path for `SELECT count(*) FROM table` without decoding row payloads.
+    /// Returns `Ok(None)` to fall back to `scan_table`.
+    fn count_table_rows(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<u64>> {
+        let _ = (schema, name, meter);
+        Ok(None)
+    }
 
     /// Resolve a catalog-provided table-valued function (e.g., `pragma_table_info('t')`).
     /// Return `Ok(None)` to fall back to built-in TVFs (`json_each`, `json_tree`, `generate_series`).
@@ -151,6 +226,8 @@ pub struct QueryParams {
     pub named: HashMap<String, SqlValue>,
 }
 
+static NULL_PARAM_VALUE: SqlValue = SqlValue::Null;
+
 impl QueryParams {
     pub fn empty() -> Self {
         Self::default()
@@ -168,24 +245,39 @@ impl QueryParams {
         self
     }
 
-    /// Resolve a parsed SQLite variable (`index` is 1-based, `text` is e.g. `"?"`, `"?2"`, `":foo"`).
-    pub fn resolve(&self, index: usize, text: &str) -> SqlValue {
-        if !text.is_empty() && !text.starts_with('?') {
+    /// Borrowed version of [`QueryParams::resolve`]: resolves a parsed SQLite variable without
+    /// cloning `Text`/`Blob` values. Normalizes `SqlValue::Real(NaN)` to `SqlValue::Null`.
+    #[inline]
+    pub fn resolve_ref(&self, index: usize, text: &str) -> &SqlValue {
+        let raw = if !text.is_empty() && !text.starts_with('?') {
             if let Some(v) = self.named.get(text) {
-                return v.clone();
+                Some(v)
+            } else if let Some(bare) = text.get(1..) {
+                self.named.get(bare)
+            } else {
+                None
             }
-            if let Some(bare) = text.get(1..) {
-                if let Some(v) = self.named.get(bare) {
-                    return v.clone();
-                }
-            }
+        } else {
+            None
         }
-        if index >= 1 {
-            if let Some(v) = self.positional.get(index - 1) {
-                return v.clone();
+        .or_else(|| {
+            if index >= 1 {
+                self.positional.get(index - 1)
+            } else {
+                None
             }
+        });
+        match raw {
+            Some(SqlValue::Real(r)) if r.is_nan() => &NULL_PARAM_VALUE,
+            Some(v) => v,
+            None => &NULL_PARAM_VALUE,
         }
-        SqlValue::Null
+    }
+
+    /// Resolve a parsed SQLite variable (`index` is 1-based, `text` is e.g. `"?"`, `"?2"`, `":foo"`).
+    /// Normalizes `SqlValue::Real(NaN)` to `SqlValue::Null` (matching SQLite `sqlite3_bind_double`).
+    pub fn resolve(&self, index: usize, text: &str) -> SqlValue {
+        self.resolve_ref(index, text).clone()
     }
 }
 

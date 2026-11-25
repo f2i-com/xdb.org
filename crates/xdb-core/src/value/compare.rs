@@ -60,45 +60,53 @@ fn class_rank(v: &SqlValue) -> u8 {
 
 /// `sqlite3MemCompare` (`vdbeaux.c:4555`): ascending sort order (`ORDER BY` / index order).
 /// Two `NULL`s compare equal. `TEXT` uses `coll` (defaulting to `BINARY` UTF-8).
+#[inline]
 pub fn mem_compare(a: &SqlValue, b: &SqlValue, coll: Option<&Collation>) -> Ordering {
-    let ra = class_rank(a);
-    let rb = class_rank(b);
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
     match (a, b) {
-        (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
-        (SqlValue::Null, SqlValue::Real(r)) | (SqlValue::Real(r), SqlValue::Null)
-            if r.is_nan() =>
-        {
-            Ordering::Equal
-        }
         (SqlValue::Int(x), SqlValue::Int(y)) => x.cmp(y),
-        (SqlValue::Int(x), SqlValue::Real(y)) => int_float_compare(*x, *y),
-        (SqlValue::Real(x), SqlValue::Int(y)) => int_float_compare(*y, *x).reverse(),
-        (SqlValue::Real(x), SqlValue::Real(y)) => {
-            if x.is_nan() {
-                if y.is_nan() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Less
-                }
-            } else if y.is_nan() {
-                Ordering::Greater
-            } else if x < y {
-                Ordering::Less
-            } else if x > y {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        }
         (SqlValue::Text(x), SqlValue::Text(y)) => match coll {
             Some(c) => c.compare_utf8(x, y),
             None => compare_bytes_binary(x, y),
         },
         (SqlValue::Blob(x), SqlValue::Blob(y)) => compare_bytes_binary(x, y),
-        _ => unreachable!(),
+        (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+        (SqlValue::Real(x), SqlValue::Real(y)) => {
+            if !x.is_nan() && !y.is_nan() {
+                if x < y {
+                    Ordering::Less
+                } else if x > y {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
+            } else if x.is_nan() && y.is_nan() {
+                Ordering::Equal
+            } else if x.is_nan() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (SqlValue::Int(x), SqlValue::Real(y)) => {
+            if y.is_nan() {
+                Ordering::Greater
+            } else {
+                int_float_compare(*x, *y)
+            }
+        }
+        (SqlValue::Real(x), SqlValue::Int(y)) => {
+            if x.is_nan() {
+                Ordering::Less
+            } else {
+                int_float_compare(*y, *x).reverse()
+            }
+        }
+        (SqlValue::Null, SqlValue::Real(r)) | (SqlValue::Real(r), SqlValue::Null)
+            if r.is_nan() =>
+        {
+            Ordering::Equal
+        }
+        _ => class_rank(a).cmp(&class_rank(b)),
     }
 }
 
@@ -130,6 +138,15 @@ impl CompareOp {
     }
 }
 
+#[inline]
+fn is_null_or_nan(v: &SqlValue) -> bool {
+    match v {
+        SqlValue::Null => true,
+        SqlValue::Real(r) => r.is_nan(),
+        _ => false,
+    }
+}
+
 /// Evaluates `left <op> right` (`OP_Eq..OP_Ge`, `vdbe.c:2345`), returning `Some(true/false)`
 /// or `None` (`NULL`).
 pub fn compare_op(
@@ -139,10 +156,12 @@ pub fn compare_op(
     aff: Option<Affinity>,
     coll: Option<&Collation>,
 ) -> Option<bool> {
-    if left.is_null() || right.is_null() {
+    let l_null = is_null_or_nan(&left);
+    let r_null = is_null_or_nan(&right);
+    if l_null || r_null {
         return match op {
-            CompareOp::Is => Some(left.is_null() && right.is_null()),
-            CompareOp::IsNot => Some(!(left.is_null() && right.is_null())),
+            CompareOp::Is => Some(l_null && r_null),
+            CompareOp::IsNot => Some(!(l_null && r_null)),
             _ => None,
         };
     }

@@ -4,7 +4,7 @@
 //! `CAST(CAST(x'ff' AS TEXT) AS BLOB)` preserve invalid UTF-8 bytes verbatim, matching
 //! SQLite 100% (eliminating the JS UTF-16 `U+FFFD` loss).
 
-use super::affinity::{affinity_type, number_to_text};
+use super::affinity::affinity_type;
 use super::numeric::{int_value, numerify, real_value};
 use super::utf::{decode_stored_text_to_utf8, encode_utf8_to_stored_text, TextEncoding};
 use super::{Affinity, SqlValue};
@@ -25,7 +25,7 @@ pub fn blob_to_text(blob: &[u8], enc: TextEncoding) -> Box<[u8]> {
 /// `sqlite3VdbeMemCast`: `CAST(v AS <affinity>)`.
 /// Returns `Err` only if `aff == Affinity::Flexnum` (which no `CAST` target produces).
 pub fn cast_value(v0: SqlValue, aff: Affinity, enc: TextEncoding) -> Result<SqlValue, &'static str> {
-    if v0.is_null() {
+    if v0.is_null() || matches!(v0, SqlValue::Real(r) if r.is_nan()) {
         return Ok(SqlValue::Null);
     }
     // Numeric targets read a UTF-16 database's BLOB as UTF-16 text (sqlite3AtoF with enc).
@@ -42,10 +42,21 @@ pub fn cast_value(v0: SqlValue, aff: Affinity, enc: TextEncoding) -> Result<SqlV
         Affinity::None | Affinity::Blob => match v {
             SqlValue::Blob(_) => Ok(v),
             SqlValue::Text(b) => Ok(SqlValue::Blob(text_to_blob(&b, enc))),
-            other => {
-                let s = number_to_text(&other).expect("numeric");
+            SqlValue::Int(i) => {
+                let mut buf = [0u8; 24];
+                let s = super::int64::int64_to_text_buf(i, &mut buf);
+                Ok(SqlValue::Blob(text_to_blob(s, enc)))
+            }
+            SqlValue::Real(r) => {
+                let mut buf = [0u8; 48];
+                let s = super::fp_format::real_to_text_buf(
+                    r,
+                    super::fp_format::DEFAULT_FP_DIGITS,
+                    &mut buf,
+                );
                 Ok(SqlValue::Blob(text_to_blob(s.as_bytes(), enc)))
             }
+            SqlValue::Null => unreachable!(),
         },
         Affinity::Numeric => Ok(numerify(&v)),
         Affinity::Integer => Ok(SqlValue::Int(int_value(&v))),
@@ -53,7 +64,22 @@ pub fn cast_value(v0: SqlValue, aff: Affinity, enc: TextEncoding) -> Result<SqlV
         Affinity::Text => match v {
             SqlValue::Text(_) => Ok(v),
             SqlValue::Blob(b) => Ok(SqlValue::Text(blob_to_text(&b, enc))),
-            other => Ok(SqlValue::from(number_to_text(&other).expect("numeric"))),
+            SqlValue::Int(i) => {
+                let mut buf = [0u8; 24];
+                Ok(SqlValue::Text(Box::from(super::int64::int64_to_text_buf(
+                    i, &mut buf,
+                ))))
+            }
+            SqlValue::Real(r) => {
+                let mut buf = [0u8; 48];
+                let s = super::fp_format::real_to_text_buf(
+                    r,
+                    super::fp_format::DEFAULT_FP_DIGITS,
+                    &mut buf,
+                );
+                Ok(SqlValue::Text(Box::from(s.as_bytes())))
+            }
+            SqlValue::Null => unreachable!(),
         },
         Affinity::Flexnum => Err("CAST to FLEXNUM affinity is not supported"),
     }

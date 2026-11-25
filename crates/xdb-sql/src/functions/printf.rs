@@ -581,7 +581,12 @@ pub fn str_appendf(
                     if flag_altform2 {
                         let mut z = 0;
                         let mut rem = precision;
+                        let mut ticks = 0u64;
                         while rem > 0 && at(slice, z) != 0 {
+                            ticks += 1;
+                            if (ticks & 255) == 0 {
+                                acc.charge_steps(1)?;
+                            }
                             z = skip_utf8(slice, z);
                             rem -= 1;
                         }
@@ -592,11 +597,19 @@ pub fn str_appendf(
                         while z < limit && at(slice, z) != 0 {
                             z += 1;
                         }
+                        if z >= 256 {
+                            acc.charge_steps((z / 256) as u64)?;
+                        }
                         z
                     }
                 } else {
-                    c_str_len(slice)
+                    let len = c_str_len(slice);
+                    if len >= 256 {
+                        acc.charge_steps((len / 256) as u64)?;
+                    }
+                    len
                 };
+                acc.check_scratch(length)?;
                 out_bytes = slice[..length].to_vec();
                 width = adjust_width_for_utf8(&out_bytes, width, flag_altform2);
             }
@@ -616,13 +629,8 @@ pub fn str_appendf(
             }
             XType::EscapeQ | XType::EscapeBigQ | XType::EscapeW => {
                 let t = a.text();
-                if let Some(raw) = t.as_deref() {
-                    let worst_factor = if flag_alternateform { 6usize } else { 2usize };
-                    let est = raw.len().saturating_mul(worst_factor).saturating_add(16);
-                    acc.check_scratch(est.min(acc.limit))?;
-                }
                 out_bytes = escape_quote(
-                    acc.limit,
+                    acc,
                     t.as_deref(),
                     infop.xtype,
                     precision,
@@ -860,13 +868,14 @@ fn render_float(
 }
 
 fn escape_quote(
-    limit: usize,
+    acc: &mut ByteAccum<'_>,
     arg: Option<&[u8]>,
     xtype: XType,
     precision: i32,
     mut flag_alternateform: bool,
     altform2: bool,
 ) -> SqlResult<Vec<u8>> {
+    let limit = acc.limit;
     let mut need_quote = 0u8;
     let escarg: &[u8] = match arg {
         None => {
@@ -892,10 +901,15 @@ fn escape_quote(
     let mut k = precision;
     let mut i = 0usize;
     let mut n = 0usize;
+    let mut ticks = 0u64;
     while k != 0 {
         let ch = at(escarg, i);
         if ch == 0 {
             break;
+        }
+        ticks += 1;
+        if (ticks & 255) == 0 {
+            acc.charge_steps(1)?;
         }
         if ch == q {
             n += 1;
@@ -909,6 +923,9 @@ fn escape_quote(
         k -= 1;
     }
     if flag_alternateform {
+        if i >= 256 {
+            acc.charge_steps((i / 256) as u64)?;
+        }
         let mut n_back = 0usize;
         let mut n_ctrl = 0usize;
         for &ch in &escarg[..i] {
@@ -934,6 +951,7 @@ fn escape_quote(
     if total > 70 && total > limit {
         return Err(SqlError::too_big());
     }
+    acc.check_scratch(total)?;
     let mut out = Vec::with_capacity(total);
     if need_quote == 2 {
         out.extend_from_slice(b"unistr('");

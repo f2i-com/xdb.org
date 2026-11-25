@@ -42,6 +42,7 @@ const COMPARE_PAD: usize = 18;
 #[derive(Debug)]
 struct CursorCore {
     pager: Pager,
+    noop_meter: bool,
     root_page: u32,
     is_table: bool,
     pages: Vec<Arc<BtreePage>>,
@@ -63,8 +64,10 @@ impl CursorCore {
                 "invalid b-tree root page {root_page}"
             )));
         }
+        let noop_meter = pager.is_noop_meter();
         Ok(Self {
             pager,
+            noop_meter,
             root_page,
             is_table,
             pages: Vec::with_capacity(BTREE_MAX_DEPTH),
@@ -151,19 +154,21 @@ impl CursorCore {
             return Ok(self.record.as_mut().expect("some"));
         }
         let c = self.current_cell()?;
-        let page = self.current_page().clone();
-        let enc = self.pager.db().text_encoding;
-        let pager = self.pager.clone();
-        let rec = self
-            .record
-            .get_or_insert_with(|| RecordView::new(pager, enc));
-        rec.reset(
-            page.pgno,
-            page.data.clone(),
-            c.payload_offset,
-            c.local_size,
-            c.payload_size,
-        );
+        let cur_pgno = self.current_page().pgno;
+        if self.record.as_ref().is_some_and(|r| r.pgno() == cur_pgno) {
+            let rec = self.record.as_mut().expect("some");
+            rec.reset_same_page(c.payload_offset, c.local_size, c.payload_size);
+            self.record_stamp = self.stamp;
+            return Ok(rec);
+        }
+        let page_data = self.current_page().data.clone();
+        if self.record.is_none() {
+            let enc = self.pager.db().text_encoding;
+            let pager = self.pager.clone();
+            self.record = Some(RecordView::new(pager, enc));
+        }
+        let rec = self.record.as_mut().expect("some");
+        rec.reset(cur_pgno, page_data, c.payload_offset, c.local_size, c.payload_size);
         self.record_stamp = self.stamp;
         Ok(rec)
     }
@@ -184,9 +189,7 @@ impl CursorCore {
             self.valid = false;
             return Ok(false);
         }
-        let root = self
-            .pager
-            .get_btree_page(self.root_page, &format!("root page of b-tree {}", self.root_page))?;
+        let root = self.pager.get_btree_page(self.root_page, "b-tree root")?;
         if root.is_table != self.is_table {
             return Err(SqliteError::corrupt(format!(
                 "page {}: expected the root of {} b-tree, found page type 0x{:02x}",
@@ -225,7 +228,9 @@ impl CursorCore {
     }
 
     fn move_to_child(&mut self, pgno: u32) -> SqliteResult<()> {
-        self.pager.meter().charge_steps(1)?;
+        if !self.noop_meter {
+            self.pager.meter().charge_steps(1)?;
+        }
         if self.pages.len() >= BTREE_MAX_DEPTH {
             return Err(SqliteError::corrupt(format!(
                 "b-tree {}: deeper than {BTREE_MAX_DEPTH} levels",
@@ -239,10 +244,7 @@ impl CursorCore {
                 self.root_page
             )));
         }
-        let parent_pgno = self.current_page().pgno;
-        let child = self
-            .pager
-            .get_btree_page(pgno, &format!("child of page {parent_pgno}"))?;
+        let child = self.pager.get_btree_page(pgno, "b-tree child")?;
         if child.n_cell < 1 || child.is_table != self.is_table {
             return Err(SqliteError::corrupt(if child.n_cell < 1 {
                 format!("page {pgno}: child page has no cells")
@@ -308,7 +310,9 @@ impl CursorCore {
         if !self.valid {
             return Ok(false);
         }
-        self.pager.meter().charge_steps(1)?;
+        if !self.noop_meter {
+            self.pager.meter().charge_steps(1)?;
+        }
         self.step_dir(1);
         self.moved();
         let d = self.depth();
@@ -371,7 +375,9 @@ impl CursorCore {
         if !self.valid {
             return Ok(false);
         }
-        self.pager.meter().charge_steps(1)?;
+        if !self.noop_meter {
+            self.pager.meter().charge_steps(1)?;
+        }
         self.step_dir(-1);
         self.moved();
         loop {
@@ -414,12 +420,54 @@ impl CursorCore {
                 }
             }
         }
-        loop {
-            n += 1;
-            if !self.next()? {
-                return Ok(n);
+        // Index / WITHOUT ROWID B-tree: every cell on every interior and leaf page is an entry,
+        // so we sum `n_cell` across all reachable pages in O(pages) time with strict cycle guards.
+        self.invalidate();
+        let max_pages = self.pager.page_count();
+        let mut visited_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut stack: Vec<(u32, usize)> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
+        stack.push((self.root_page, 0));
+        while let Some((pgno, depth)) = stack.pop() {
+            if !visited_pages.insert(pgno) || visited_pages.len() > max_pages as usize {
+                return Err(SqliteError::corrupt(format!(
+                    "b-tree rooted at page {} contains a cycle or shared page {pgno}",
+                    self.root_page
+                )));
+            }
+            if !self.noop_meter {
+                self.pager.meter().charge_steps(1)?;
+            }
+            let page = self
+                .pager
+                .get_btree_page(pgno, "index b-tree")?;
+            if page.is_table {
+                return Err(SqliteError::corrupt(format!(
+                    "page {pgno}: expected index b-tree page"
+                )));
+            }
+            n = n.saturating_add(page.n_cell as u64);
+            if !page.is_leaf {
+                if depth + 1 >= BTREE_MAX_DEPTH {
+                    return Err(SqliteError::corrupt(format!(
+                        "b-tree rooted at page {} exceeds maximum depth {BTREE_MAX_DEPTH}",
+                        self.root_page
+                    )));
+                }
+                let needed_stack = stack.len().saturating_add(page.n_cell + 1);
+                if needed_stack > max_pages as usize + 1 {
+                    return Err(SqliteError::corrupt(format!(
+                        "b-tree rooted at page {} has more child pointers than pages",
+                        self.root_page
+                    )));
+                }
+                stack.push((page.right_child, depth + 1));
+                for i in 0..page.n_cell {
+                    let child = page.child_at(i)?;
+                    stack.push((child, depth + 1));
+                }
             }
         }
+        Ok(n)
     }
 }
 
@@ -484,6 +532,93 @@ impl TableCursor {
         self.core.record()
     }
 
+    /// Zero-copy access to `(rowid, local_payload_bytes, encoding)` for the current table
+    /// leaf row when the entire record fits inline on the leaf page (no overflow chain).
+    #[inline]
+    pub(crate) fn current_local_payload(
+        &mut self,
+    ) -> SqliteResult<Option<(i64, &[u8], xdb_core::TextEncoding)>> {
+        if !self.core.noop_meter {
+            return Ok(None);
+        }
+        let cell = self.core.current_cell()?;
+        if cell.overflow_page != 0 || cell.local_size as u32 != cell.payload_size {
+            return Ok(None);
+        }
+        let d = self.core.depth();
+        let page = &self.core.pages[d];
+        let start = cell.payload_offset;
+        let end = start + cell.local_size;
+        let usable = (self.core.pager.db().usable_size as usize).min(page.data.len());
+        if end > usable {
+            return Err(SqliteError::corrupt(format!(
+                "page {}: local payload runs past usable page end",
+                page.pgno
+            )));
+        }
+        Ok(Some((
+            cell.key,
+            &page.data[start..end],
+            self.core.pager.db().text_encoding,
+        )))
+    }
+
+    /// Snapshot the current leaf `Arc<BtreePage>` and geometry for whole-leaf batch scanning
+    /// (zero per-row `CellInfo` / `CursorCore::next()` overhead on un-metered table scans).
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn current_leaf_batch(
+        &self,
+    ) -> Option<(
+        Arc<BtreePage>,
+        usize,
+        usize,
+        u32,
+        crate::format::PayloadLimits,
+        xdb_core::TextEncoding,
+    )> {
+        if !self.core.valid || !self.core.noop_meter || self.core.pages.is_empty() {
+            return None;
+        }
+        let d = self.core.depth();
+        let page = &self.core.pages[d];
+        if !page.is_leaf {
+            return None;
+        }
+        let db = self.core.pager.db();
+        Some((
+            Arc::clone(page),
+            self.core.idx[d],
+            page.n_cell,
+            db.usable_size,
+            db.limits,
+            db.text_encoding,
+        ))
+    }
+
+    /// Position this cursor at exact cell index `ci` on the current leaf (used for overflow
+    /// or non-inline record fallback inside a whole-leaf batch scan).
+    #[inline]
+    pub(crate) fn set_leaf_cell_index(&mut self, ci: usize) {
+        let d = self.core.depth();
+        self.core.idx[d] = ci;
+        self.core.moved();
+    }
+
+    /// Jump directly from the current leaf to cell `0` of the next leaf in B-tree order.
+    #[inline]
+    pub(crate) fn advance_to_next_leaf(&mut self) -> SqliteResult<bool> {
+        if !self.core.valid || self.core.pages.is_empty() {
+            return Ok(false);
+        }
+        let d = self.core.depth();
+        let n_cell = self.core.pages[d].n_cell;
+        if n_cell > 0 {
+            self.core.idx[d] = n_cell - 1;
+        }
+        self.core.next()
+    }
+
     /// Position on the row with smallest rowid `>= rowid`.
     pub fn seek(&mut self, rowid: i64) -> SqliteResult<SeekResult> {
         match self.move_to(rowid)? {
@@ -525,6 +660,121 @@ impl TableCursor {
     }
 
     fn move_to_inner(&mut self, rowid: i64) -> SqliteResult<Option<i32>> {
+        let noop = self.core.noop_meter;
+        // Same-leaf and next-leaf locality fast path: avoids `Arc::clone` and root re-descent
+        // when seeking ascending rowids from secondary index scans (`WHERE grp = 7`).
+        if self.core.valid && !self.core.pages.is_empty() {
+            let d = self.core.depth();
+            if self.core.pages[d].is_leaf && self.core.pages[d].n_cell > 0 {
+                let (first_k, last_k) = {
+                    let page = &self.core.pages[d];
+                    (page.rowid_at(0)?, page.rowid_at(page.n_cell - 1)?)
+                };
+                if rowid >= first_k && rowid <= last_k {
+                    self.core.moves = 0;
+                    self.core.dir = 0;
+                    let page = &self.core.pages[d];
+                    let mut lwr: isize = 0;
+                    let mut upr: isize = page.n_cell as isize - 1;
+                    let mut idx: isize = upr >> 1;
+                    let c: i32;
+                    loop {
+                        if !noop {
+                            self.core.pager.meter().charge_steps(1)?;
+                        }
+                        let k = page.rowid_at(idx as usize)?;
+                        if k < rowid {
+                            lwr = idx + 1;
+                            if lwr > upr {
+                                c = -1;
+                                break;
+                            }
+                        } else if k > rowid {
+                            upr = idx - 1;
+                            if lwr > upr {
+                                c = 1;
+                                break;
+                            }
+                        } else {
+                            self.core.idx[d] = idx as usize;
+                            self.core.moved();
+                            return Ok(Some(0));
+                        }
+                        idx = (lwr + upr) >> 1;
+                    }
+                    self.core.idx[d] = idx as usize;
+                    self.core.moved();
+                    return Ok(Some(c));
+                }
+                // Next-leaf sibling check: if `rowid > last_k` and parent has a next child slot
+                // whose upper bound covers `rowid`, step directly to that sibling leaf!
+                if rowid > last_k && d >= 1 {
+                    let p_idx = self.core.idx[d - 1];
+                    let parent = &self.core.pages[d - 1];
+                    if !parent.is_leaf && p_idx < parent.n_cell {
+                        let next_slot = p_idx + 1;
+                        let fits_next = if next_slot < parent.n_cell {
+                            rowid <= parent.rowid_at(next_slot)?
+                        } else {
+                            // `next_slot == parent.n_cell` is `right_child` of `parent`: only valid
+                            // if all ancestors above `d - 1` have no smaller upper bound (i.e.
+                            // `d == 1`, where `parent` IS root).
+                            d == 1
+                        };
+                        if fits_next {
+                            let child_pgno = if next_slot < parent.n_cell {
+                                parent.child_at(next_slot)?
+                            } else {
+                                parent.right_child
+                            };
+                            if !noop {
+                                self.core.pager.meter().charge_steps(1)?;
+                            }
+                            let child_page =
+                                self.core.pager.get_btree_page(child_pgno, "b-tree child")?;
+                            if child_page.is_table && child_page.is_leaf && child_page.n_cell > 0 {
+                                self.core.moves = 0;
+                                self.core.dir = 0;
+                                self.core.idx[d - 1] = next_slot;
+                                self.core.pages[d] = child_page;
+                                let page = &self.core.pages[d];
+                                let mut lwr: isize = 0;
+                                let mut upr: isize = page.n_cell as isize - 1;
+                                let mut idx: isize = upr >> 1;
+                                let c: i32;
+                                loop {
+                                    if !noop {
+                                        self.core.pager.meter().charge_steps(1)?;
+                                    }
+                                    let k = page.rowid_at(idx as usize)?;
+                                    if k < rowid {
+                                        lwr = idx + 1;
+                                        if lwr > upr {
+                                            c = -1;
+                                            break;
+                                        }
+                                    } else if k > rowid {
+                                        upr = idx - 1;
+                                        if lwr > upr {
+                                            c = 1;
+                                            break;
+                                        }
+                                    } else {
+                                        self.core.idx[d] = idx as usize;
+                                        self.core.moved();
+                                        return Ok(Some(0));
+                                    }
+                                    idx = (lwr + upr) >> 1;
+                                }
+                                self.core.idx[d] = idx as usize;
+                                self.core.moved();
+                                return Ok(Some(c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if !self.core.move_to_root()? {
             return Ok(None);
         }
@@ -536,7 +786,9 @@ impl TableCursor {
             let mut idx: isize = upr >> 1;
             let c: i32;
             loop {
-                self.core.pager.meter().charge_steps(1)?;
+                if !noop {
+                    self.core.pager.meter().charge_steps(1)?;
+                }
                 let k = page.rowid_at(idx as usize)?;
                 if k < rowid {
                     lwr = idx + 1;
@@ -662,7 +914,9 @@ impl IndexCursor {
             let mut idx: isize = upr >> 1;
             let mut c: i32;
             loop {
-                self.core.pager.meter().charge_steps(1)?;
+                if !self.core.noop_meter {
+                    self.core.pager.meter().charge_steps(1)?;
+                }
                 let pc = page.cell_offset(idx as usize) + ptr;
                 if pc >= end {
                     return Err(SqliteError::corrupt(format!(

@@ -117,6 +117,7 @@ pub struct TableInfo {
     pub primary_key: Vec<i32>,
     pub indexes: Vec<Arc<IndexInfo>>,
     pub definition: TableDefinition,
+    pub(crate) sql_meta: std::sync::OnceLock<Arc<xdb_sql::TableMeta>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1044,6 +1045,7 @@ impl<'a> SchemaLoader<'a> {
                 primary_key: def.primary_key.iter().map(|p| p.cid).collect(),
                 indexes,
                 definition: def.clone(),
+                sql_meta: std::sync::OnceLock::new(),
             })
         };
 

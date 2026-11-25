@@ -314,7 +314,7 @@ pub fn open_snapshot_from_image(bytes: Vec<u8>) -> (Snapshot, u32) {
     };
     let mode = if empty {
         SnapshotMode::Empty
-    } else if bytes.get(19).copied() == Some(2) {
+    } else if bytes.get(18).copied() == Some(2) || bytes.get(19).copied() == Some(2) {
         SnapshotMode::Wal
     } else {
         SnapshotMode::Rollback
@@ -578,7 +578,10 @@ pub fn open_snapshot(
                 }
             }
         }
-        if options.wal == WalMode::Apply && wal_info.is_none() && page1[19] == 2 {
+        if options.wal == WalMode::Apply
+            && wal_info.is_none()
+            && (page1[18] == 2 || page1[19] == 2)
+        {
             wal_info = Some(WalInfo::empty(wal_path, WalStatus::Absent, 0));
         }
         checked

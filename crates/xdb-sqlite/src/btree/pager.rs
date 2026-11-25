@@ -36,6 +36,7 @@ struct PagerInner {
     lru: VecDeque<(u32, u64)>,
     tick: u64,
     meter: Arc<dyn Meter>,
+    noop_meter: bool,
     tracked_bytes: u64,
 }
 
@@ -53,6 +54,7 @@ impl Drop for PagerInner {
 pub struct Pager {
     db: DatabaseInfo,
     meter: Arc<dyn Meter>,
+    noop_meter: bool,
     inner: Arc<Mutex<PagerInner>>,
 }
 
@@ -64,10 +66,12 @@ impl Pager {
         meter: Option<Arc<dyn Meter>>,
     ) -> Self {
         let meter = meter.unwrap_or_else(|| Arc::new(NoopMeter));
+        let noop_meter = meter.is_noop();
         let capacity = cache_pages.max(1);
         Self {
             db,
             meter: meter.clone(),
+            noop_meter,
             inner: Arc::new(Mutex::new(PagerInner {
                 source,
                 capacity,
@@ -76,6 +80,7 @@ impl Pager {
                 lru: VecDeque::new(),
                 tick: 0,
                 meter,
+                noop_meter,
                 tracked_bytes: 0,
             })),
         }
@@ -101,6 +106,11 @@ impl Pager {
         &self.meter
     }
 
+    #[inline]
+    pub fn is_noop_meter(&self) -> bool {
+        self.noop_meter
+    }
+
     pub fn stats(&self) -> PagerStats {
         self.inner.lock().expect("pager poisoned").stats
     }
@@ -110,7 +120,8 @@ impl Pager {
     }
 
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().expect("pager poisoned");
+        let mut guard = self.inner.lock().expect("pager poisoned");
+        let inner = &mut *guard;
         inner.cache.clear();
         inner.lru.clear();
         if inner.tracked_bytes > 0 {
@@ -121,7 +132,8 @@ impl Pager {
 
     /// Clear cached pages and close the underlying [`PageSource`] (releasing locks).
     pub fn close(&self) -> SqliteResult<()> {
-        let mut inner = self.inner.lock().expect("pager poisoned");
+        let mut guard = self.inner.lock().expect("pager poisoned");
+        let inner = &mut *guard;
         inner.cache.clear();
         inner.lru.clear();
         if inner.tracked_bytes > 0 {
@@ -150,34 +162,72 @@ impl Pager {
 
     /// Prime the cache with an already-read page (e.g. page 1 read during `Btree::open`).
     pub fn prime(&self, pgno: u32, data: Vec<u8>) -> SqliteResult<()> {
+        self.prime_shared(pgno, data.into())
+    }
+
+    /// Prime the cache with an already-shared immutable page buffer (zero copy).
+    pub fn prime_shared(&self, pgno: u32, data: Arc<[u8]>) -> SqliteResult<()> {
         if data.len() != self.db.page_size as usize {
             return Ok(());
         }
-        let mut inner = self.inner.lock().expect("pager poisoned");
+        let mut guard = self.inner.lock().expect("pager poisoned");
+        let inner = &mut *guard;
         if inner.cache.contains_key(&pgno) {
             return Ok(());
         }
         inner.stats.misses += 1;
-        Self::insert_locked(&mut inner, pgno, data.into(), self.db.page_size as u64)
+        Self::insert_locked(inner, pgno, data, self.db.page_size as u64)
     }
 
     /// Shared immutable bytes of page `pgno`.
     pub fn get_page(&self, pgno: u32, what: &str) -> SqliteResult<Arc<[u8]>> {
         self.check_pgno(pgno, what)?;
-        let mut inner = self.inner.lock().expect("pager poisoned");
-        Self::fetch_page_locked(&mut inner, pgno, self.db.page_size)
+        let mut guard = self.inner.lock().expect("pager poisoned");
+        let inner = &mut *guard;
+        Self::fetch_page_locked(inner, pgno, self.db.page_size)
     }
 
     /// Memoized parsed [`BtreePage`] for page `pgno`.
     pub fn get_btree_page(&self, pgno: u32, what: &str) -> SqliteResult<Arc<BtreePage>> {
         self.check_pgno(pgno, what)?;
-        let mut inner = self.inner.lock().expect("pager poisoned");
-        let data = Self::fetch_page_locked(&mut inner, pgno, self.db.page_size)?;
-        if let Some(entry) = inner.cache.get(&pgno) {
-            if let Some(ref bt) = entry.btree {
-                return Ok(bt.clone());
+        let mut guard = self.inner.lock().expect("pager poisoned");
+        let inner = &mut *guard;
+        inner.tick += 1;
+        let tick = inner.tick;
+        let half_cap = (inner.capacity >> 1).max(1) as u64;
+        if let Some(entry) = inner.cache.get_mut(&pgno) {
+            if !inner.noop_meter {
+                inner.meter.charge_steps(1)?;
             }
+            inner.stats.hits += 1;
+            let bt = entry.btree.clone();
+            let data = if bt.is_none() {
+                Some(entry.data.clone())
+            } else {
+                None
+            };
+            if tick.saturating_sub(entry.tick) > half_cap {
+                entry.tick = tick;
+                inner.lru.push_back((pgno, tick));
+                if inner.lru.len() > inner.capacity.saturating_mul(2) {
+                    let cache = &inner.cache;
+                    inner
+                        .lru
+                        .retain(|(p, t)| cache.get(p).is_some_and(|e| e.tick == *t));
+                }
+            }
+            if let Some(bt) = bt {
+                return Ok(bt);
+            }
+            let parsed = Arc::new(BtreePage::parse(pgno, data.expect("data cloned"), &self.db)?);
+            if let Some(entry) = inner.cache.get_mut(&pgno) {
+                entry.btree = Some(parsed.clone());
+            }
+            return Ok(parsed);
         }
+        // Cache miss: load page bytes, parse, and store parsed BtreePage in single insertion.
+        inner.tick -= 1;
+        let data = Self::fetch_page_locked(inner, pgno, self.db.page_size)?;
         let parsed = Arc::new(BtreePage::parse(pgno, data, &self.db)?);
         if let Some(entry) = inner.cache.get_mut(&pgno) {
             entry.btree = Some(parsed.clone());
@@ -194,7 +244,9 @@ impl Pager {
         let tick = inner.tick;
         let half_cap = (inner.capacity >> 1).max(1) as u64;
         if let Some(entry) = inner.cache.get_mut(&pgno) {
-            inner.meter.charge_steps(1)?;
+            if !inner.noop_meter {
+                inner.meter.charge_steps(1)?;
+            }
             inner.stats.hits += 1;
             let data = entry.data.clone();
             if tick.saturating_sub(entry.tick) > half_cap {
@@ -210,16 +262,17 @@ impl Pager {
             return Ok(data);
         }
 
-        inner.meter.charge_page_reads(1)?;
+        if !inner.noop_meter {
+            inner.meter.charge_page_reads(1)?;
+        }
         inner.stats.misses += 1;
-        let bytes = inner.source.read_page(pgno)?;
-        if bytes.len() != page_size as usize {
+        let arc = inner.source.read_page_shared(pgno)?;
+        if arc.len() != page_size as usize {
             return Err(SqliteError::corrupt(format!(
                 "PageSource returned {} bytes for page {pgno}, expected {page_size}",
-                bytes.len()
+                arc.len()
             )));
         }
-        let arc: Arc<[u8]> = bytes.into();
         Self::insert_locked(inner, pgno, arc.clone(), u64::from(page_size))?;
         Ok(arc)
     }
@@ -238,7 +291,9 @@ impl Pager {
                     .is_some_and(|e| e.tick == old_tick);
                 if stale {
                     inner.cache.remove(&old_pgno);
-                    inner.meter.release_memory(page_bytes);
+                    if !inner.noop_meter {
+                        inner.meter.release_memory(page_bytes);
+                    }
                     inner.tracked_bytes = inner.tracked_bytes.saturating_sub(page_bytes);
                     break;
                 }
@@ -247,13 +302,17 @@ impl Pager {
             if inner.cache.len() >= inner.capacity {
                 if let Some(&k) = inner.cache.keys().next() {
                     inner.cache.remove(&k);
-                    inner.meter.release_memory(page_bytes);
+                    if !inner.noop_meter {
+                        inner.meter.release_memory(page_bytes);
+                    }
                     inner.tracked_bytes = inner.tracked_bytes.saturating_sub(page_bytes);
                 }
             }
         }
-        inner.meter.reserve_memory(page_bytes)?;
-        inner.tracked_bytes = inner.tracked_bytes.saturating_add(page_bytes);
+        if !inner.noop_meter {
+            inner.meter.reserve_memory(page_bytes)?;
+            inner.tracked_bytes = inner.tracked_bytes.saturating_add(page_bytes);
+        }
         inner.tick += 1;
         let tick = inner.tick;
         inner.cache.insert(

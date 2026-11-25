@@ -1,7 +1,7 @@
 //! Type affinity, ported from SQLite 3.54.1 (`build.c`, `vdbe.c`, `expr.c`).
 
-use super::fp_format::{real_to_text, DEFAULT_FP_DIGITS};
-use super::int64::{i64_to_real, int64_to_text, real_to_integer_affinity};
+use super::fp_format::{real_to_text, real_to_text_buf, DEFAULT_FP_DIGITS};
+use super::int64::{i64_to_real, int64_to_text, int64_to_text_buf, real_to_integer_affinity};
 use super::numeric::apply_numeric_affinity;
 use super::{Affinity, SqlValue};
 
@@ -71,20 +71,32 @@ pub fn number_to_text(v: &SqlValue) -> Option<String> {
 pub fn apply_affinity_raw(v: SqlValue, aff: Affinity) -> SqlValue {
     match v {
         SqlValue::Null | SqlValue::Blob(_) => v,
-        SqlValue::Int(_) => match aff {
-            Affinity::Text => SqlValue::from(number_to_text(&v).expect("int")),
-            _ => v,
-        },
-        SqlValue::Real(r) => match aff {
-            Affinity::Numeric | Affinity::Integer | Affinity::Real => {
-                match real_to_integer_affinity(r) {
-                    Some(i) => SqlValue::Int(i),
-                    None => SqlValue::Real(r),
-                }
+        SqlValue::Int(i) => match aff {
+            Affinity::Text => {
+                let mut buf = [0u8; 24];
+                SqlValue::Text(Box::from(super::int64::int64_to_text_buf(i, &mut buf)))
             }
-            Affinity::Text => SqlValue::from(real_to_text(r, DEFAULT_FP_DIGITS)),
-            _ => SqlValue::Real(r),
+            _ => SqlValue::Int(i),
         },
+        SqlValue::Real(r) => {
+            if r.is_nan() {
+                return SqlValue::Null;
+            }
+            match aff {
+                Affinity::Numeric | Affinity::Integer | Affinity::Real => {
+                    match real_to_integer_affinity(r) {
+                        Some(i) => SqlValue::Int(i),
+                        None => SqlValue::Real(r),
+                    }
+                }
+                Affinity::Text => {
+                    let mut buf = [0u8; 48];
+                    let s = super::fp_format::real_to_text_buf(r, DEFAULT_FP_DIGITS, &mut buf);
+                    SqlValue::Text(Box::from(s.as_bytes()))
+                }
+                _ => SqlValue::Real(r),
+            }
+        }
         SqlValue::Text(ref bytes) => {
             if is_numeric_affinity(Some(aff)) {
                 apply_numeric_affinity(bytes, true).unwrap_or(v)
@@ -160,8 +172,20 @@ pub fn apply_comparison_affinity(
 
 fn stringify_number(v: SqlValue) -> SqlValue {
     match v {
-        SqlValue::Int(i) => SqlValue::from(int64_to_text(i)),
-        SqlValue::Real(r) => SqlValue::from(real_to_text(r, DEFAULT_FP_DIGITS)),
+        SqlValue::Int(i) => {
+            let mut buf = [0u8; 24];
+            SqlValue::Text(Box::from(int64_to_text_buf(i, &mut buf)))
+        }
+        SqlValue::Real(r) => {
+            if r.is_nan() {
+                SqlValue::Null
+            } else {
+                let mut buf = [0u8; 48];
+                SqlValue::Text(Box::from(
+                    real_to_text_buf(r, DEFAULT_FP_DIGITS, &mut buf).as_bytes(),
+                ))
+            }
+        }
         other => other,
     }
 }

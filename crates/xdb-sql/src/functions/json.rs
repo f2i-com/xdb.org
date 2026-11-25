@@ -4,7 +4,7 @@
 //! Zero external dependencies; enforces nesting depth limits (SQLite `JSON_MAX_DEPTH = 1000`)
 //! and length limits.
 
-use xdb_core::value::{atof, int_value, number_to_text, real_same_as_int, real_to_i64, SqlValue};
+use xdb_core::value::{atof, int_value, number_to_text, SqlValue};
 
 use crate::errors::{SqlError, SqlResult};
 use crate::functions::FunctionContext;
@@ -76,10 +76,10 @@ pub fn json_value_from_sql(v: &SqlValue, is_json: bool) -> SqlResult<JsonVal> {
         SqlValue::Null => Ok(JsonVal::Null),
         SqlValue::Int(i) => Ok(JsonVal::Int(*i)),
         SqlValue::Real(r) => {
-            if r.is_finite() {
-                Ok(JsonVal::Real(*r))
-            } else {
+            if r.is_nan() {
                 Ok(JsonVal::Null)
+            } else {
+                Ok(JsonVal::Real(*r))
             }
         }
         SqlValue::Text(b) => {
@@ -96,21 +96,52 @@ pub fn json_value_from_sql(v: &SqlValue, is_json: bool) -> SqlResult<JsonVal> {
 
 // ───────────────────────────── parser (RFC 8259 + JSON5) ─────────────────────────────
 
-struct JsonParser<'a> {
+struct JsonParser<'a, 'm> {
     src: &'a [u8],
     pos: usize,
     allow_json5: bool,
     depth: usize,
+    meter: Option<&'m dyn xdb_core::Meter>,
+    mem: crate::utf8::MemoryGuard<'m>,
+    limit_err: Option<xdb_core::ResourceLimitError>,
 }
 
-impl<'a> JsonParser<'a> {
+impl<'a, 'm> JsonParser<'a, 'm> {
     fn new(src: &'a str, allow_json5: bool) -> Self {
+        Self::with_meter(src, allow_json5, None)
+    }
+
+    fn with_meter(
+        src: &'a str,
+        allow_json5: bool,
+        meter: Option<&'m dyn xdb_core::Meter>,
+    ) -> Self {
         Self {
             src: src.as_bytes(),
             pos: 0,
             allow_json5,
             depth: 0,
+            meter,
+            mem: crate::utf8::MemoryGuard::new(meter),
+            limit_err: None,
         }
+    }
+
+    #[inline]
+    fn charge_node(&mut self, bytes: u64) -> Result<(), usize> {
+        if let Some(m) = self.meter {
+            if let Err(e) = m.charge_steps(1) {
+                self.limit_err = Some(e);
+                return Err(self.pos + 1);
+            }
+            if bytes > 0 {
+                if let Err(SqlError::ResourceLimit(e)) = self.mem.reserve(bytes) {
+                    self.limit_err = Some(e);
+                    return Err(self.pos + 1);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<u8> {
@@ -164,19 +195,41 @@ impl<'a> JsonParser<'a> {
         let Some(b) = self.peek() else {
             return Err(self.pos + 1);
         };
+        self.charge_node(std::mem::size_of::<JsonVal>() as u64)?;
         match b {
             b'{' => self.parse_object(),
             b'[' => self.parse_array(),
-            b'"' => self.parse_string(b'"').map(JsonVal::Str),
-            b'\'' if self.allow_json5 => self.parse_string(b'\'').map(JsonVal::Str),
+            b'"' => {
+                let s = self.parse_string(b'"')?;
+                Ok(JsonVal::Str(s))
+            }
+            b'\'' if self.allow_json5 => {
+                let s = self.parse_string(b'\'')?;
+                Ok(JsonVal::Str(s))
+            }
             b't' => self.expect_kw(b"true").map(|()| JsonVal::Bool(true)),
             b'f' => self.expect_kw(b"false").map(|()| JsonVal::Bool(false)),
-            b'n' => self.expect_kw(b"null").map(|()| JsonVal::Null),
+            b'n' => {
+                if self.src[self.pos..].starts_with(b"null") {
+                    self.pos += 4;
+                    Ok(JsonVal::Null)
+                } else if self.allow_json5 && self.match_kw_ci(b"nan") {
+                    Ok(JsonVal::Null)
+                } else {
+                    Err(self.pos + 1)
+                }
+            }
+            b'N' if self.allow_json5 && self.match_kw_ci(b"nan") => Ok(JsonVal::Null),
+            b'q' | b'Q' if self.allow_json5 && self.match_kw_ci(b"qnan") => Ok(JsonVal::Null),
+            b's' | b'S' if self.allow_json5 && self.match_kw_ci(b"snan") => Ok(JsonVal::Null),
             b'-' | b'0'..=b'9' => self.parse_number(),
             b'+' | b'.' if self.allow_json5 => self.parse_number(),
-            b'I' if self.allow_json5 => {
-                self.expect_kw(b"Infinity")
-                    .map(|()| JsonVal::Real(f64::INFINITY))
+            b'i' | b'I' if self.allow_json5 => {
+                if self.match_kw_ci(b"infinity") || self.match_kw_ci(b"inf") {
+                    Ok(JsonVal::Real(f64::INFINITY))
+                } else {
+                    Err(self.pos + 1)
+                }
             }
             _ => Err(self.pos + 1),
         }
@@ -191,6 +244,16 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    fn match_kw_ci(&mut self, kw: &[u8]) -> bool {
+        let rest = &self.src[self.pos..];
+        if rest.len() >= kw.len() && rest[..kw.len()].eq_ignore_ascii_case(kw) {
+            self.pos += kw.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn parse_object(&mut self) -> Result<JsonVal, usize> {
         self.depth += 1;
         if self.depth > JSON_MAX_DEPTH {
@@ -198,18 +261,22 @@ impl<'a> JsonParser<'a> {
         }
         self.pos += 1; // '{'
         self.skip_ws()?;
-        let mut entries = Vec::new();
         if self.peek() == Some(b'}') {
             self.pos += 1;
             self.depth -= 1;
-            return Ok(JsonVal::Object(entries));
+            return Ok(JsonVal::Object(Vec::new()));
         }
+        let mut entries = Vec::with_capacity(4);
         loop {
             self.skip_ws()?;
             let key = match self.peek() {
                 Some(b'"') => self.parse_string(b'"')?,
                 Some(b'\'') if self.allow_json5 => self.parse_string(b'\'')?,
-                Some(c) if self.allow_json5 && is_json5_ident_start(c) => self.parse_ident()?,
+                Some(c) if self.allow_json5 && is_json5_ident_start(c) => {
+                    let k = self.parse_ident()?;
+                    self.charge_node(k.len() as u64)?;
+                    k
+                }
                 _ => return Err(self.pos + 1),
             };
             self.skip_ws()?;
@@ -218,6 +285,7 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
             let val = self.parse_value()?;
+            self.charge_node(32)?;
             entries.push((key, val));
             self.skip_ws()?;
             match self.peek() {
@@ -294,11 +362,53 @@ impl<'a> JsonParser<'a> {
 
     fn parse_string(&mut self, quote: u8) -> Result<String, usize> {
         self.pos += 1; // opening quote
-        let mut out = String::new();
+        let start = self.pos;
+        let bytes = self.src;
+        let len = bytes.len();
+        // Fast unescaped slice scan: avoids byte-by-byte `String::push` & repeated reallocs!
+        while self.pos < len {
+            let b = bytes[self.pos];
+            if b == quote {
+                let slice = &bytes[start..self.pos];
+                self.pos += 1;
+                if self.meter.is_some() && !slice.is_empty() {
+                    self.charge_node(slice.len() as u64)?;
+                }
+                return Ok(std::str::from_utf8(slice)
+                    .expect("input JSON is valid UTF-8")
+                    .to_string());
+            }
+            if b < 0x20 {
+                return Err(self.pos + 1);
+            }
+            if b == b'\\' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let prefix_len = self.pos - start;
+        if prefix_len > 0 {
+            self.charge_node(prefix_len as u64)?;
+        }
+        let mut out = String::with_capacity(prefix_len + 16);
+        let mut reserved_len = prefix_len;
+        if prefix_len > 0 {
+            let prefix = std::str::from_utf8(&bytes[start..self.pos])
+                .expect("input JSON is valid UTF-8");
+            out.push_str(prefix);
+        }
         while self.pos < self.src.len() {
+            if out.len().saturating_sub(reserved_len) >= 4096 {
+                let delta = out.len() - reserved_len;
+                self.charge_node(delta as u64)?;
+                reserved_len = out.len();
+            }
             let b = self.src[self.pos];
             if b == quote {
                 self.pos += 1;
+                if out.len() > reserved_len {
+                    self.charge_node((out.len() - reserved_len) as u64)?;
+                }
                 return Ok(out);
             }
             if b < 0x20 {
@@ -415,8 +525,7 @@ impl<'a> JsonParser<'a> {
         } else if self.allow_json5 && self.peek() == Some(b'+') {
             self.pos += 1;
         }
-        if self.allow_json5 && self.src[self.pos..].starts_with(b"Infinity") {
-            self.pos += 8;
+        if self.allow_json5 && (self.match_kw_ci(b"infinity") || self.match_kw_ci(b"inf")) {
             return Ok(JsonVal::Real(if neg {
                 f64::NEG_INFINITY
             } else {
@@ -499,6 +608,15 @@ impl<'a> JsonParser<'a> {
 
         let slice = &self.src[start..self.pos];
         if !is_float {
+            let digits = &self.src[int_start..self.pos];
+            if !digits.is_empty() && digits.len() <= 18 {
+                let mut acc = 0u64;
+                for &d in digits {
+                    acc = acc * 10 + u64::from(d - b'0');
+                }
+                let iv = if neg { -(acc as i64) } else { acc as i64 };
+                return Ok(JsonVal::Int(iv));
+            }
             let s = std::str::from_utf8(slice).unwrap_or("");
             if let Ok(iv) = s.parse::<i64>() {
                 return Ok(JsonVal::Int(iv));
@@ -529,6 +647,37 @@ pub fn parse_json(src: &str, allow_json5: bool) -> SqlResult<JsonVal> {
 }
 
 // ───────────────────────────── rendering ─────────────────────────────
+
+fn push_json_escaped_str_metered(
+    s: &str,
+    out: &mut String,
+    max_len: usize,
+    ctx: Option<&FunctionContext<'_>>,
+    mem: &mut crate::utf8::MemoryGuard<'_>,
+) -> SqlResult<()> {
+    let bytes = s.as_bytes();
+    if let Some(c) = ctx {
+        if bytes.len() >= 256 {
+            c.charge_steps((bytes.len() / 256) as u64)?;
+        }
+    }
+    let mut esc_len: usize = 2; // surrounding quotes
+    for &b in bytes {
+        let add = match b {
+            b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+        esc_len = esc_len.saturating_add(add);
+    }
+    if out.len().saturating_add(esc_len) > max_len {
+        return Err(SqlError::too_big());
+    }
+    mem.reserve(esc_len as u64)?;
+    out.reserve(esc_len);
+    push_json_escaped_str(s, out);
+    Ok(())
+}
 
 fn push_json_escaped_str(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -581,6 +730,104 @@ pub fn render_json_compact(val: &JsonVal, out: &mut String) {
     let _ = render_json_compact_limited(val, out, usize::MAX, 0, None, &mut mem);
 }
 
+/// Parse JSON text while charging per-node steps and cumulative AST memory against `meter`.
+pub fn parse_json_metered_with(
+    src: &str,
+    allow_json5: bool,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> SqlResult<JsonVal> {
+    if let Some(m) = meter {
+        if src.len() >= 64 {
+            m.charge_steps((src.len() / 64) as u64)?;
+        }
+    }
+    let mut p = JsonParser::with_meter(src, allow_json5, meter);
+    let val = match p.parse_value() {
+        Ok(v) => v,
+        Err(_) => {
+            if let Some(e) = p.limit_err {
+                return Err(SqlError::ResourceLimit(e));
+            }
+            return Err(SqlError::runtime("malformed JSON"));
+        }
+    };
+    if p.skip_ws().is_err() || p.pos < p.src.len() {
+        if let Some(e) = p.limit_err {
+            return Err(SqlError::ResourceLimit(e));
+        }
+        return Err(SqlError::runtime("malformed JSON"));
+    }
+    Ok(val)
+}
+
+/// Render a [`JsonVal`] to a compact JSON `String`, enforcing `meter` steps & memory.
+pub fn render_json_compact_metered(
+    val: &JsonVal,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> SqlResult<String> {
+    let mut out = String::new();
+    let mut mem = crate::utf8::MemoryGuard::new(meter);
+    let ctx = FunctionContext::new(meter, 0);
+    render_json_compact_limited(val, &mut out, usize::MAX, 0, Some(&ctx), &mut mem)?;
+    Ok(out)
+}
+
+/// Render an iterator of `&JsonVal` elements as a JSON array without cloning the elements.
+pub fn render_json_array_iter_metered<'a, I>(
+    items: I,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<SqlValue>
+where
+    I: IntoIterator<Item = &'a JsonVal>,
+{
+    let mut out = String::new();
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    let max_len = ctx.limits.max_length;
+    out.push('[');
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        render_json_compact_limited(item, &mut out, max_len, 1, Some(ctx), &mut mem)?;
+    }
+    out.push(']');
+    if out.len() > max_len {
+        return Err(SqlError::too_big());
+    }
+    Ok(SqlValue::text(out))
+}
+
+/// Render an iterator of `(&str, &JsonVal)` pairs as a JSON object without cloning.
+pub fn render_json_object_iter_metered<'a, I>(
+    entries: I,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<SqlValue>
+where
+    I: IntoIterator<Item = (&'a str, &'a JsonVal)>,
+{
+    let mut out = String::new();
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    let max_len = ctx.limits.max_length;
+    out.push('{');
+    for (i, (k, v)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if out.len().saturating_add(k.len()).saturating_add(3) > max_len {
+            return Err(SqlError::too_big());
+        }
+        push_json_escaped_str_metered(k, &mut out, max_len.saturating_sub(1), Some(ctx), &mut mem)?;
+        out.push(':');
+        mem.reserve(1)?;
+        render_json_compact_limited(v, &mut out, max_len, 1, Some(ctx), &mut mem)?;
+    }
+    out.push('}');
+    if out.len() > max_len {
+        return Err(SqlError::too_big());
+    }
+    Ok(SqlValue::text(out))
+}
+
 /// Render a [`JsonVal`] to a SQL `TEXT` value while enforcing `ctx.limits.max_length`
 /// and charging cumulative memory + steps against `ctx.meter`.
 pub fn render_json_value_metered(val: &JsonVal, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
@@ -608,13 +855,72 @@ fn render_json_extracted_metered(val: &JsonVal, ctx: &FunctionContext<'_>) -> Sq
     }
 }
 
-fn parse_json_metered(src: &str, json5: bool, ctx: &FunctionContext<'_>) -> SqlResult<JsonVal> {
+fn json_value_from_sql_guarded(
+    v: &SqlValue,
+    is_json: bool,
+    ctx: &FunctionContext<'_>,
+    mem: &mut crate::utf8::MemoryGuard<'_>,
+) -> SqlResult<JsonVal> {
+    match v {
+        SqlValue::Null => Ok(JsonVal::Null),
+        SqlValue::Int(i) => Ok(JsonVal::Int(*i)),
+        SqlValue::Real(r) => {
+            if r.is_nan() {
+                Ok(JsonVal::Null)
+            } else {
+                Ok(JsonVal::Real(*r))
+            }
+        }
+        SqlValue::Text(b) => {
+            if is_json {
+                let s = String::from_utf8_lossy(b);
+                let parsed = parse_json_metered(&s, true, ctx)?;
+                mem.reserve((b.len() as u64).saturating_add(32))?;
+                Ok(parsed)
+            } else {
+                mem.reserve((b.len() as u64).saturating_add(32))?;
+                let s = String::from_utf8_lossy(b);
+                Ok(JsonVal::Str(s.into_owned()))
+            }
+        }
+        SqlValue::Blob(_) => Err(SqlError::runtime("JSON cannot hold BLOB values")),
+    }
+}
+
+pub(crate) fn json_value_from_sql_metered(
+    v: &SqlValue,
+    is_json: bool,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<JsonVal> {
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    json_value_from_sql_guarded(v, is_json, ctx, &mut mem)
+}
+
+fn parse_json_with_pos_metered(
+    src: &str,
+    json5: bool,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<Result<JsonVal, usize>> {
     if src.len() >= 64 {
         ctx.charge_steps((src.len() / 64) as u64)?;
     }
-    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
-    mem.reserve(src.len() as u64)?;
-    parse_json(src, json5)
+    let mut p = JsonParser::with_meter(src, json5, ctx.meter);
+    let res = match p.parse_value() {
+        Ok(val) => match p.skip_ws() {
+            Ok(()) if p.pos >= p.src.len() => Ok(val),
+            Ok(()) => Err(p.pos + 1),
+            Err(pos) => Err(pos),
+        },
+        Err(pos) => Err(pos),
+    };
+    if let Some(e) = p.limit_err {
+        return Err(SqlError::ResourceLimit(e));
+    }
+    Ok(res)
+}
+
+fn parse_json_metered(src: &str, json5: bool, ctx: &FunctionContext<'_>) -> SqlResult<JsonVal> {
+    parse_json_metered_with(src, json5, ctx.meter)
 }
 
 fn render_json_compact_limited(
@@ -642,28 +948,16 @@ fn render_json_compact_limited(
                 if r.is_nan() {
                     out.push_str("null");
                 } else if r.is_sign_negative() {
-                    out.push_str("-9.0e999");
+                    out.push_str("-9.0e+999");
                 } else {
-                    out.push_str("9.0e999");
+                    out.push_str("9.0e+999");
                 }
             } else if let Some(s) = number_to_text(&SqlValue::Real(*r)) {
                 out.push_str(&s);
             }
         }
         JsonVal::Str(s) => {
-            if out.len().saturating_add(s.len()).saturating_add(2) > max_len {
-                return Err(SqlError::too_big());
-            }
-            mem.reserve((s.len() + 2) as u64)?;
-            let start = out.len();
-            push_json_escaped_str(s, out);
-            let actual = out.len() - start;
-            if actual > s.len() + 2 {
-                mem.reserve((actual - (s.len() + 2)) as u64)?;
-            }
-            if out.len() > max_len {
-                return Err(SqlError::too_big());
-            }
+            push_json_escaped_str_metered(s, out, max_len, ctx, mem)?;
             return Ok(());
         }
         JsonVal::Array(items) => {
@@ -685,10 +979,9 @@ fn render_json_compact_limited(
                 if out.len().saturating_add(k.len()).saturating_add(3) > max_len {
                     return Err(SqlError::too_big());
                 }
-                let kstart = out.len();
-                push_json_escaped_str(k, out);
+                push_json_escaped_str_metered(k, out, max_len.saturating_sub(1), ctx, mem)?;
                 out.push(':');
-                mem.reserve((out.len() - kstart) as u64)?;
+                mem.reserve(1)?;
                 render_json_compact_limited(v, out, max_len, depth + 1, ctx, mem)?;
             }
             out.push('}');
@@ -757,18 +1050,17 @@ fn render_json_pretty(
             out.push_str("{\n");
             for (i, (k, v)) in entries.iter().enumerate() {
                 let indent_bytes = indent.len().saturating_mul(level + 1);
-                let est = indent_bytes.saturating_add(k.len()).saturating_add(4);
-                if out.len().saturating_add(est) > max_len {
+                if out.len().saturating_add(indent_bytes).saturating_add(2) > max_len {
                     return Err(SqlError::too_big());
                 }
-                mem.reserve(est as u64)?;
-                if est >= 256 {
-                    ctx.charge_steps((est / 256) as u64)?;
+                mem.reserve((indent_bytes + 2) as u64)?;
+                if indent_bytes >= 256 {
+                    ctx.charge_steps((indent_bytes / 256) as u64)?;
                 }
                 for _ in 0..=level {
                     out.push_str(indent);
                 }
-                push_json_escaped_str(k, out);
+                push_json_escaped_str_metered(k, out, max_len.saturating_sub(2), Some(ctx), mem)?;
                 out.push_str(": ");
                 render_json_pretty(v, indent, level + 1, out, ctx, mem)?;
                 if i + 1 < entries.len() {
@@ -808,14 +1100,19 @@ enum PathStep {
     FromEnd(Option<usize>),
 }
 
-fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
+fn parse_json_path(path: &str, ctx: &FunctionContext<'_>) -> SqlResult<Vec<PathStep>> {
     let bytes = path.as_bytes();
     if bytes.first() != Some(&b'$') {
         return Err(SqlError::runtime(format!("JSON path error near '{path}'")));
     }
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
     let mut i = 1;
     let mut steps = Vec::new();
     while i < bytes.len() {
+        ctx.charge_steps(1)?;
+        if steps.len() >= JSON_MAX_DEPTH {
+            return Err(SqlError::runtime("JSON nesting depth exceeded"));
+        }
         match bytes[i] {
             b'.' => {
                 i += 1;
@@ -823,11 +1120,18 @@ fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
                     return Err(SqlError::runtime(format!("JSON path error near '{path}'")));
                 }
                 if bytes[i] == b'"' {
-                    let mut p = JsonParser::new(&path[i..], false);
-                    let key = p
-                        .parse_string(b'"')
-                        .map_err(|_| SqlError::runtime(format!("JSON path error near '{path}'")))?;
+                    let mut p = JsonParser::with_meter(&path[i..], false, ctx.meter);
+                    let key = match p.parse_string(b'"') {
+                        Ok(k) => k,
+                        Err(_) => {
+                            if let Some(lim) = p.limit_err.take() {
+                                return Err(SqlError::ResourceLimit(lim));
+                            }
+                            return Err(SqlError::runtime(format!("JSON path error near '{path}'")));
+                        }
+                    };
                     i += p.pos;
+                    mem.reserve((key.len() as u64).saturating_add(32))?;
                     steps.push(PathStep::Key(key));
                 } else {
                     let start = i;
@@ -837,6 +1141,7 @@ fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
                     if i == start {
                         return Err(SqlError::runtime(format!("JSON path error near '{path}'")));
                     }
+                    mem.reserve(((i - start) as u64).saturating_add(32))?;
                     steps.push(PathStep::Key(path[start..i].to_string()));
                 }
             }
@@ -846,6 +1151,7 @@ fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b']' {
                         i += 1;
+                        mem.reserve(32)?;
                         steps.push(PathStep::FromEnd(None));
                     } else if i < bytes.len() && bytes[i] == b'-' {
                         i += 1;
@@ -862,6 +1168,7 @@ fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
                         // instead of erroring (matches SQLite on both 32-bit WASM and 64-bit).
                         let n: usize = path[start..i].parse().unwrap_or(usize::MAX);
                         i += 1;
+                        mem.reserve(32)?;
                         steps.push(PathStep::FromEnd(Some(n)));
                     } else {
                         return Err(SqlError::runtime(format!("JSON path error near '{path}'")));
@@ -876,6 +1183,7 @@ fn parse_json_path(path: &str) -> SqlResult<Vec<PathStep>> {
                     }
                     let idx: usize = path[start..i].parse().unwrap_or(usize::MAX);
                     i += 1;
+                    mem.reserve(32)?;
                     steps.push(PathStep::Index(idx));
                 }
             }
@@ -896,23 +1204,16 @@ fn arrow_rhs_to_path(rhs: &SqlValue) -> Option<String> {
                 Some(format!("$[{i}]"))
             }
         }
-        SqlValue::Real(r) => {
-            let iv = real_to_i64(*r);
-            if real_same_as_int(*r, iv) {
-                if iv < 0 {
-                    Some(format!("$[#-{}]", iv.unsigned_abs()))
-                } else {
-                    Some(format!("$[{iv}]"))
-                }
-            } else {
-                let s = number_to_text(rhs).unwrap_or_default();
-                Some(format!("$.\"{s}\""))
-            }
+        SqlValue::Real(_) => {
+            let s = number_to_text(rhs).unwrap_or_default();
+            Some(format!("$.\"{s}\""))
         }
         SqlValue::Text(b) | SqlValue::Blob(b) => {
             let s = String::from_utf8_lossy(b);
             if s.starts_with('$') {
                 Some(s.into_owned())
+            } else if s.len() >= 3 && s.starts_with('[') && s.ends_with(']') {
+                Some(format!("${s}"))
             } else {
                 let mut quoted = String::from("$.");
                 push_json_escaped_str(&s, &mut quoted);
@@ -920,6 +1221,144 @@ fn arrow_rhs_to_path(rhs: &SqlValue) -> Option<String> {
             }
         }
     }
+}
+
+/// Walk a SQLite JSON path string directly against `root` without allocating `Vec<PathStep>`,
+/// matching SQLite `json.c:jsonLookupStep` semantics (including returning `Ok(None)` when
+/// stepping `[...]` into a non-array or `.key` into a non-object, while still rejecting
+/// invalid path syntax such as `$a`, `$.`, or `[foo]` on an array).
+fn lookup_json_path_str<'a>(
+    root: &'a JsonVal,
+    path: &str,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<Option<&'a JsonVal>> {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+    }
+    if bytes.len() > JSON_MAX_DEPTH {
+        ctx.charge_steps((bytes.len() / 64) as u64)?;
+        let mut steps_est = 0usize;
+        let mut in_quote = false;
+        let mut esc = false;
+        for &b in &bytes[1..] {
+            if in_quote {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_quote = false;
+                }
+            } else if b == b'"' {
+                in_quote = true;
+            } else if b == b'.' || b == b'[' {
+                steps_est += 1;
+                if steps_est > JSON_MAX_DEPTH {
+                    return Err(SqlError::runtime("JSON path too deep"));
+                }
+            }
+        }
+    }
+    let mut cur = root;
+    let mut i = 1usize;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        depth += 1;
+        if depth > JSON_MAX_DEPTH {
+            return Err(SqlError::runtime("JSON path too deep"));
+        }
+        if (depth & 31) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                }
+                let key_cow: std::borrow::Cow<'_, str> = if bytes[i] == b'"' {
+                    let mut p = JsonParser::with_meter(&path[i..], false, ctx.meter);
+                    let key = match p.parse_string(b'"') {
+                        Ok(k) => k,
+                        Err(_) => {
+                            if let Some(lim) = p.limit_err.take() {
+                                return Err(SqlError::ResourceLimit(lim));
+                            }
+                            return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                        }
+                    };
+                    i += p.pos;
+                    std::borrow::Cow::Owned(key)
+                } else {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
+                        i += 1;
+                    }
+                    if i == start {
+                        return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                    }
+                    std::borrow::Cow::Borrowed(&path[start..i])
+                };
+                match cur {
+                    JsonVal::Object(entries) => {
+                        let Some((_, next)) = entries.iter().find(|(ek, _)| ek == key_cow.as_ref())
+                        else {
+                            return Ok(None);
+                        };
+                        cur = next;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            b'[' => {
+                let JsonVal::Array(items) = cur else {
+                    // SQLite `jsonLookupStep`: `[` on a non-array returns NULL immediately.
+                    return Ok(None);
+                };
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'#' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b']' {
+                        return Ok(None);
+                    } else if i < bytes.len() && bytes[i] == b'-' {
+                        i += 1;
+                        let start = i;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        if i == start || i >= bytes.len() || bytes[i] != b']' {
+                            return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                        }
+                        let n: usize = path[start..i].parse().unwrap_or(usize::MAX);
+                        i += 1;
+                        if n == 0 || n > items.len() {
+                            return Ok(None);
+                        }
+                        cur = &items[items.len() - n];
+                    } else {
+                        return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                    }
+                } else {
+                    let start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i == start || i >= bytes.len() || bytes[i] != b']' {
+                        return Err(SqlError::runtime(format!("bad JSON path: '{path}'")));
+                    }
+                    let idx: usize = path[start..i].parse().unwrap_or(usize::MAX);
+                    i += 1;
+                    let Some(next) = items.get(idx) else {
+                        return Ok(None);
+                    };
+                    cur = next;
+                }
+            }
+            _ => return Err(SqlError::runtime(format!("bad JSON path: '{path}'"))),
+        }
+    }
+    Ok(Some(cur))
 }
 
 fn lookup_path<'a>(root: &'a JsonVal, steps: &[PathStep]) -> Option<&'a JsonVal> {
@@ -951,6 +1390,30 @@ enum MutMode {
     Set,
 }
 
+fn step_can_create_into_empty(step: &PathStep) -> bool {
+    matches!(
+        step,
+        PathStep::Key(_) | PathStep::Index(0) | PathStep::FromEnd(None) | PathStep::FromEnd(Some(0))
+    )
+}
+
+fn build_created_container(steps: &[PathStep], new_val: JsonVal) -> Option<JsonVal> {
+    if steps.iter().any(|s| !step_can_create_into_empty(s)) {
+        return None;
+    }
+    let mut val = new_val;
+    for step in steps.iter().rev() {
+        val = match step {
+            PathStep::Key(k) => JsonVal::Object(vec![(k.clone(), val)]),
+            PathStep::Index(0) | PathStep::FromEnd(None) | PathStep::FromEnd(Some(0)) => {
+                JsonVal::Array(vec![val])
+            }
+            _ => return None,
+        };
+    }
+    Some(val)
+}
+
 fn mutate_path(root: &mut JsonVal, steps: &[PathStep], new_val: JsonVal, mode: MutMode) {
     if steps.is_empty() {
         if mode != MutMode::Insert {
@@ -959,22 +1422,44 @@ fn mutate_path(root: &mut JsonVal, steps: &[PathStep], new_val: JsonVal, mode: M
         return;
     }
     let mut cur = root;
-    for step in &steps[..steps.len() - 1] {
+    for i in 0..steps.len() - 1 {
+        let step = &steps[i];
         match (cur, step) {
             (JsonVal::Object(entries), PathStep::Key(k)) => {
-                let Some(pos) = entries.iter().position(|(ek, _)| ek == k) else {
+                if let Some(pos) = entries.iter().position(|(ek, _)| ek == k) {
+                    cur = &mut entries[pos].1;
+                } else if mode != MutMode::Replace {
+                    if let Some(created) = build_created_container(&steps[i + 1..], new_val) {
+                        entries.push((k.clone(), created));
+                    }
                     return;
-                };
-                cur = &mut entries[pos].1;
+                } else {
+                    return;
+                }
             }
             (JsonVal::Array(items), PathStep::Index(idx)) => {
-                let Some(elem) = items.get_mut(*idx) else {
+                if *idx < items.len() {
+                    cur = &mut items[*idx];
+                } else if *idx == items.len() && mode != MutMode::Replace {
+                    if let Some(created) = build_created_container(&steps[i + 1..], new_val) {
+                        items.push(created);
+                    }
                     return;
-                };
-                cur = elem;
+                } else {
+                    return;
+                }
+            }
+            (JsonVal::Array(items), PathStep::FromEnd(None))
+            | (JsonVal::Array(items), PathStep::FromEnd(Some(0))) => {
+                if mode != MutMode::Replace {
+                    if let Some(created) = build_created_container(&steps[i + 1..], new_val) {
+                        items.push(created);
+                    }
+                }
+                return;
             }
             (JsonVal::Array(items), PathStep::FromEnd(Some(n))) => {
-                if *n == 0 || *n > items.len() {
+                if *n > items.len() {
                     return;
                 }
                 let len = items.len();
@@ -996,15 +1481,18 @@ fn mutate_path(root: &mut JsonVal, steps: &[PathStep], new_val: JsonVal, mode: M
         (JsonVal::Array(items), PathStep::Index(idx)) => {
             if *idx < items.len() && mode != MutMode::Insert {
                 items[*idx] = new_val;
+            } else if *idx == items.len() && mode != MutMode::Replace {
+                items.push(new_val);
             }
         }
-        (JsonVal::Array(items), PathStep::FromEnd(None)) => {
+        (JsonVal::Array(items), PathStep::FromEnd(None))
+        | (JsonVal::Array(items), PathStep::FromEnd(Some(0))) => {
             if mode != MutMode::Replace {
                 items.push(new_val);
             }
         }
         (JsonVal::Array(items), PathStep::FromEnd(Some(n))) => {
-            if *n > 0 && *n <= items.len() && mode != MutMode::Insert {
+            if *n <= items.len() && mode != MutMode::Insert {
                 let idx = items.len() - *n;
                 items[idx] = new_val;
             }
@@ -1044,7 +1532,9 @@ fn remove_path(root: &mut JsonVal, steps: &[PathStep]) {
     }
     match (cur, steps.last().unwrap()) {
         (JsonVal::Object(entries), PathStep::Key(k)) => {
-            entries.retain(|(ek, _)| ek != k);
+            if let Some(pos) = entries.iter().position(|(ek, _)| ek == k) {
+                entries.remove(pos);
+            }
         }
         (JsonVal::Array(items), PathStep::Index(idx)) => {
             if *idx < items.len() {
@@ -1078,16 +1568,59 @@ fn merge_patch(
         JsonVal::Object(entries) => entries,
         _ => Vec::new(),
     };
-    for (k, v) in patch_entries {
-        ctx.charge_steps(1)?;
-        if matches!(v, JsonVal::Null) {
-            base.retain(|(bk, _)| bk != &k);
-        } else if let Some(pos) = base.iter().position(|(bk, _)| bk == &k) {
-            let old = std::mem::replace(&mut base[pos].1, JsonVal::Null);
-            base[pos].1 = merge_patch(old, v, depth + 1, ctx)?;
-        } else {
-            let cleaned = merge_patch(JsonVal::Object(Vec::new()), v, depth + 1, ctx)?;
-            base.push((k, cleaned));
+    if base.len().saturating_mul(patch_entries.len()) > 256 {
+        let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+        mem.reserve((base.len() as u64).saturating_mul(48))?;
+        let mut slots: Vec<Option<(String, JsonVal)>> = base.into_iter().map(Some).collect();
+        let mut key_positions: std::collections::HashMap<String, std::collections::VecDeque<usize>> =
+            std::collections::HashMap::with_capacity(slots.len());
+        for (idx, entry) in slots.iter().enumerate() {
+            ctx.charge_steps(1)?;
+            if let Some((bk, _)) = entry {
+                key_positions.entry(bk.clone()).or_default().push_back(idx);
+            }
+        }
+        for (k, v) in patch_entries {
+            ctx.charge_steps(1)?;
+            if matches!(v, JsonVal::Null) {
+                if let Some(positions) = key_positions.get_mut(&k) {
+                    if let Some(pos) = positions.pop_front() {
+                        slots[pos] = None;
+                        if positions.is_empty() {
+                            key_positions.remove(&k);
+                        }
+                    }
+                }
+            } else if let Some(positions) = key_positions.get(&k) {
+                if let Some(&pos) = positions.front() {
+                    if let Some((_, ref mut slot_val)) = slots[pos] {
+                        let old = std::mem::replace(slot_val, JsonVal::Null);
+                        *slot_val = merge_patch(old, v, depth + 1, ctx)?;
+                    }
+                }
+            } else {
+                let cleaned = merge_patch(JsonVal::Object(Vec::new()), v, depth + 1, ctx)?;
+                let idx = slots.len();
+                mem.reserve((k.len() as u64).saturating_add(48))?;
+                key_positions.entry(k.clone()).or_default().push_back(idx);
+                slots.push(Some((k, cleaned)));
+            }
+        }
+        base = slots.into_iter().flatten().collect();
+    } else {
+        for (k, v) in patch_entries {
+            ctx.charge_steps(1)?;
+            if matches!(v, JsonVal::Null) {
+                if let Some(pos) = base.iter().position(|(bk, _)| bk == &k) {
+                    base.remove(pos);
+                }
+            } else if let Some(pos) = base.iter().position(|(bk, _)| bk == &k) {
+                let old = std::mem::replace(&mut base[pos].1, JsonVal::Null);
+                base[pos].1 = merge_patch(old, v, depth + 1, ctx)?;
+            } else {
+                let cleaned = merge_patch(JsonVal::Object(Vec::new()), v, depth + 1, ctx)?;
+                base.push((k, cleaned));
+            }
         }
     }
     Ok(JsonVal::Object(base))
@@ -1139,8 +1672,7 @@ pub fn eval_json_arrow_metered(
     let Some(path_str) = arrow_rhs_to_path(rhs) else {
         return Ok(SqlValue::Null);
     };
-    let steps = parse_json_path(&path_str)?;
-    let Some(found) = lookup_path(&doc, &steps) else {
+    let Some(found) = lookup_json_path_str(&doc, &path_str, ctx)? else {
         return Ok(SqlValue::Null);
     };
     if extract_text {
@@ -1184,7 +1716,13 @@ pub fn call_json_scalar(
                 if args[1].is_null() {
                     return Ok(Some((SqlValue::Null, false)));
                 }
-                int_value(&args[1])
+                let f = int_value(&args[1]);
+                if !(1..=15).contains(&f) {
+                    return Err(SqlError::runtime(
+                        "FLAGS parameter to json_valid() must be between 1 and 15",
+                    ));
+                }
+                f
             } else {
                 1
             };
@@ -1199,9 +1737,9 @@ pub fn call_json_scalar(
                     }
                     let ok = if let Ok(s) = std::str::from_utf8(&b) {
                         if (flags & 2) != 0 {
-                            parse_json_with_pos(s, true).is_ok()
+                            parse_json_with_pos_metered(s, true, ctx)?.is_ok()
                         } else if (flags & 1) != 0 {
-                            parse_json_with_pos(s, false).is_ok()
+                            parse_json_with_pos_metered(s, false, ctx)?.is_ok()
                         } else {
                             false
                         }
@@ -1222,11 +1760,33 @@ pub fn call_json_scalar(
             let v = match text_bytes_of(&args[0]) {
                 None => SqlValue::Null,
                 Some(b) => match std::str::from_utf8(&b) {
-                    Ok(s) => match parse_json_with_pos(s, true) {
+                    Ok(s) => match parse_json_with_pos_metered(s, true, ctx)? {
                         Ok(_) => SqlValue::Int(0),
-                        Err(pos) => SqlValue::Int(pos as i64),
+                        Err(byte_pos_1based) => {
+                            let byte_idx = byte_pos_1based.saturating_sub(1).min(s.len());
+                            let mut boundary = byte_idx;
+                            while boundary > 0 && !s.is_char_boundary(boundary) {
+                                boundary -= 1;
+                            }
+                            let char_pos = s[..boundary].chars().count() + 1;
+                            SqlValue::Int(char_pos as i64)
+                        }
                     },
-                    Err(_) => SqlValue::Int(1),
+                    Err(e) => {
+                        let valid_prefix = std::str::from_utf8(&b[..e.valid_up_to()])
+                            .expect("valid UTF-8 prefix up to valid_up_to");
+                        match parse_json_with_pos_metered(valid_prefix, true, ctx)? {
+                            Err(byte_pos_1based) if byte_pos_1based <= valid_prefix.len() => {
+                                let byte_idx = byte_pos_1based.saturating_sub(1);
+                                let mut boundary = byte_idx;
+                                while boundary > 0 && !valid_prefix.is_char_boundary(boundary) {
+                                    boundary -= 1;
+                                }
+                                SqlValue::Int((valid_prefix[..boundary].chars().count() + 1) as i64)
+                            }
+                            _ => SqlValue::Int((valid_prefix.chars().count() + 1) as i64),
+                        }
+                    }
                 },
             };
             (v, false)
@@ -1241,13 +1801,13 @@ pub fn call_json_scalar(
                 return Ok(Some((SqlValue::Null, false)));
             };
             let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let doc = parse_json(s, true)?;
+            let doc = parse_json_metered(s, true, ctx)?;
             let target = if args.len() == 2 {
                 let Some(pb) = text_bytes_of(&args[1]) else {
                     return Ok(Some((SqlValue::Null, false)));
                 };
                 let ps = String::from_utf8_lossy(&pb);
-                let steps = parse_json_path(&ps)?;
+                let steps = parse_json_path(&ps, ctx)?;
                 lookup_path(&doc, &steps)
             } else {
                 Some(&doc)
@@ -1268,13 +1828,13 @@ pub fn call_json_scalar(
                 return Ok(Some((SqlValue::Null, false)));
             };
             let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let doc = parse_json(s, true)?;
+            let doc = parse_json_metered(s, true, ctx)?;
             let target = if args.len() == 2 {
                 let Some(pb) = text_bytes_of(&args[1]) else {
                     return Ok(Some((SqlValue::Null, false)));
                 };
                 let ps = String::from_utf8_lossy(&pb);
-                let steps = parse_json_path(&ps)?;
+                let steps = parse_json_path(&ps, ctx)?;
                 lookup_path(&doc, &steps)
             } else {
                 Some(&doc)
@@ -1302,35 +1862,36 @@ pub fn call_json_scalar(
                     return Ok(Some((SqlValue::Null, false)));
                 };
                 let ps = String::from_utf8_lossy(&pb);
-                let steps = parse_json_path(&ps)?;
-                if let Some(node) = lookup_path(&doc, &steps) {
+                if let Some(node) = lookup_json_path_str(&doc, &ps, ctx)? {
                     let is_j = matches!(node, JsonVal::Array(_) | JsonVal::Object(_));
                     (render_json_extracted_metered(node, ctx)?, is_j)
                 } else {
                     (SqlValue::Null, false)
                 }
             } else {
-                let mut arr = Vec::with_capacity(args.len() - 1);
+                static NULL_JSON: JsonVal = JsonVal::Null;
+                let mut refs: Vec<&JsonVal> = Vec::with_capacity(args.len() - 1);
                 for arg in &args[1..] {
                     let Some(pb) = text_bytes_of(arg) else {
-                        arr.push(JsonVal::Null);
-                        continue;
+                        return Ok(Some((SqlValue::Null, false)));
                     };
                     let ps = String::from_utf8_lossy(&pb);
-                    let steps = parse_json_path(&ps)?;
-                    arr.push(
-                        lookup_path(&doc, &steps)
-                            .cloned()
-                            .unwrap_or(JsonVal::Null),
-                    );
+                    refs.push(lookup_json_path_str(&doc, &ps, ctx)?.unwrap_or(&NULL_JSON));
                 }
-                (render_json_value_metered(&JsonVal::Array(arr), ctx)?, true)
+                (render_json_array_iter_metered(refs.into_iter(), ctx)?, true)
             }
         }
         "json_array" => {
+            let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+            mem.reserve((args.len() as u64).saturating_mul(32))?;
             let mut items = Vec::with_capacity(args.len());
             for (idx, arg) in args.iter().enumerate() {
-                items.push(json_value_from_sql(arg, ctx.arg_is_json(idx))?);
+                items.push(json_value_from_sql_guarded(
+                    arg,
+                    ctx.arg_is_json(idx),
+                    ctx,
+                    &mut mem,
+                )?);
             }
             (render_json_value_metered(&JsonVal::Array(items), ctx)?, true)
         }
@@ -1340,14 +1901,22 @@ pub fn call_json_scalar(
                     "json_object() requires an even number of arguments",
                 ));
             }
+            let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+            mem.reserve(((args.len() / 2) as u64).saturating_mul(48))?;
             let mut entries = Vec::with_capacity(args.len() / 2);
             let mut i = 0;
             while i < args.len() {
                 let SqlValue::Text(ref kb) = args[i] else {
                     return Err(SqlError::runtime("json_object() labels must be TEXT"));
                 };
+                mem.reserve((kb.len() as u64).saturating_add(24))?;
                 let key = String::from_utf8_lossy(kb).into_owned();
-                let val = json_value_from_sql(&args[i + 1], ctx.arg_is_json(i + 1))?;
+                let val = json_value_from_sql_guarded(
+                    &args[i + 1],
+                    ctx.arg_is_json(i + 1),
+                    ctx,
+                    &mut mem,
+                )?;
                 entries.push((key, val));
                 i += 2;
             }
@@ -1362,7 +1931,7 @@ pub fn call_json_scalar(
                     "wrong number of arguments to function json_quote()",
                 ));
             }
-            let jv = json_value_from_sql(&args[0], ctx.arg_is_json(0))?;
+            let jv = json_value_from_sql_metered(&args[0], ctx.arg_is_json(0), ctx)?;
             (render_json_value_metered(&jv, ctx)?, true)
         }
         "json_insert" | "json_replace" | "json_set" => {
@@ -1376,6 +1945,8 @@ pub fn call_json_scalar(
             };
             let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
             let mut doc = parse_json_metered(s, true, ctx)?;
+            let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+            mem.reserve(s.len() as u64)?;
             let mode = match lower_name {
                 "json_insert" => MutMode::Insert,
                 "json_replace" => MutMode::Replace,
@@ -1385,8 +1956,13 @@ pub fn call_json_scalar(
             while i + 1 < args.len() {
                 if let Some(pb) = text_bytes_of(&args[i]) {
                     let ps = String::from_utf8_lossy(&pb);
-                    let steps = parse_json_path(&ps)?;
-                    let val = json_value_from_sql(&args[i + 1], ctx.arg_is_json(i + 1))?;
+                    let steps = parse_json_path(&ps, ctx)?;
+                    let val = json_value_from_sql_guarded(
+                        &args[i + 1],
+                        ctx.arg_is_json(i + 1),
+                        ctx,
+                        &mut mem,
+                    )?;
                     mutate_path(&mut doc, &steps, val, mode);
                 }
                 i += 2;
@@ -1410,7 +1986,7 @@ pub fn call_json_scalar(
                     return Ok(Some((SqlValue::Null, false)));
                 };
                 let ps = String::from_utf8_lossy(&pb);
-                let steps = parse_json_path(&ps)?;
+                let steps = parse_json_path(&ps, ctx)?;
                 if steps.is_empty() {
                     removed_root = true;
                 } else if !removed_root {
@@ -1537,7 +2113,7 @@ fn eval_json_tvf(
             });
         };
         let ps = String::from_utf8_lossy(&pb).into_owned();
-        let steps = parse_json_path(&ps)?;
+        let steps = parse_json_path(&ps, ctx)?;
         let Some(node) = lookup_path(&doc, &steps) else {
             return Ok(TableValuedResult {
                 columns,

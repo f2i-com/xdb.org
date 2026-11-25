@@ -16,7 +16,7 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 cd "$here"
 
 TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.92.0}"
-VERSION="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+VERSION="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '\r')"
 
 echo "=== Building xdb-wasm v$VERSION (toolchain $TOOLCHAIN)"
 RUSTFLAGS="-Dwarnings" cargo +"$TOOLCHAIN" build --locked --release --target wasm32-unknown-unknown

@@ -95,21 +95,23 @@ pub fn atof(bytes: &[u8]) -> AtoFResult {
         m_state = 1;
         s = u64::from(c - b'0');
         i += 1;
-        c = byte_at(i);
-        while is_sql_digit(c) {
-            s = s * 10 + u64::from(c - b'0');
+        while i < len {
+            let dig = bytes[i].wrapping_sub(b'0');
+            if dig > 9 {
+                break;
+            }
+            s = s * 10 + u64::from(dig);
             i += 1;
-            c = byte_at(i);
             if s >= LIMIT_U64_DIV10 {
                 m_state = 9;
-                while is_sql_digit(c) {
+                while i < len && bytes[i].wrapping_sub(b'0') <= 9 {
                     i += 1;
-                    c = byte_at(i);
                     d += 1;
                 }
                 break;
             }
         }
+        c = byte_at(i);
     }
 
     // Decimal point.
@@ -258,7 +260,18 @@ pub fn atoi64(bytes: &[u8]) -> Atoi64Result {
         i += 1;
     }
     let z_num = i;
-    while i < len && is_sql_digit(bytes[i]) {
+    // Single-pass accumulation for the common <= 18-digit case (avoids scanning digits twice).
+    let mut u: u64 = 0;
+    let fast_end = len.min(z_num + 18);
+    while i < fast_end {
+        let dig = bytes[i].wrapping_sub(b'0');
+        if dig > 9 {
+            break;
+        }
+        u = u * 10 + u64::from(dig);
+        i += 1;
+    }
+    while i < len && bytes[i].wrapping_sub(b'0') <= 9 {
         i += 1;
     }
     let n_digit = i - z_num;
@@ -276,10 +289,6 @@ pub fn atoi64(bytes: &[u8]) -> Atoi64Result {
     }
 
     if n_digit < 19 {
-        let mut u: u64 = 0;
-        for &b in &bytes[z_num..i] {
-            u = u * 10 + u64::from(b - b'0');
-        }
         let value = if neg {
             (u as i64).wrapping_neg()
         } else {
@@ -329,7 +338,7 @@ fn is_dec_or_hex_span_char(b: u8) -> bool {
 pub fn dec_or_hex_to_i64(bytes: &[u8]) -> Atoi64Result {
     let len = bytes.len();
     let at = |k: usize| -> u8 { if k < len { bytes[k] } else { 0 } };
-    if at(0) == b'0' && (at(1) == b'x' || at(1) == b'X') {
+    if at(0) == b'0' && (at(1) == b'x' || at(1) == b'X') && is_sql_xdigit(at(2)) {
         let mut i = 2usize;
         while at(i) == b'0' {
             i += 1;

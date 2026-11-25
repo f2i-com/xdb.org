@@ -43,28 +43,39 @@ const CC_ID: u8 = 27;
 const CC_NUL: u8 = 29;
 const CC_BOM: u8 = 30;
 
-// aiClass[] for 0x00..=0x7f (tokenize.c:60, SQLITE_ASCII).
-#[rustfmt::skip]
-const AI_CLASS: [u8; 128] = [
-    29, 28, 28, 28, 28, 28, 28, 28, 28,  7,  7, 28,  7,  7, 28, 28,
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-     7, 15,  8,  5,  4, 22, 24,  8, 17, 18, 21, 20, 23, 11, 26, 16,
-     3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  5, 19, 12, 14, 13,  6,
-     5,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
-     1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2,  9, 28, 28, 28,  2,
-     8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
-     1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 28, 10, 28, 25, 28,
-];
+// Branchless 256-entry aiClass[] (tokenize.c:60, SQLITE_ASCII):
+// 0x00..=0x7f as SQLite ASCII classes, 0xEF -> CC_BOM, all other >= 0x80 -> CC_ID.
+const AI_CLASS: [u8; 256] = {
+    #[rustfmt::skip]
+    const LO: [u8; 128] = [
+        29, 28, 28, 28, 28, 28, 28, 28, 28,  7,  7, 28,  7,  7, 28, 28,
+        28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+         7, 15,  8,  5,  4, 22, 24,  8, 17, 18, 21, 20, 23, 11, 26, 16,
+         3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  5, 19, 12, 14, 13,  6,
+         5,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+         1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2,  9, 28, 28, 28,  2,
+         8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+         1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 28, 10, 28, 25, 28,
+    ];
+    let mut t = [CC_ID; 256];
+    let mut i = 0;
+    while i < 128 {
+        t[i] = LO[i];
+        i += 1;
+    }
+    t[0xef] = CC_BOM;
+    t
+};
 
-// sqlite3CtypeMap bits (global.c:118) for 0x00..=0x7f:
-// 0x01 space, 0x02 alpha, 0x04 digit, 0x08 xdigit, 0x20 lower, 0x40 '$'/'_', 0x80 quote.
+// Branchless 256-entry sqlite3CtypeMap bits (global.c:118):
+// 0x01 space, 0x02 alpha/non-ASCII-id, 0x04 digit, 0x08 xdigit, 0x20 lower, 0x40 '$'/'_', 0x80 quote.
 const CT_SPACE: u8 = 0x01;
 const CT_DIGIT: u8 = 0x04;
 const CT_XDIGIT: u8 = 0x08;
 const CT_QUOTE: u8 = 0x80;
 
-const CTYPE: [u8; 128] = {
-    let mut t = [0u8; 128];
+const CTYPE: [u8; 256] = {
+    let mut t = [0u8; 256];
     t[0x09] = CT_SPACE;
     t[0x0a] = CT_SPACE;
     t[0x0b] = CT_SPACE;
@@ -92,46 +103,46 @@ const CTYPE: [u8; 128] = {
     t[0x27] = CT_QUOTE; // '
     t[0x5b] = CT_QUOTE; // [
     t[0x60] = CT_QUOTE; // `
+    // Bytes >= 0x80 are IdChar (0x02 bit set -> `(CTYPE[c] & 0x46) != 0`, not space/digit/xdigit/quote).
+    let mut c = 0x80;
+    while c < 256 {
+        t[c] = 0x02;
+        c += 1;
+    }
     t
 };
 
 /// `sqlite3Isspace` on a byte (`false` for `>= 0x80`).
 #[inline]
 pub const fn is_sql_space(c: u8) -> bool {
-    c < 0x80 && (CTYPE[c as usize] & CT_SPACE) != 0
+    (CTYPE[c as usize] & CT_SPACE) != 0
 }
 
 #[inline]
 const fn is_digit(c: u8) -> bool {
-    c < 0x80 && (CTYPE[c as usize] & CT_DIGIT) != 0
+    (CTYPE[c as usize] & CT_DIGIT) != 0
 }
 
 #[inline]
 const fn is_xdigit(c: u8) -> bool {
-    c < 0x80 && (CTYPE[c as usize] & CT_XDIGIT) != 0
+    (CTYPE[c as usize] & CT_XDIGIT) != 0
 }
 
 /// `sqlite3Isquote`: one of `"`, `'`, `[`, `` ` ``.
 #[inline]
 pub const fn is_quote_char(c: u8) -> bool {
-    c < 0x80 && (CTYPE[c as usize] & CT_QUOTE) != 0
+    (CTYPE[c as usize] & CT_QUOTE) != 0
 }
 
 /// `IdChar` (`tokenize.c:168`): letters, digits, `_`, `$`, and every byte `>= 0x80`.
 #[inline]
 pub const fn is_id_char(c: u8) -> bool {
-    c >= 0x80 || (CTYPE[c as usize] & 0x46) != 0
+    (CTYPE[c as usize] & 0x46) != 0
 }
 
 #[inline]
 const fn char_class(c: u8) -> u8 {
-    if c < 0x80 {
-        AI_CLASS[c as usize]
-    } else if c == 0xef {
-        CC_BOM
-    } else {
-        CC_ID
-    }
+    AI_CLASS[c as usize]
 }
 
 /// True if `bytes[i..i+5]` is ASCII case-insensitively `"ilike"`.
@@ -175,6 +186,8 @@ pub struct Scanner<'a> {
     pub dialect: Dialect,
     pub kind: u16,
     pub end: usize,
+    /// Set by `scan()` when a `tk::STRING` token contained doubled `''` escapes.
+    pub(crate) has_doubled_quote: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -186,6 +199,21 @@ impl<'a> Scanner<'a> {
             dialect,
             kind: tk::EOF,
             end: 0,
+            has_doubled_quote: false,
+        }
+    }
+
+    /// Create a scanner that stops lazily at the first NUL byte during scanning rather than
+    /// pre-scanning the entire input upfront (`O(1)` construction for multi-statement scripts).
+    #[inline]
+    pub(crate) fn new_lazy(sql: &'a str, dialect: Dialect) -> Self {
+        Self {
+            bytes: sql.as_bytes(),
+            limit: sql.len(),
+            dialect,
+            kind: tk::EOF,
+            end: 0,
+            has_doubled_quote: false,
         }
     }
 
@@ -212,6 +240,10 @@ impl<'a> Scanner<'a> {
             return;
         }
         let c0 = self.bytes[i];
+        if c0 == 0 {
+            self.set(tk::EOF, i);
+            return;
+        }
         let mut j: usize;
         match char_class(c0) {
             CC_SPACE => {
@@ -226,7 +258,7 @@ impl<'a> Scanner<'a> {
                 let c1 = self.c(i + 1);
                 if c1 == b'-' {
                     j = i + 2;
-                    while j < n && self.bytes[j] != b'\n' {
+                    while j < n && self.bytes[j] != b'\n' && self.bytes[j] != 0 {
                         j += 1;
                     }
                     self.set(tk::COMMENT, j);
@@ -344,11 +376,16 @@ impl<'a> Scanner<'a> {
             CC_QUOTE => {
                 let delim = c0;
                 let mut c = 0u8;
+                let mut doubled = false;
                 j = i + 1;
                 while j < n {
                     c = self.bytes[j];
+                    if c == 0 {
+                        break;
+                    }
                     if c == delim {
                         if self.c(j + 1) == delim {
+                            doubled = true;
                             j += 2;
                             continue;
                         } else {
@@ -360,6 +397,7 @@ impl<'a> Scanner<'a> {
                 if j >= n {
                     c = 0;
                 }
+                self.has_doubled_quote = doubled;
                 if c == b'\'' {
                     self.set(tk::STRING, j + 1);
                 } else if c != 0 {
@@ -429,7 +467,7 @@ impl<'a> Scanner<'a> {
                             }
                         }
                         break;
-                    } else if c == b':' && self.c(j + 1) == b':' {
+                    } else if self.dialect != Dialect::Xdb && c == b':' && self.c(j + 1) == b':' {
                         j += 2;
                     } else {
                         break;
@@ -450,17 +488,18 @@ impl<'a> Scanner<'a> {
                 return;
             }
             CC_KYWD0 => {
-                if char_class(self.c(i + 1)) > CC_KYWD {
+                let bytes = self.bytes;
+                if i + 1 >= n || char_class(bytes[i + 1]) > CC_KYWD {
                     j = i + 1;
                 } else {
                     j = i + 2;
-                    while char_class(self.c(j)) <= CC_KYWD {
+                    while j < n && char_class(bytes[j]) <= CC_KYWD {
                         j += 1;
                     }
-                    if is_id_char(self.c(j)) {
+                    if j < n && is_id_char(bytes[j]) {
                         j += 1;
                     } else {
-                        self.set(keyword_code(&self.bytes[i..j]), j);
+                        self.set(keyword_code(&bytes[i..j]), j);
                         return;
                     }
                 }
@@ -517,13 +556,18 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_number(&mut self, i: usize) {
+        let bytes = self.bytes;
+        let n = self.limit;
         let mut kind = tk::INTEGER;
         let mut j: usize;
-        let c1 = self.c(i + 1);
-        if self.bytes[i] == b'0' && (c1 == b'x' || c1 == b'X') && is_xdigit(self.c(i + 2)) {
+        if bytes[i] == b'0'
+            && i + 2 < n
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+            && is_xdigit(bytes[i + 2])
+        {
             j = i + 3;
-            loop {
-                let c = self.c(j);
+            while j < n {
+                let c = bytes[j];
                 if !is_xdigit(c) {
                     if c == b'_' {
                         kind = tk::QNUMBER;
@@ -535,9 +579,9 @@ impl<'a> Scanner<'a> {
             }
         } else {
             j = i;
-            loop {
-                let c = self.c(j);
-                if !is_digit(c) {
+            while j < n {
+                let c = bytes[j];
+                if !c.is_ascii_digit() {
                     if c == b'_' {
                         kind = tk::QNUMBER;
                     } else {
@@ -546,14 +590,19 @@ impl<'a> Scanner<'a> {
                 }
                 j += 1;
             }
-            if self.c(j) == b'.' {
+            // Fast exit for plain integers terminated by `,`, `)`, `' '`, `;`, `+`, `-`, `*`, etc.
+            if j == n || (bytes[j] < b'.' && bytes[j] != b'$') {
+                self.set(kind, j);
+                return;
+            }
+            if bytes[j] == b'.' {
                 if kind == tk::INTEGER {
                     kind = tk::FLOAT;
                 }
                 j += 1;
-                loop {
-                    let c = self.c(j);
-                    if !is_digit(c) {
+                while j < n {
+                    let c = bytes[j];
+                    if !c.is_ascii_digit() {
                         if c == b'_' {
                             kind = tk::QNUMBER;
                         } else {
@@ -563,19 +612,20 @@ impl<'a> Scanner<'a> {
                     j += 1;
                 }
             }
-            let ce = self.c(j);
-            if (ce == b'e' || ce == b'E')
-                && (is_digit(self.c(j + 1))
-                    || ((self.c(j + 1) == b'+' || self.c(j + 1) == b'-')
-                        && is_digit(self.c(j + 2))))
+            if j + 1 < n
+                && (bytes[j] == b'e' || bytes[j] == b'E')
+                && (bytes[j + 1].is_ascii_digit()
+                    || ((bytes[j + 1] == b'+' || bytes[j + 1] == b'-')
+                        && j + 2 < n
+                        && bytes[j + 2].is_ascii_digit()))
             {
                 if kind == tk::INTEGER {
                     kind = tk::FLOAT;
                 }
                 j += 2;
-                loop {
-                    let c = self.c(j);
-                    if !is_digit(c) {
+                while j < n {
+                    let c = bytes[j];
+                    if !c.is_ascii_digit() {
                         if c == b'_' {
                             kind = tk::QNUMBER;
                         } else {
@@ -586,7 +636,7 @@ impl<'a> Scanner<'a> {
                 }
             }
         }
-        while is_id_char(self.c(j)) {
+        while j < n && is_id_char(bytes[j]) {
             kind = tk::ILLEGAL;
             j += 1;
         }
@@ -596,8 +646,8 @@ impl<'a> Scanner<'a> {
 
 /// Every raw token of `sql`, including `SPACE` and `COMMENT` tokens.
 pub fn raw_tokens(sql: &str, dialect: Dialect) -> Vec<Token> {
-    let mut s = Scanner::new(sql, dialect);
-    let mut out = Vec::new();
+    let mut s = Scanner::new_lazy(sql, dialect);
+    let mut out = Vec::with_capacity(sql.len() / 5 + 4);
     let mut i = 0;
     loop {
         s.scan(i);
@@ -617,11 +667,19 @@ pub fn raw_tokens(sql: &str, dialect: Dialect) -> Vec<Token> {
     out
 }
 
-fn analyze_next(s: &mut Scanner<'_>, mut i: usize) -> (u16, usize) {
+fn analyze_next_metered(
+    s: &mut Scanner<'_>,
+    mut i: usize,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> Result<(u16, usize), xdb_core::ResourceLimitError> {
     loop {
         s.scan(i);
         if s.kind != tk::SPACE && s.kind != tk::COMMENT {
             break;
+        }
+        if let Some(m) = meter {
+            let steps = ((s.end.saturating_sub(i)) as u64 / 64).max(1);
+            m.charge_steps(steps)?;
         }
         i = s.end;
     }
@@ -635,7 +693,7 @@ fn analyze_next(s: &mut Scanner<'_>, mut i: usize) -> (u16, usize) {
     {
         t = tk::ID;
     }
-    (t, s.end)
+    Ok((t, s.end))
 }
 
 /// `analyzeWindowKeyword` / `analyzeOverKeyword` / `analyzeFilterKeyword`
@@ -646,51 +704,75 @@ pub fn classify_context_keyword(
     end: usize,
     last_token: Option<u16>,
 ) -> u16 {
+    classify_context_keyword_metered(s, kind, end, last_token, None).expect("unmetered")
+}
+
+pub(crate) fn classify_context_keyword_metered(
+    s: &mut Scanner<'_>,
+    kind: u16,
+    end: usize,
+    last_token: Option<u16>,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> Result<u16, xdb_core::ResourceLimitError> {
     if kind == tk::WINDOW {
-        let (a_type, a_end) = analyze_next(s, end);
+        let (a_type, a_end) = analyze_next_metered(s, end, meter)?;
         if a_type != tk::ID {
-            return tk::ID;
+            return Ok(tk::ID);
         }
-        let (b_type, _) = analyze_next(s, a_end);
-        return if b_type == tk::AS { tk::WINDOW } else { tk::ID };
+        let (b_type, _) = analyze_next_metered(s, a_end, meter)?;
+        return Ok(if b_type == tk::AS { tk::WINDOW } else { tk::ID });
     }
     if kind == tk::OVER {
         if last_token == Some(tk::RP) {
-            let (a_type, _) = analyze_next(s, end);
+            let (a_type, _) = analyze_next_metered(s, end, meter)?;
             if a_type == tk::LP || a_type == tk::ID {
-                return tk::OVER;
+                return Ok(tk::OVER);
             }
         }
-        return tk::ID;
+        return Ok(tk::ID);
     }
     if kind == tk::FILTER {
-        if last_token == Some(tk::RP) && analyze_next(s, end).0 == tk::LP {
-            return tk::FILTER;
+        if last_token == Some(tk::RP) && analyze_next_metered(s, end, meter)?.0 == tk::LP {
+            return Ok(tk::FILTER);
         }
-        return tk::ID;
+        return Ok(tk::ID);
     }
-    kind
+    Ok(kind)
 }
 
 /// XDB dialect: whether the identifier `ILIKE` is the operator (`LIKE_KW`) or stays `ID`.
-pub fn classify_ilike(s: &mut Scanner<'_>, mut i: usize) -> u16 {
+pub fn classify_ilike(s: &mut Scanner<'_>, i: usize) -> u16 {
+    classify_ilike_metered(s, i, None).expect("unmetered")
+}
+
+pub(crate) fn classify_ilike_metered(
+    s: &mut Scanner<'_>,
+    mut i: usize,
+    meter: Option<&dyn xdb_core::Meter>,
+) -> Result<u16, xdb_core::ResourceLimitError> {
     loop {
         s.scan(i);
         if s.kind != tk::SPACE && s.kind != tk::COMMENT {
             break;
+        }
+        if let Some(m) = meter {
+            let steps = ((s.end.saturating_sub(i)) as u64 / 64).max(1);
+            m.charge_steps(steps)?;
         }
         i = s.end;
     }
     let t = s.kind;
     let end = s.end;
     if t == tk::WINDOW {
-        return if classify_context_keyword(s, tk::WINDOW, end, None) == tk::WINDOW {
-            tk::ID
-        } else {
-            tk::LIKE_KW
-        };
+        return Ok(
+            if classify_context_keyword_metered(s, tk::WINDOW, end, None, meter)? == tk::WINDOW {
+                tk::ID
+            } else {
+                tk::LIKE_KW
+            },
+        );
     }
-    match t {
+    Ok(match t {
         tk::ID
         | tk::STRING
         | tk::INDEXED
@@ -717,15 +799,15 @@ pub fn classify_ilike(s: &mut Scanner<'_>, mut i: usize) -> u16 {
                 tk::ID
             }
         }
-    }
+    })
 }
 
 /// Tokens `sqlite3RunParser` feeds to the parser (drops whitespace/comments and
 /// classifies `WINDOW`/`OVER`/`FILTER`).
 pub fn parser_tokens(sql: &str, dialect: Dialect) -> Vec<Token> {
-    let mut s = Scanner::new(sql, dialect);
-    let mut probe = Scanner::new(sql, dialect);
-    let mut out = Vec::new();
+    let mut s = Scanner::new_lazy(sql, dialect);
+    let mut probe = Scanner::new_lazy(sql, dialect);
+    let mut out = Vec::with_capacity(sql.len() / 6 + 4);
     let mut last: Option<u16> = None;
     let mut i = 0;
     loop {
@@ -772,7 +854,7 @@ pub fn split_statements(sql: &str) -> Vec<(usize, usize)> {
         [6, 6, 5, 5, 5, 5, 5, 7],
         [1, 7, 5, 5, 5, 5, 5, 5],
     ];
-    let mut s = Scanner::new(sql, Dialect::Sqlite);
+    let mut s = Scanner::new_lazy(sql, Dialect::Sqlite);
     let mut out = Vec::new();
     let mut state = 0usize;
     let mut stmt_start: Option<usize> = None;
@@ -808,7 +890,7 @@ pub fn split_statements(sql: &str) -> Vec<(usize, usize)> {
         i = s.end;
     }
     if let Some(start) = stmt_start {
-        out.push((start, s.limit));
+        out.push((start, i));
     }
     out
 }

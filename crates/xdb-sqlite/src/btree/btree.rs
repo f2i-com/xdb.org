@@ -112,12 +112,14 @@ impl Btree {
         }
 
         if let Some(ref meter) = options.meter {
-            meter.charge_page_reads(1)?;
+            if !meter.is_noop() {
+                meter.charge_page_reads(1)?;
+            }
         }
-        let page1 = source.read_page(1)?;
+        let page1 = source.read_page_shared(1)?;
         let info = validate_database_header(&page1, page_count, source_ps, options.file_page_count)?;
         let pager = Pager::new(source, info, cache_pages, options.meter);
-        pager.prime(1, page1)?;
+        pager.prime_shared(1, page1)?;
         Ok(Self { info, pager })
     }
 

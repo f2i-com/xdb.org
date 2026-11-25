@@ -4,8 +4,6 @@
 //! - [`fp10_convert2`] (`sqlite3Fp10Convert2`, `util.c:787`)
 //! - [`fp_decode`] (`sqlite3FpDecode`, `util.c:1392`)
 
-use std::sync::OnceLock;
-
 const BIT52: u64 = 1u64 << 52;
 const BIT55_MINUS_2: u64 = (1u64 << 55) - 2;
 
@@ -43,14 +41,12 @@ const A_SCALE_LO: [u32; 26] = [
 ];
 
 struct PowerTable {
-    hi: Box<[u64; N_POW]>,
-    lo: Box<[u32; N_POW]>,
+    hi: [u64; N_POW],
+    lo: [u32; N_POW],
 }
 
-static POWERS: OnceLock<PowerTable> = OnceLock::new();
-
-fn compute_power_of_ten(p: i32) -> (u64, u32) {
-    let (mut g, mut n) = if p < 0 {
+const fn compute_power_of_ten(p: i32) -> (u64, u32) {
+    let (g, n) = if p < 0 {
         if p == -1 {
             return (A_SCALE[13], A_SCALE_LO[13]);
         }
@@ -71,31 +67,36 @@ fn compute_power_of_ten(p: i32) -> (u64, u32) {
     if n == 0 {
         return (s, s_lo);
     }
-    let _ = &mut g;
-    let _ = &mut n;
     let b = A_BASE[n as usize];
     let r = (s as u128) * (b as u128) + (((s_lo as u128) * (b as u128)) >> 32);
     let mut lo = ((r >> 32) & 0xffff_ffff) as u32;
     let mut x = (r >> 64) as u64;
     if (x & (1u64 << 63)) == 0 {
-        x = (x << 1) | u64::from((lo >> 31) & 1);
+        x = (x << 1) | (((lo >> 31) & 1) as u64);
         lo = lo.wrapping_shl(1) | 1;
     }
     (x, lo)
 }
 
+const fn build_power_table() -> PowerTable {
+    let mut hi = [0u64; N_POW];
+    let mut lo = [0u32; N_POW];
+    let mut i = 0usize;
+    while i < N_POW {
+        let p = POWERSOF10_FIRST + (i as i32);
+        let (h, l) = compute_power_of_ten(p);
+        hi[i] = h;
+        lo[i] = l;
+        i += 1;
+    }
+    PowerTable { hi, lo }
+}
+
+static POWERS: PowerTable = build_power_table();
+
+#[inline(always)]
 fn power_table() -> &'static PowerTable {
-    POWERS.get_or_init(|| {
-        let mut hi = Box::new([0u64; N_POW]);
-        let mut lo = Box::new([0u32; N_POW]);
-        for p in POWERSOF10_FIRST..=POWERSOF10_LAST {
-            let (h, l) = compute_power_of_ten(p);
-            let idx = (p - POWERSOF10_FIRST) as usize;
-            hi[idx] = h;
-            lo[idx] = l;
-        }
-        PowerTable { hi, lo }
-    })
+    &POWERS
 }
 
 /// `floor(log2(10^p))`, approximately (`util.c:733`).
@@ -120,10 +121,12 @@ const EXACT_POW10: [f64; 23] = [
 /// for a `u64` `d > 0`.
 #[inline]
 pub fn fp10_convert2(d: u64, p: i32) -> f64 {
-    if d < (1u64 << 53) && (0..=22).contains(&p) {
-        let r = (d as f64) * EXACT_POW10[p as usize];
-        if r < 9007199254740992.0 {
-            return r;
+    if d < (1u64 << 53) {
+        if (0..=22).contains(&p) {
+            return (d as f64) * EXACT_POW10[p as usize];
+        }
+        if (-22..0).contains(&p) {
+            return (d as f64) / EXACT_POW10[(-p) as usize];
         }
     }
     fp10_convert2_full(d, p)
@@ -218,17 +221,48 @@ pub struct FpDecoded {
     pub i_dp: i32,
 }
 
+/// Zero-allocation stack-backed decoded floating-point digits used by internal formatters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FpDecodedStack {
+    pub sign: char,
+    pub special: FpSpecial,
+    pub digits: [u8; 24],
+    pub len: u8,
+    pub i_dp: i32,
+}
+
+impl FpDecodedStack {
+    #[inline]
+    pub(crate) fn digits_str(&self) -> &str {
+        std::str::from_utf8(&self.digits[..usize::from(self.len)]).expect("ASCII digits")
+    }
+}
+
 /// `sqlite3FpDecode` (`util.c:1392`): decode `r` into rounded decimal digits.
-pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
+pub fn fp_decode(r: f64, i_round: i32, mx_round: i32) -> FpDecoded {
+    let s = fp_decode_stack(r, i_round, mx_round);
+    FpDecoded {
+        sign: s.sign,
+        special: s.special,
+        digits: s.digits_str().to_string(),
+        i_dp: s.i_dp,
+    }
+}
+
+/// Allocation-free `sqlite3FpDecode` writing digits into a 24-byte stack buffer.
+pub(crate) fn fp_decode_stack(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecodedStack {
     let mx_round = mx_round.max(1);
     let sign = if r < 0.0 {
         r = -r;
         '-'
     } else if r == 0.0 {
-        return FpDecoded {
+        let mut digits = [0u8; 24];
+        digits[0] = b'0';
+        return FpDecodedStack {
             sign: '+',
             special: FpSpecial::Finite,
-            digits: "0".to_string(),
+            digits,
+            len: 1,
             i_dp: 1,
         };
     } else {
@@ -243,10 +277,11 @@ pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
         } else {
             FpSpecial::Inf
         };
-        return FpDecoded {
+        return FpDecodedStack {
             sign,
             special,
-            digits: String::new(),
+            digits: [0u8; 24],
+            len: 0,
             i_dp: 0,
         };
     }
@@ -268,26 +303,38 @@ pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
     };
     let (dv, exp) = fp2_convert10(v, e, n_digits);
 
-    // Format dv into a small stack buffer with 2 leading spare slots (for prepended '0' and rounding carry).
-    let mut tmp = [0u8; 24];
-    let mut len = 0usize;
+    // Format dv right-to-left using a 2-digit table directly into `buf` (leaving >= 2 leading spare slots).
+    const DEC_PAIRS: &[u8; 200] = b"\
+        0001020304050607080910111213141516171819\
+        2021222324252627282930313233343536373839\
+        4041424344454647484950515253545556575859\
+        6061626364656667686970717273747576777879\
+        8081828384858687888990919293949596979899";
+    let mut buf = [0u8; 26];
+    let mut z = buf.len();
     let mut rem = dv;
     if rem == 0 {
-        tmp[0] = b'0';
-        len = 1;
+        z -= 1;
+        buf[z] = b'0';
     } else {
-        while rem > 0 {
-            tmp[len] = b'0' + (rem % 10) as u8;
-            rem /= 10;
-            len += 1;
+        while rem >= 100 {
+            let d = ((rem % 100) as usize) * 2;
+            rem /= 100;
+            z -= 2;
+            buf[z] = DEC_PAIRS[d];
+            buf[z + 1] = DEC_PAIRS[d + 1];
         }
-        tmp[..len].reverse();
+        if rem >= 10 {
+            let d = (rem as usize) * 2;
+            z -= 2;
+            buf[z] = DEC_PAIRS[d];
+            buf[z + 1] = DEC_PAIRS[d + 1];
+        } else {
+            z -= 1;
+            buf[z] = b'0' + (rem as u8);
+        }
     }
-
-    let mut buf = [0u8; 26];
-    let mut z = 2usize;
-    let mut n = len;
-    buf[z..z + n].copy_from_slice(&tmp[..n]);
+    let mut n = buf.len() - z;
     let mut i_dp = (n as i32) + exp;
 
     if i_round <= 0 {
@@ -366,11 +413,13 @@ pub fn fp_decode(mut r: f64, mut i_round: i32, mx_round: i32) -> FpDecoded {
         n -= 1;
     }
 
-    let digits = String::from_utf8(buf[z..z + n].to_vec()).expect("ASCII digits");
-    FpDecoded {
+    let mut digits = [0u8; 24];
+    digits[..n].copy_from_slice(&buf[z..z + n]);
+    FpDecodedStack {
         sign,
         special: FpSpecial::Finite,
         digits,
+        len: n as u8,
         i_dp,
     }
 }

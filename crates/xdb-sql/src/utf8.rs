@@ -253,14 +253,18 @@ impl<'m> ByteAccum<'m> {
             let delta = target - self.charged;
             if let Some(m) = self.meter {
                 m.reserve_memory(delta as u64)?;
+                // Update `self.charged` immediately so `Drop` releases `delta` even if
+                // `charge_steps` below returns a resource-limit error.
+                self.charged = target;
                 self.step_pending = self.step_pending.saturating_add(delta);
                 if self.step_pending >= 256 {
                     let steps = (self.step_pending / 256) as u64;
                     self.step_pending %= 256;
                     m.charge_steps(steps)?;
                 }
+            } else {
+                self.charged = target;
             }
-            self.charged = target;
         }
         self.buf.reserve(extra);
         Ok(())
@@ -279,6 +283,16 @@ impl<'m> ByteAccum<'m> {
                 if extra >= 256 {
                     m.charge_steps((extra / 256) as u64)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn charge_steps(&self, steps: u64) -> SqlResult<()> {
+        if let Some(m) = self.meter {
+            if steps > 0 {
+                m.charge_steps(steps)?;
             }
         }
         Ok(())

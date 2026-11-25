@@ -1,11 +1,12 @@
 //! Collating sequences, ported from SQLite 3.54.1 `main.c`, `util.c`, `callback.c`, `vdbeaux.c`.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use super::utf::{encode_utf8_to_stored_text, sqlite_utf16_to_utf8, TextEncoding};
+use super::utf::{sqlite_utf16_to_utf8, TextEncoding};
 
 /// SQLite's three built-in collations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,20 +58,60 @@ pub fn compare_bytes_binary(a: &[u8], b: &[u8]) -> Ordering {
 /// that position, total byte lengths decide, so `"a\0x" == "A\0y"` under `NOCASE`).
 pub fn compare_bytes_nocase_utf8(a: &[u8], b: &[u8]) -> Ordering {
     let n = a.len().min(b.len());
-    for i in 0..n {
+    let mut i = 0usize;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    const BIT5: u64 = 0x2020_2020_2020_2020;
+    // Branchless SWAR 8-byte fast skip: advances 8 bytes per step across identical non-NUL
+    // chunks AND mixed-case ASCII letter chunks (zero scalar loop on mixed-case ASCII).
+    for (ca, cb) in a[..n].chunks_exact(8).zip(b[..n].chunks_exact(8)) {
+        let wa = u64::from_ne_bytes(ca.try_into().unwrap());
+        let wb = u64::from_ne_bytes(cb.try_into().unwrap());
+        let has_nul = (wa.wrapping_sub(ONES) & !wa & HIGHS) != 0;
+        if wa == wb {
+            if has_nul {
+                break;
+            }
+            i += 8;
+        } else {
+            let diff = wa ^ wb;
+            if (diff & !BIT5) != 0 || has_nul {
+                break;
+            }
+            // Bit 7 of each lane is 1 iff `(wa_byte | 0x20)` is in `b'a'..=b'z'` and `< 0x80`.
+            let lo = wa | BIT5;
+            let lo7 = lo & 0x7F7F_7F7F_7F7F_7F7F;
+            let letter_mask = lo7.wrapping_add(0x1F1F_1F1F_1F1F_1F1F)
+                & !lo7.wrapping_add(0x0505_0505_0505_0505)
+                & !lo
+                & HIGHS;
+            if ((diff << 2) & !letter_mask) == 0 {
+                i += 8;
+            } else {
+                break;
+            }
+        }
+    }
+    while i < n {
         let x = a[i];
+        let y = b[i];
+        if x == y && x != 0 {
+            i += 1;
+            continue;
+        }
         if x == 0 {
-            let fy = fold_ascii(b[i]);
+            let fy = fold_ascii(y);
             if fy != 0 {
                 return Ordering::Less;
             }
             return a.len().cmp(&b.len());
         }
         let fx = fold_ascii(x);
-        let fy = fold_ascii(b[i]);
+        let fy = fold_ascii(y);
         if fx != fy {
             return fx.cmp(&fy);
         }
+        i += 1;
     }
     a.len().cmp(&b.len())
 }
@@ -179,9 +220,42 @@ impl Collation {
         match self {
             Collation::Builtin { kind, encoding } => {
                 if *kind == BuiltinCollation::Binary && *encoding != TextEncoding::Utf8 {
-                    let ea = encode_utf8_to_stored_text(a, *encoding);
-                    let eb = encode_utf8_to_stored_text(b, *encoding);
-                    compare_bytes_binary(&ea, &eb)
+                    let le = *encoding == TextEncoding::Utf16Le;
+                    let mut ia = super::utf::Utf8AsUtf16Units::new(a);
+                    let mut ib = super::utf::Utf8AsUtf16Units::new(b);
+                    loop {
+                        match (ia.next(), ib.next()) {
+                            (Some(ua), Some(ub)) => {
+                                if ua != ub {
+                                    return if le {
+                                        ua.swap_bytes().cmp(&ub.swap_bytes())
+                                    } else {
+                                        ua.cmp(&ub)
+                                    };
+                                }
+                            }
+                            (None, None) => return Ordering::Equal,
+                            (None, Some(_)) => return Ordering::Less,
+                            (Some(_), None) => return Ordering::Greater,
+                        }
+                    }
+                } else if *encoding != TextEncoding::Utf8 {
+                    fn normalize_utf16_collation<'a>(
+                        s: &'a [u8],
+                        enc: TextEncoding,
+                    ) -> Cow<'a, [u8]> {
+                        if std::str::from_utf8(s).is_ok() {
+                            Cow::Borrowed(s)
+                        } else {
+                            Cow::Owned(sqlite_utf16_to_utf8(
+                                &super::utf::utf8_to_utf16_bytes(s, enc),
+                                enc,
+                            ))
+                        }
+                    }
+                    let ua = normalize_utf16_collation(a, *encoding);
+                    let ub = normalize_utf16_collation(b, *encoding);
+                    compare_text_bytes(*kind, &ua, &ub, TextEncoding::Utf8)
                 } else {
                     compare_text_bytes(*kind, a, b, TextEncoding::Utf8)
                 }
@@ -211,20 +285,21 @@ impl Collation {
 #[derive(Debug, Clone)]
 pub struct CollationRegistry {
     encoding: TextEncoding,
-    by_name: HashMap<String, Collation>,
+    binary: Collation,
+    nocase: Collation,
+    rtrim: Collation,
+    custom: Option<HashMap<String, Collation>>,
 }
 
 impl CollationRegistry {
     pub fn new(encoding: TextEncoding) -> Self {
-        let mut by_name = HashMap::new();
-        for kind in [
-            BuiltinCollation::Binary,
-            BuiltinCollation::Nocase,
-            BuiltinCollation::Rtrim,
-        ] {
-            by_name.insert(kind.name().to_string(), Collation::builtin(kind, encoding));
+        Self {
+            encoding,
+            binary: Collation::builtin(BuiltinCollation::Binary, encoding),
+            nocase: Collation::builtin(BuiltinCollation::Nocase, encoding),
+            rtrim: Collation::builtin(BuiltinCollation::Rtrim, encoding),
+            custom: None,
         }
-        Self { encoding, by_name }
     }
 
     pub fn encoding(&self) -> TextEncoding {
@@ -235,20 +310,45 @@ impl CollationRegistry {
         let name = name.into();
         let key = name.to_ascii_uppercase();
         let coll = Collation::Custom { name, func };
-        self.by_name.insert(key, coll.clone());
+        self.custom
+            .get_or_insert_with(HashMap::new)
+            .insert(key, coll.clone());
         coll
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {
         let key = name.to_ascii_uppercase();
-        if matches!(key.as_str(), "BINARY" | "NOCASE" | "RTRIM") {
-            return false;
-        }
-        self.by_name.remove(&key).is_some()
+        self.custom
+            .as_mut()
+            .is_some_and(|m| m.remove(&key).is_some())
     }
 
+    #[inline]
     pub fn find(&self, name: &str) -> Option<&Collation> {
-        self.by_name.get(&name.to_ascii_uppercase())
+        if let Some(ref custom) = self.custom {
+            if name.len() <= 64 {
+                let mut buf = [0u8; 64];
+                for (dst, &src) in buf.iter_mut().zip(name.as_bytes()) {
+                    *dst = src.to_ascii_uppercase();
+                }
+                if let Ok(upper) = std::str::from_utf8(&buf[..name.len()]) {
+                    if let Some(c) = custom.get(upper) {
+                        return Some(c);
+                    }
+                }
+            } else if let Some(c) = custom.get(&name.to_ascii_uppercase()) {
+                return Some(c);
+            }
+        }
+        if name.eq_ignore_ascii_case("BINARY") {
+            Some(&self.binary)
+        } else if name.eq_ignore_ascii_case("NOCASE") {
+            Some(&self.nocase)
+        } else if name.eq_ignore_ascii_case("RTRIM") {
+            Some(&self.rtrim)
+        } else {
+            None
+        }
     }
 }
 

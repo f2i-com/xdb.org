@@ -70,7 +70,11 @@ impl std::error::Error for SqlError {
 
 impl From<SqlParseError> for SqlError {
     fn from(e: SqlParseError) -> Self {
-        SqlError::Parse(e)
+        if let Some(lim) = e.resource_limit {
+            SqlError::ResourceLimit(lim)
+        } else {
+            SqlError::Parse(e)
+        }
     }
 }
 

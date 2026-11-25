@@ -1,6 +1,6 @@
 //! Floating-point formatting with SQLite 3.54.1 semantics (`printf.c:545-780`).
 
-use super::fp_core::{fp_decode, FpSpecial};
+use super::fp_core::FpSpecial;
 
 /// `SQLITE_FP_PRECISION_LIMIT` (`printf.c:176`).
 pub const FP_PRECISION_LIMIT: i32 = 100_000_000;
@@ -86,7 +86,7 @@ enum XType {
 /// Render one `printf` float conversion exactly as SQLite 3.54.1 does.
 pub fn format_float(realvalue: f64, spec: FloatFormatSpec) -> String {
     let mut precision = spec.precision.unwrap_or(-1);
-    let width = spec.width;
+    let width = spec.width.min(FP_PRECISION_LIMIT as usize);
     let flag_prefix = spec.sign_prefix.as_str();
     let flag_alt = spec.alternate_form;
     let flag_alt2 = spec.alt_form2;
@@ -119,8 +119,9 @@ pub fn format_float(realvalue: f64, spec: FloatFormatSpec) -> String {
         XType::Exp => precision + 1,
     };
 
-    let s = fp_decode(realvalue, i_round, if flag_alt2 { 20 } else { 16 });
-    let mut digits = s.digits;
+    let s = super::fp_core::fp_decode_stack(realvalue, i_round, if flag_alt2 { 20 } else { 16 });
+    let mut digits_buf = s.digits;
+    let mut digits_len = usize::from(s.len);
     let mut i_dp = s.i_dp;
 
     match s.special {
@@ -133,7 +134,8 @@ pub fn format_float(realvalue: f64, spec: FloatFormatSpec) -> String {
         }
         FpSpecial::Inf => {
             if flag_zeropad {
-                digits = "9".to_string();
+                digits_buf[0] = b'9';
+                digits_len = 1;
                 i_dp = 1000;
             } else {
                 let text = if s.sign == '-' {
@@ -149,7 +151,8 @@ pub fn format_float(realvalue: f64, spec: FloatFormatSpec) -> String {
         FpSpecial::Finite => {}
     }
 
-    let digit_bytes = digits.as_bytes();
+    let digit_bytes = &digits_buf[..digits_len];
+    let digits = std::str::from_utf8(digit_bytes).expect("ASCII digits");
     let sn = digit_bytes.len();
 
     let prefix = if s.sign == '-' {
@@ -287,17 +290,27 @@ pub fn format_float(realvalue: f64, spec: FloatFormatSpec) -> String {
     out
 }
 
-fn push_zeros(out: &mut String, n: usize) {
+fn push_zeros(out: &mut String, mut n: usize) {
+    const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     out.reserve(n);
-    for _ in 0..n {
-        out.push('0');
+    while n >= ZEROS.len() {
+        out.push_str(ZEROS);
+        n -= ZEROS.len();
+    }
+    if n > 0 {
+        out.push_str(&ZEROS[..n]);
     }
 }
 
-fn push_spaces(out: &mut String, n: usize) {
+fn push_spaces(out: &mut String, mut n: usize) {
+    const SPACES: &str = "                                                                ";
     out.reserve(n);
-    for _ in 0..n {
-        out.push(' ');
+    while n >= SPACES.len() {
+        out.push_str(SPACES);
+        n -= SPACES.len();
+    }
+    if n > 0 {
+        out.push_str(&SPACES[..n]);
     }
 }
 
@@ -317,9 +330,125 @@ fn pad_spaces(text: &str, width: usize, left_justify: bool) -> String {
     out
 }
 
+/// Stack-allocated `REAL -> TEXT` formatter matching [`real_to_text`] for `n_fp_digit <= 20`
+/// (zero heap allocation). Returns the formatted ASCII slice inside `buf`.
+pub fn real_to_text_buf(r: f64, n_fp_digit: i32, buf: &mut [u8; 48]) -> &str {
+    // Fast exact integral path for finite non-zero exact integers with |r| < 1e15 under default
+    // precision (>= 15): formats `<int>.0` directly without decimal fp2_convert10 round-tripping.
+    if n_fp_digit >= 15 && r.is_finite() && r != 0.0 && r.fract() == 0.0 && r.abs() < 1e15 {
+        let mut ibuf = [0u8; 24];
+        let ib = super::int64::int64_to_text_buf(r as i64, &mut ibuf);
+        let n = ib.len();
+        buf[..n].copy_from_slice(ib);
+        buf[n] = b'.';
+        buf[n + 1] = b'0';
+        return std::str::from_utf8(&buf[..n + 2]).expect("ASCII");
+    }
+    let mut precision = if n_fp_digit < 0 {
+        6
+    } else if n_fp_digit == 0 {
+        1
+    } else {
+        n_fp_digit.min(20)
+    };
+    let s = super::fp_core::fp_decode_stack(r, precision, 20);
+    match s.special {
+        FpSpecial::Nan => {
+            buf[..3].copy_from_slice(b"NaN");
+            return std::str::from_utf8(&buf[..3]).expect("ASCII");
+        }
+        FpSpecial::Inf => {
+            let bytes: &[u8] = if s.sign == '-' { b"-Inf" } else { b"Inf" };
+            buf[..bytes.len()].copy_from_slice(bytes);
+            return std::str::from_utf8(&buf[..bytes.len()]).expect("ASCII");
+        }
+        FpSpecial::Finite => {}
+    }
+    let digit_bytes = &s.digits[..usize::from(s.len)];
+    let sn = digit_bytes.len();
+    let i_dp = s.i_dp;
+    let mut exp = i_dp - 1;
+    precision -= 1;
+    let is_exp = if exp < -4 || exp > precision {
+        true
+    } else {
+        precision -= exp;
+        false
+    };
+    let mut e2 = if is_exp { 0 } else { i_dp - 1 };
+    let mut len = 0usize;
+    if s.sign == '-' {
+        buf[len] = b'-';
+        len += 1;
+    }
+    let mut j = 0usize;
+    if e2 < 0 {
+        buf[len] = b'0';
+        len += 1;
+    } else {
+        j = ((e2 + 1) as usize).min(sn);
+        buf[len..len + j].copy_from_slice(&digit_bytes[..j]);
+        len += j;
+        e2 -= j as i32;
+        if e2 >= 0 {
+            let zeros = (e2 + 1) as usize;
+            buf[len..len + zeros].fill(b'0');
+            len += zeros;
+            e2 = -1;
+        }
+    }
+    buf[len] = b'.';
+    len += 1;
+    if e2 < -1 && precision > 0 {
+        let nn = (-1 - e2).min(precision);
+        buf[len..len + nn as usize].fill(b'0');
+        len += nn as usize;
+        precision -= nn;
+    }
+    if precision > 0 {
+        let nn = ((sn - j) as i32).min(precision);
+        if nn > 0 {
+            let nnu = nn as usize;
+            buf[len..len + nnu].copy_from_slice(&digit_bytes[j..j + nnu]);
+            len += nnu;
+        }
+    }
+    while len > 0 && buf[len - 1] == b'0' {
+        len -= 1;
+    }
+    if len > 0 && buf[len - 1] == b'.' {
+        buf[len] = b'0';
+        len += 1;
+    }
+    if is_exp {
+        buf[len] = b'e';
+        len += 1;
+        if exp < 0 {
+            buf[len] = b'-';
+            exp = -exp;
+        } else {
+            buf[len] = b'+';
+        }
+        len += 1;
+        if exp >= 100 {
+            buf[len] = b'0' + (exp / 100) as u8;
+            len += 1;
+            exp %= 100;
+        }
+        buf[len] = b'0' + (exp / 10) as u8;
+        buf[len + 1] = b'0' + (exp % 10) as u8;
+        len += 2;
+    }
+    std::str::from_utf8(&buf[..len]).expect("ASCII")
+}
+
 /// `REAL -> TEXT` as SQLite renders it (`vdbeMemRenderNum`, `vdbemem.c:106`):
 /// `printf("%!.*g", n_fp_digit, r)`. Default `n_fp_digit = 17`.
 pub fn real_to_text(r: f64, n_fp_digit: i32) -> String {
+    if n_fp_digit <= 20 {
+        let mut buf = [0u8; 48];
+        return real_to_text_buf(r, n_fp_digit, &mut buf).to_string();
+    }
     let mut spec = FloatFormatSpec::new(FloatConversion::LowerG);
     spec.precision = Some(n_fp_digit);
     spec.alt_form2 = true;

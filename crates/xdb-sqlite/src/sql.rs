@@ -14,24 +14,81 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use xdb_core::value::{mem_compare, CollationRegistry};
+use xdb_core::value::{mem_compare, BuiltinCollation, Collation, CollationRegistry, TextEncoding};
 use xdb_core::{Affinity, Meter, SqlValue};
-use xdb_parser::{expr_children, Expr, IndexOrigin};
+use xdb_parser::{expr_children, Expr, IndexOrigin, SelectStmt};
 use xdb_sql::{
-    eval_generated_expr, execute_query, Bound, ColumnMeta, IndexMeta, QueryOptions, QueryParams,
-    QueryResult, ScannedRow, ScopeColumn, SqlCatalog, SqlError, SqlResult, TableMeta,
-    TableScanHint, TableValuedResult, ViewMeta,
+    eval_generated_expr, execute_query, execute_select_stmt, Bound, ColumnMeta, IndexMeta,
+    QueryOptions, QueryParams, QueryResult, ScannedRow, ScopeColumn, SqlCatalog, SqlError,
+    SqlResult, TableMeta, TableScanHint, TableValuedResult, ViewMeta,
 };
 
 use crate::access::SearchKey;
 use crate::btree::{SeekOp, SeekResult};
-use crate::database::{ColumnSpec, ScanOptions, SqliteDatabase, TableReader};
+use crate::database::{FastPeekVal, RowCursor, SqliteDatabase, TableReader};
 use crate::errors::{SqliteError, SqliteResult};
 use crate::schema::catalog::GeneratedKind;
 use crate::schema::{ColumnHiddenKind, SchemaObject, TableInfo};
 
-type RawRowList = Vec<(Option<i64>, Vec<SqlValue>)>;
+type RawRowList = Vec<ScannedRow>;
+
+struct ScanMemGuard<'a> {
+    meter: Option<&'a dyn Meter>,
+    reserved: u64,
+}
+
+impl<'a> ScanMemGuard<'a> {
+    fn new(meter: Option<&'a dyn Meter>) -> Self {
+        Self { meter, reserved: 0 }
+    }
+
+    fn reserve(&mut self, bytes: u64) -> SqlResult<()> {
+        if bytes > 0 {
+            if let Some(m) = self.meter {
+                m.reserve_memory(bytes)?;
+                self.reserved = self.reserved.saturating_add(bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        if bytes > 0 {
+            let rel = bytes.min(self.reserved);
+            if rel > 0 {
+                self.reserved -= rel;
+                if let Some(m) = self.meter {
+                    m.release_memory(rel);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ScanMemGuard<'_> {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            if let Some(m) = self.meter {
+                m.release_memory(self.reserved);
+            }
+        }
+    }
+}
+
+fn estimate_vals_bytes(vals: &[SqlValue]) -> u64 {
+    let mut total = (vals.len() as u64).saturating_mul(24).saturating_add(32);
+    for v in vals {
+        match v {
+            SqlValue::Text(b) | SqlValue::Blob(b) => {
+                total = total.saturating_add(b.len() as u64);
+            }
+            _ => {}
+        }
+    }
+    total
+}
 
 /// Map a [`SqliteError`] to an [`xdb_sql::SqlError`], preserving `ResourceLimit`.
 fn map_sqlite_err(e: SqliteError) -> SqlError {
@@ -63,7 +120,7 @@ impl<'a> SqliteSqlCatalog<'a> {
     fn check_schema(schema: Option<&str>) -> bool {
         match schema {
             None => true,
-            Some(s) => s.eq_ignore_ascii_case("main") || s.eq_ignore_ascii_case("temp"),
+            Some(s) => s.eq_ignore_ascii_case("main"),
         }
     }
 
@@ -120,68 +177,321 @@ impl<'a> SqliteSqlCatalog<'a> {
         &self,
         reader: &TableReader,
         hint: &TableScanHint,
+        needed_columns: Option<&[usize]>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<Vec<ScannedRow>> {
         let info = reader.info();
-        let stored_specs: Vec<ColumnSpec> = info
-            .columns
-            .iter()
-            .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
-            .map(|c| ColumnSpec::Cid(c.cid))
-            .collect();
-        let stored_cids: Vec<usize> = info
-            .columns
-            .iter()
-            .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
-            .map(|c| c.cid)
-            .collect();
-
-        let scan_opts = ScanOptions {
-            columns: Some(stored_specs),
-            rowid: !info.without_rowid,
-        };
-
-        let raw_rows: Vec<(Option<i64>, Vec<SqlValue>)> =
-            self.collect_raw_rows(reader, hint, &scan_opts, meter)?;
-
-        // Reconstruct full column vector (length = info.columns.len()) and compute VIRTUAL columns.
         let total_cols = info.columns.len();
-        let virt_plan = if info.has_virtual_columns {
-            Some(VirtualColumnPlan::build(info)?)
+
+        // Determine whether any VIRTUAL column is actually needed by this query.
+        let needed_has_virtual = info.has_virtual_columns
+            && match needed_columns {
+                None => true,
+                Some(needed) => needed
+                    .iter()
+                    .any(|&cid| cid < total_cols && info.columns[cid].hidden == ColumnHiddenKind::Virtual),
+            };
+
+        let virt_plan = if needed_has_virtual {
+            Some(VirtualColumnPlan::build_for(info, needed_columns)?)
         } else {
             None
         };
 
-        let mut out = Vec::with_capacity(raw_rows.len());
-        for (rowid, stored_vals) in raw_rows {
+        // Choose which stored columns to decode:
+        // - If VIRTUAL columns are evaluated, decode all stored columns (to satisfy any
+        //   transitive column dependencies inside generated expressions).
+        // - Otherwise, if `needed_columns` is provided, decode ONLY the requested stored columns!
+        let (stored_cids, full_stored_identity): (Vec<usize>, bool) = if !needed_has_virtual {
+            if let Some(needed) = needed_columns {
+                let mut cids = Vec::with_capacity(needed.len());
+                for &cid in needed {
+                    if cid < total_cols && info.columns[cid].hidden != ColumnHiddenKind::Virtual {
+                        cids.push(cid);
+                    }
+                }
+                let is_identity =
+                    cids.len() == total_cols && cids.iter().enumerate().all(|(i, &c)| i == c);
+                (cids, is_identity)
+            } else {
+                let cids: Vec<usize> = info
+                    .columns
+                    .iter()
+                    .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
+                    .map(|c| c.cid)
+                    .collect();
+                let is_identity = !info.has_virtual_columns && cids.len() == total_cols;
+                (cids, is_identity)
+            }
+        } else {
+            let cids = info
+                .columns
+                .iter()
+                .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
+                .map(|c| c.cid)
+                .collect();
+            (cids, false)
+        };
+
+        let sparse = if full_stored_identity {
+            None
+        } else {
+            Some((total_cols, stored_cids.as_slice()))
+        };
+
+        let mut rows = self.collect_raw_rows(reader, hint, &stored_cids, sparse, meter)?;
+
+        // Fast single-pass return when no VIRTUAL generated columns need evaluation:
+        // `collect_raw_rows` already decoded every column directly into its final slot position!
+        let Some(ref plan) = virt_plan else {
+            return Ok(rows);
+        };
+
+        let mut mem = ScanMemGuard::new(meter);
+        for srow in &mut rows {
             if let Some(m) = meter {
                 m.charge_steps(1)?;
             }
-            let mut full = if info.has_virtual_columns {
-                let mut v = vec![SqlValue::Null; total_cols];
-                for (&cid, val) in stored_cids.iter().zip(stored_vals) {
-                    v[cid] = val;
-                }
-                v
-            } else {
-                stored_vals
-            };
-            if let Some(ref plan) = virt_plan {
-                plan.evaluate(&mut full, self.options)?;
+            let prev_bytes = estimate_vals_bytes(&srow.values);
+            plan.evaluate(&mut srow.values, self.options)?;
+            let new_bytes = estimate_vals_bytes(&srow.values);
+            if new_bytes > prev_bytes {
+                mem.reserve(new_bytes - prev_bytes)?;
             }
-            out.push(ScannedRow {
-                rowid,
-                values: full,
-            });
         }
-        Ok(out)
+        Ok(rows)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn visit_with_virtuals(
+        &self,
+        reader: &TableReader,
+        hint: &TableScanHint,
+        needed_columns: Option<&[usize]>,
+        meter: Option<&dyn Meter>,
+        visit: &mut dyn FnMut(Option<i64>, &[SqlValue]) -> SqlResult<bool>,
+    ) -> SqlResult<()> {
+        let info = reader.info();
+        let total_cols = info.columns.len();
+        let needed_has_virtual = info.has_virtual_columns
+            && match needed_columns {
+                None => true,
+                Some(needed) => needed
+                    .iter()
+                    .any(|&cid| cid < total_cols && info.columns[cid].hidden == ColumnHiddenKind::Virtual),
+            };
+        if needed_has_virtual {
+            let rows = self.scan_with_virtuals(reader, hint, needed_columns, meter)?;
+            for row in rows {
+                if !visit(row.rowid, &row.values)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let stored_cids: Vec<usize> = if let Some(needed) = needed_columns {
+            let mut cids = Vec::with_capacity(needed.len());
+            for &cid in needed {
+                if cid < total_cols && info.columns[cid].hidden != ColumnHiddenKind::Virtual {
+                    cids.push(cid);
+                }
+            }
+            cids
+        } else {
+            info.columns
+                .iter()
+                .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
+                .map(|c| c.cid)
+                .collect()
+        };
+
+        let has_rowid = !info.without_rowid;
+        let mut buf = vec![SqlValue::Null; total_cols];
+
+        match hint {
+            TableScanHint::FullScan => {
+                let mut cur = reader.cursor_cids(&stored_cids).map_err(map_sqlite_err)?;
+                cur.visit_sparse_range(
+                    &mut buf,
+                    &stored_cids,
+                    None,
+                    None,
+                    meter,
+                    map_sqlite_err,
+                    SqlError::ResourceLimit,
+                    visit,
+                )?;
+                return Ok(());
+            }
+            TableScanHint::RowidRange { low, high } if has_rowid => {
+                let lo_opt: Option<Option<i64>> = match low {
+                    Bound::Unbounded => Some(None),
+                    Bound::Included(v) => bound_to_int(v).map(Some),
+                    Bound::Excluded(v) => match bound_to_int(v) {
+                        Some(i) => match i.checked_add(1) {
+                            Some(n) => Some(Some(n)),
+                            None => return Ok(()),
+                        },
+                        None => None,
+                    },
+                };
+                let hi_opt: Option<Option<i64>> = match high {
+                    Bound::Unbounded => Some(None),
+                    Bound::Included(v) => bound_to_int(v).map(Some),
+                    Bound::Excluded(v) => match bound_to_int(v) {
+                        Some(i) => match i.checked_sub(1) {
+                            Some(n) => Some(Some(n)),
+                            None => return Ok(()),
+                        },
+                        None => None,
+                    },
+                };
+                if let (Some(lo_i64), Some(hi_i64)) = (lo_opt, hi_opt) {
+                    if let (Some(lo), Some(hi)) = (lo_i64, hi_i64) {
+                        if lo > hi {
+                            return Ok(());
+                        }
+                        if lo == hi {
+                            if let Some(m) = meter {
+                                m.charge_steps(1)?;
+                            }
+                            let mut rcur =
+                                reader.cursor_cids(&stored_cids).map_err(map_sqlite_err)?;
+                            if rcur.seek(lo).map_err(map_sqlite_err)? == SeekResult::Exact {
+                                rcur.decode_into_sparse_buf(&mut buf, &stored_cids)
+                                    .map_err(map_sqlite_err)?;
+                                let _ = visit(Some(lo), &buf)?;
+                            }
+                            return Ok(());
+                        }
+                    }
+                    let mut rcur = reader.cursor_cids(&stored_cids).map_err(map_sqlite_err)?;
+                    rcur.visit_sparse_range(
+                        &mut buf,
+                        &stored_cids,
+                        lo_i64,
+                        hi_i64,
+                        meter,
+                        map_sqlite_err,
+                        SqlError::ResourceLimit,
+                        visit,
+                    )?;
+                    return Ok(());
+                }
+            }
+            TableScanHint::IndexEq { index_name, values } if has_rowid => {
+                if let Ok(idx_reader) = self.db.index(index_name) {
+                    let idx_info = idx_reader.info();
+                    if !idx_info.without_rowid_primary_key && !idx_info.partial && !values.is_empty() {
+                        if let Ok(key_info) = idx_reader.key_info(Some(&self.options.collations)) {
+                            if let Ok(mut search_key) = SearchKey::new(key_info.clone(), values, 1) {
+                                let mut icur = idx_reader.cursor().map_err(map_sqlite_err)?;
+                                let width = icur.width();
+                                if width > values.len() {
+                                    let rid_col = width - 1;
+                                    let binary_fallback = (key_info.encoding != TextEncoding::Utf8)
+                                        .then(|| {
+                                            Collation::builtin(
+                                                BuiltinCollation::Binary,
+                                                key_info.encoding,
+                                            )
+                                        });
+                                    if !icur
+                                        .seek_key(&mut search_key, SeekOp::Ge)
+                                        .map_err(map_sqlite_err)?
+                                    {
+                                        return Ok(());
+                                    }
+                                    let mut rcur = reader
+                                        .cursor_cids(&stored_cids)
+                                        .map_err(map_sqlite_err)?;
+                                    let mut fell_back = false;
+                                    let mut visited_any = false;
+                                    loop {
+                                        if let Some(m) = meter {
+                                            m.charge_steps(1)?;
+                                        }
+                                        let mut matches = true;
+                                        for (k, target) in values.iter().enumerate() {
+                                            let kv = icur.value(k).map_err(map_sqlite_err)?;
+                                            let coll = key_info.collations[k]
+                                                .as_ref()
+                                                .or(binary_fallback.as_ref());
+                                            if mem_compare(&kv, target, coll) != Ordering::Equal {
+                                                matches = false;
+                                                break;
+                                            }
+                                        }
+                                        if !matches {
+                                            break;
+                                        }
+                                        let rid_val =
+                                            icur.value(rid_col).map_err(map_sqlite_err)?;
+                                        let Some(rid) = rid_val.as_i64() else {
+                                            if visited_any {
+                                                return Err(SqlError::storage(
+                                                    "non-integer rowid in secondary index",
+                                                ));
+                                            }
+                                            fell_back = true;
+                                            break;
+                                        };
+                                        if rcur.seek(rid).map_err(map_sqlite_err)?
+                                            == SeekResult::Exact
+                                        {
+                                            rcur.decode_into_sparse_buf(&mut buf, &stored_cids)
+                                                .map_err(map_sqlite_err)?;
+                                            visited_any = true;
+                                            if !visit(Some(rid), &buf)? {
+                                                break;
+                                            }
+                                        }
+                                        if !icur.next().map_err(map_sqlite_err)? {
+                                            break;
+                                        }
+                                    }
+                                    if !fell_back {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Fallback for remaining hints (RowidIn, IndexRange, IndexIn, RowidOrder, IndexOrder, TopK)
+        let rows = self.scan_with_virtuals(reader, hint, needed_columns, meter)?;
+        for row in rows {
+            if !visit(row.rowid, &row.values)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn decode_cursor_row(
+        cur: &mut RowCursor,
+        sparse: Option<(usize, &[usize])>,
+    ) -> SqlResult<Vec<SqlValue>> {
+        match sparse {
+            None => cur.row().map_err(map_sqlite_err),
+            Some((total_cols, cids)) => cur
+                .row_into_sparse(total_cols, cids)
+                .map_err(map_sqlite_err),
+        }
     }
 
     fn collect_raw_rows(
         &self,
         reader: &TableReader,
         hint: &TableScanHint,
-        scan_opts: &ScanOptions,
+        stored_cids: &[usize],
+        sparse: Option<(usize, &[usize])>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<RawRowList> {
         let info = reader.info();
@@ -190,34 +500,546 @@ impl<'a> SqliteSqlCatalog<'a> {
         match hint {
             TableScanHint::RowidRange { low, high } if has_rowid => {
                 if let Some(rows) =
-                    self.try_rowid_range_scan(reader, low, high, scan_opts, meter)?
+                    self.try_rowid_range_scan(reader, low, high, stored_cids, sparse, meter)?
                 {
                     return Ok(rows);
                 }
             }
+            TableScanHint::RowidIn { values } if has_rowid => {
+                return self.try_rowid_in_scan(reader, values, stored_cids, sparse, meter);
+            }
             TableScanHint::IndexEq { index_name, values } if has_rowid => {
                 if let Some(rows) =
-                    self.try_index_eq_scan(reader, index_name, values, scan_opts, meter)?
+                    self.try_index_eq_scan(reader, index_name, values, stored_cids, sparse, meter)?
                 {
+                    return Ok(rows);
+                }
+            }
+            TableScanHint::IndexRange {
+                index_name,
+                low,
+                high,
+            } if has_rowid => {
+                if let Some(rows) = self.try_index_range_scan(
+                    reader, index_name, low, high, stored_cids, sparse, meter,
+                )? {
+                    return Ok(rows);
+                }
+            }
+            TableScanHint::IndexIn { index_name, values } if has_rowid => {
+                if let Some(rows) =
+                    self.try_index_in_scan(reader, index_name, values, stored_cids, sparse, meter)?
+                {
+                    return Ok(rows);
+                }
+            }
+            TableScanHint::RowidOrder { desc, limit } if has_rowid || !*desc => {
+                return self.try_rowid_order_scan(reader, *desc, *limit, stored_cids, sparse, meter);
+            }
+            TableScanHint::IndexOrder {
+                index_name,
+                desc,
+                limit,
+            } if has_rowid => {
+                if let Some(rows) = self.try_index_order_scan(
+                    reader, index_name, *desc, *limit, stored_cids, sparse, meter,
+                )? {
+                    return Ok(rows);
+                }
+            }
+            TableScanHint::TopK {
+                col_idx,
+                desc,
+                nulls_first,
+                collation,
+                limit,
+            } => {
+                if let Some(rows) = self.try_topk_scan(
+                    reader,
+                    *col_idx,
+                    *desc,
+                    *nulls_first,
+                    collation,
+                    *limit,
+                    stored_cids,
+                    sparse,
+                    meter,
+                )? {
                     return Ok(rows);
                 }
             }
             _ => {}
         }
 
-        // Default full B-tree scan
-        let mut cur = reader.cursor(Some(scan_opts)).map_err(map_sqlite_err)?;
+        // Default full B-tree scan (`rowid: false` + direct `cur.rowid()` avoids `r.remove(0)`!)
+        let mut cur = reader.cursor_cids(stored_cids).map_err(map_sqlite_err)?;
         let mut rows = Vec::new();
+        let mut mem = ScanMemGuard::new(meter);
         while cur.next().map_err(map_sqlite_err)? {
             if let Some(m) = meter {
                 m.charge_steps(1)?;
             }
-            let mut r = cur.row().map_err(map_sqlite_err)?;
-            if has_rowid {
-                let rid = r.remove(0).as_i64();
-                rows.push((rid, r));
+            let rid = if has_rowid {
+                Some(cur.rowid().map_err(map_sqlite_err)?)
             } else {
-                rows.push((None, r));
+                None
+            };
+            let r = Self::decode_cursor_row(&mut cur, sparse)?;
+            if meter.is_some() {
+                mem.reserve(estimate_vals_bytes(&r))?;
+            }
+            rows.push(ScannedRow {
+                rowid: rid,
+                values: r,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn try_rowid_order_scan(
+        &self,
+        reader: &TableReader,
+        desc: bool,
+        limit: usize,
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<RawRowList> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let has_rowid = !reader.info().without_rowid;
+        let mut cur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        let mut mem = ScanMemGuard::new(meter);
+        let positioned = if desc {
+            cur.last().map_err(map_sqlite_err)?
+        } else {
+            cur.next().map_err(map_sqlite_err)?
+        };
+        if !positioned {
+            return Ok(rows);
+        }
+        loop {
+            if let Some(m) = meter {
+                m.charge_steps(1)?;
+            }
+            let rid = if has_rowid {
+                Some(cur.rowid().map_err(map_sqlite_err)?)
+            } else {
+                None
+            };
+            let vals = Self::decode_cursor_row(&mut cur, sparse)?;
+            if meter.is_some() {
+                mem.reserve(estimate_vals_bytes(&vals))?;
+            }
+            rows.push(ScannedRow {
+                rowid: rid,
+                values: vals,
+            });
+            if rows.len() >= limit {
+                break;
+            }
+            let more = if desc {
+                cur.prev().map_err(map_sqlite_err)?
+            } else {
+                cur.next().map_err(map_sqlite_err)?
+            };
+            if !more {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_index_order_scan(
+        &self,
+        reader: &TableReader,
+        index_name: &str,
+        desc: bool,
+        limit: usize,
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<RawRowList>> {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Ok(idx_reader) = self.db.index(index_name) else {
+            return Ok(None);
+        };
+        let idx_info = idx_reader.info();
+        if idx_info.without_rowid_primary_key || idx_info.partial || idx_info.key_count == 0 {
+            return Ok(None);
+        }
+        let mut icur = idx_reader.cursor().map_err(map_sqlite_err)?;
+        let width = icur.width();
+        if width < 2 {
+            return Ok(None);
+        }
+        let rid_col = width - 1;
+        let positioned = if desc {
+            icur.last().map_err(map_sqlite_err)?
+        } else {
+            icur.next().map_err(map_sqlite_err)?
+        };
+        if !positioned {
+            return Ok(Some(Vec::new()));
+        }
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        let mut mem = ScanMemGuard::new(meter);
+        // Covering-index check: if every requested column in `scan_opts` is present in
+        // `idx_info.columns` (or is the table's IPK = `rid_col`), emit rows directly from
+        // the index cursor with ZERO table-B-tree seeks!
+        let tbl_info = reader.info();
+        let mut cover_map: Vec<(usize, bool)> = Vec::with_capacity(scan_opts.len());
+        let mut is_covering = !tbl_info.without_rowid;
+        if is_covering {
+            for &cid in scan_opts {
+                if Some(cid) == tbl_info.ipk_column {
+                    cover_map.push((rid_col, false));
+                } else if let Some(pos) = idx_info
+                    .columns
+                    .iter()
+                    .take(idx_info.key_count)
+                    .position(|ic| ic.cid == cid as i32)
+                {
+                    let real_back = tbl_info
+                        .columns
+                        .get(cid)
+                        .is_some_and(|c| c.affinity == Affinity::Real);
+                    cover_map.push((pos, real_back));
+                } else {
+                    is_covering = false;
+                    break;
+                }
+            }
+        }
+        if is_covering {
+            loop {
+                if let Some(m) = meter {
+                    m.charge_steps(1)?;
+                }
+                let rid_val = icur.value(rid_col).map_err(map_sqlite_err)?;
+                let Some(rid) = rid_val.as_i64() else {
+                    return Ok(None);
+                };
+                let vals = if let Some((full_width, cids)) = sparse {
+                    let mut v = vec![SqlValue::Null; full_width];
+                    for (&cid, &(ipos, real_back)) in cids.iter().zip(&cover_map) {
+                        let raw = if ipos == rid_col {
+                            SqlValue::Int(rid)
+                        } else {
+                            icur.value(ipos).map_err(map_sqlite_err)?
+                        };
+                        v[cid] = if real_back {
+                            crate::schema::real_read_back(raw)
+                        } else {
+                            raw
+                        };
+                    }
+                    v
+                } else {
+                    let mut v = Vec::with_capacity(cover_map.len());
+                    for &(ipos, real_back) in &cover_map {
+                        let raw = if ipos == rid_col {
+                            SqlValue::Int(rid)
+                        } else {
+                            icur.value(ipos).map_err(map_sqlite_err)?
+                        };
+                        v.push(if real_back {
+                            crate::schema::real_read_back(raw)
+                        } else {
+                            raw
+                        });
+                    }
+                    v
+                };
+                if meter.is_some() {
+                    mem.reserve(estimate_vals_bytes(&vals))?;
+                }
+                rows.push(ScannedRow {
+                    rowid: Some(rid),
+                    values: vals,
+                });
+                if rows.len() >= limit {
+                    break;
+                }
+                let more = if desc {
+                    icur.prev().map_err(map_sqlite_err)?
+                } else {
+                    icur.next().map_err(map_sqlite_err)?
+                };
+                if !more {
+                    break;
+                }
+            }
+            return Ok(Some(rows));
+        }
+
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+        loop {
+            if let Some(m) = meter {
+                m.charge_steps(1)?;
+            }
+            let rid_val = icur.value(rid_col).map_err(map_sqlite_err)?;
+            let Some(rid) = rid_val.as_i64() else {
+                return Ok(None);
+            };
+            if rcur.seek(rid).map_err(map_sqlite_err)? == SeekResult::Exact {
+                let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                if meter.is_some() {
+                    mem.reserve(estimate_vals_bytes(&vals))?;
+                }
+                rows.push(ScannedRow {
+                    rowid: Some(rid),
+                    values: vals,
+                });
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+            let more = if desc {
+                icur.prev().map_err(map_sqlite_err)?
+            } else {
+                icur.next().map_err(map_sqlite_err)?
+            };
+            if !more {
+                break;
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_topk_scan(
+        &self,
+        reader: &TableReader,
+        col_idx: usize,
+        desc: bool,
+        nulls_first: bool,
+        collation: &str,
+        limit: usize,
+        stored_cids: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<RawRowList>> {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(coll) = self.options.collations.find(collation) else {
+            return Ok(None);
+        };
+        let Some(key_slot) = stored_cids.iter().position(|&c| c == col_idx) else {
+            return Ok(None);
+        };
+        let has_rowid = !reader.info().without_rowid;
+        let mut cur = reader.cursor_cids(stored_cids).map_err(map_sqlite_err)?;
+
+        // Comparator returning `Ordering::Less` if `a` is BETTER (comes earlier in desired ORDER BY)
+        // than `b`, and `Ordering::Greater` if `a` is WORSE than `b`.
+        let cmp_order = |ka: &SqlValue, sa: u64, kb: &SqlValue, sb: u64| -> Ordering {
+            let na = ka.is_null();
+            let nb = kb.is_null();
+            if na || nb {
+                if na && nb {
+                    return sa.cmp(&sb);
+                }
+                return if na {
+                    if nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                } else if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            let mut o = mem_compare(ka, kb, Some(coll));
+            if desc {
+                o = o.reverse();
+            }
+            o.then_with(|| sa.cmp(&sb))
+        };
+
+        // Bounded max-heap of size `limit`: `heap[0]` is always the WORST kept row.
+        let mut mem = ScanMemGuard::new(meter);
+        let mut heap: Vec<(SqlValue, u64, ScannedRow)> = Vec::with_capacity(limit);
+        let mut worst_int: Option<i64> = None;
+        let mut seq = 0u64;
+        while let Some(peeked) = cur.next_peek_key_fast(key_slot).map_err(map_sqlite_err)? {
+            if let Some(m) = meter {
+                m.charge_steps(1)?;
+            }
+            let cur_seq = seq;
+            seq = seq.wrapping_add(1);
+            // Fast register rejection when heap is full and worst item is an Int:
+            // since `cur_seq > heap[0].1`, ties are strictly worse than `heap[0]` too!
+            if let (Some(w), FastPeekVal::Int(k)) = (worst_int, &peeked) {
+                if if desc { *k <= w } else { *k >= w } {
+                    continue;
+                }
+            }
+            let key = match peeked {
+                FastPeekVal::Int(k) => SqlValue::Int(k),
+                FastPeekVal::Other(v) => v,
+            };
+
+            if heap.len() < limit {
+                let rid = if has_rowid {
+                    Some(cur.rowid().map_err(map_sqlite_err)?)
+                } else {
+                    None
+                };
+                let vals = Self::decode_cursor_row(&mut cur, sparse)?;
+                if meter.is_some() {
+                    let key_extra = match &key {
+                        SqlValue::Text(b) | SqlValue::Blob(b) => b.len() as u64,
+                        _ => 0,
+                    };
+                    mem.reserve(estimate_vals_bytes(&vals).saturating_add(key_extra))?;
+                }
+                heap.push((
+                    key,
+                    cur_seq,
+                    ScannedRow {
+                        rowid: rid,
+                        values: vals,
+                    },
+                ));
+                // Sift up: keep worst item at index 0.
+                let mut idx = heap.len() - 1;
+                while idx > 0 {
+                    let parent = (idx - 1) / 2;
+                    if cmp_order(&heap[idx].0, heap[idx].1, &heap[parent].0, heap[parent].1)
+                        == Ordering::Greater
+                    {
+                        heap.swap(idx, parent);
+                        idx = parent;
+                    } else {
+                        break;
+                    }
+                }
+                if heap.len() == limit {
+                    worst_int = match heap[0].0 {
+                        SqlValue::Int(w) => Some(w),
+                        _ => None,
+                    };
+                }
+            } else {
+                let is_better = match (&key, &heap[0].0) {
+                    (SqlValue::Int(a), SqlValue::Int(b)) => {
+                        let o = if desc { b.cmp(a) } else { a.cmp(b) };
+                        o == Ordering::Less || (o == Ordering::Equal && cur_seq < heap[0].1)
+                    }
+                    _ => cmp_order(&key, cur_seq, &heap[0].0, heap[0].1) == Ordering::Less,
+                };
+                if is_better {
+                    // Strictly better than current worst item: decode full row and replace `heap[0]`.
+                    let rid = if has_rowid {
+                        Some(cur.rowid().map_err(map_sqlite_err)?)
+                    } else {
+                        None
+                    };
+                    let vals = Self::decode_cursor_row(&mut cur, sparse)?;
+                    if meter.is_some() {
+                        let key_extra = |v: &SqlValue| -> u64 {
+                            match v {
+                                SqlValue::Text(b) | SqlValue::Blob(b) => b.len() as u64,
+                                _ => 0,
+                            }
+                        };
+                        let new_b = estimate_vals_bytes(&vals).saturating_add(key_extra(&key));
+                        let old_b = estimate_vals_bytes(&heap[0].2.values)
+                            .saturating_add(key_extra(&heap[0].0));
+                        if new_b > old_b {
+                            mem.reserve(new_b - old_b)?;
+                        } else {
+                            mem.release(old_b - new_b);
+                        }
+                    }
+                    heap[0] = (
+                        key,
+                        cur_seq,
+                        ScannedRow {
+                            rowid: rid,
+                            values: vals,
+                        },
+                    );
+                    // Sift down from index 0.
+                    let n = heap.len();
+                    let mut idx = 0;
+                    loop {
+                        let left = 2 * idx + 1;
+                        if left >= n {
+                            break;
+                        }
+                        let right = left + 1;
+                        let mut worst = left;
+                        if right < n
+                            && cmp_order(
+                                &heap[right].0,
+                                heap[right].1,
+                                &heap[left].0,
+                                heap[left].1,
+                            ) == Ordering::Greater
+                        {
+                            worst = right;
+                        }
+                        if cmp_order(&heap[worst].0, heap[worst].1, &heap[idx].0, heap[idx].1)
+                            == Ordering::Greater
+                        {
+                            heap.swap(idx, worst);
+                            idx = worst;
+                        } else {
+                            break;
+                        }
+                    }
+                    worst_int = match heap[0].0 {
+                        SqlValue::Int(w) => Some(w),
+                        _ => None,
+                    };
+                }
+            }
+        }
+
+        let mut rows = Vec::with_capacity(heap.len());
+        for (_, _, srow) in heap {
+            rows.push(srow);
+        }
+        Ok(Some(rows))
+    }
+
+    fn try_rowid_in_scan(
+        &self,
+        reader: &TableReader,
+        values: &[i64],
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<RawRowList> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+        let mut rows = Vec::with_capacity(values.len());
+        let mut mem = ScanMemGuard::new(meter);
+        for &rid in values {
+            if let Some(m) = meter {
+                m.charge_steps(1)?;
+            }
+            if rcur.seek(rid).map_err(map_sqlite_err)? == SeekResult::Exact {
+                let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                if meter.is_some() {
+                    mem.reserve(estimate_vals_bytes(&vals))?;
+                }
+                rows.push(ScannedRow {
+                    rowid: Some(rid),
+                    values: vals,
+                });
             }
         }
         Ok(rows)
@@ -228,7 +1050,8 @@ impl<'a> SqliteSqlCatalog<'a> {
         reader: &TableReader,
         low: &Bound,
         high: &Bound,
-        scan_opts: &ScanOptions,
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<Option<RawRowList>> {
         // Parse integer lower/upper rowid bounds safely; on non-integer or exotic bounds,
@@ -267,27 +1090,24 @@ impl<'a> SqliteSqlCatalog<'a> {
                 return Ok(Some(Vec::new()));
             }
             if lo == hi {
-                // Fast point lookup via `TableReader::get`
-                let point_opts = ScanOptions {
-                    columns: scan_opts.columns.clone(),
-                    rowid: false,
-                };
                 if let Some(m) = meter {
                     m.charge_steps(1)?;
                 }
-                return match reader.get(lo, Some(&point_opts)).map_err(map_sqlite_err)? {
-                    Some(vals) => Ok(Some(vec![(Some(lo), vals)])),
-                    None => Ok(Some(Vec::new())),
+                let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+                return if rcur.seek(lo).map_err(map_sqlite_err)? == SeekResult::Exact {
+                    let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                    Ok(Some(vec![ScannedRow {
+                        rowid: Some(lo),
+                        values: vals,
+                    }]))
+                } else {
+                    Ok(Some(Vec::new()))
                 };
             }
         }
 
         // Range scan using `RowCursor::seek` + sequential leaf traversal (true O(log N + K)!)
-        let range_opts = ScanOptions {
-            columns: scan_opts.columns.clone(),
-            rowid: false,
-        };
-        let mut rcur = reader.cursor(Some(&range_opts)).map_err(map_sqlite_err)?;
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
         let positioned = if let Some(lo) = lo_i64 {
             rcur.seek(lo).map_err(map_sqlite_err)? != SeekResult::Eof
         } else {
@@ -298,6 +1118,7 @@ impl<'a> SqliteSqlCatalog<'a> {
         }
 
         let mut rows = Vec::new();
+        let mut mem = ScanMemGuard::new(meter);
         loop {
             if let Some(m) = meter {
                 m.charge_steps(1)?;
@@ -308,8 +1129,14 @@ impl<'a> SqliteSqlCatalog<'a> {
                     break;
                 }
             }
-            let vals = rcur.row().map_err(map_sqlite_err)?;
-            rows.push((Some(rid), vals));
+            let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+            if meter.is_some() {
+                mem.reserve(estimate_vals_bytes(&vals))?;
+            }
+            rows.push(ScannedRow {
+                rowid: Some(rid),
+                values: vals,
+            });
             if !rcur.next().map_err(map_sqlite_err)? {
                 break;
             }
@@ -322,7 +1149,8 @@ impl<'a> SqliteSqlCatalog<'a> {
         reader: &TableReader,
         index_name: &str,
         prefix_values: &[SqlValue],
-        scan_opts: &ScanOptions,
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<Option<RawRowList>> {
         let Ok(idx_reader) = self.db.index(index_name) else {
@@ -335,10 +1163,18 @@ impl<'a> SqliteSqlCatalog<'a> {
         let Ok(key_info) = idx_reader.key_info(Some(&self.options.collations)) else {
             return Ok(None);
         };
+        let binary_fallback = (key_info.encoding != TextEncoding::Utf8)
+            .then(|| Collation::builtin(BuiltinCollation::Binary, key_info.encoding));
         let Ok(mut search_key) = SearchKey::new(key_info.clone(), prefix_values, 1) else {
             return Ok(None);
         };
         let mut icur = idx_reader.cursor().map_err(map_sqlite_err)?;
+        let width = icur.width();
+        let prefix_len = prefix_values.len();
+        if width < prefix_len + 1 {
+            return Ok(None);
+        }
+        let rid_col = width - 1;
         if !icur
             .seek_key(&mut search_key, SeekOp::Ge)
             .map_err(map_sqlite_err)?
@@ -346,27 +1182,19 @@ impl<'a> SqliteSqlCatalog<'a> {
             return Ok(Some(Vec::new()));
         }
 
-        let point_opts = ScanOptions {
-            columns: scan_opts.columns.clone(),
-            rowid: false,
-        };
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
         let mut rows = Vec::new();
-        let mut seen_rowids = HashSet::new();
-        let prefix_len = prefix_values.len();
+        let mut mem = ScanMemGuard::new(meter);
 
         loop {
             if let Some(m) = meter {
                 m.charge_steps(1)?;
             }
-            let entry = icur.row().map_err(map_sqlite_err)?;
-            if entry.len() < prefix_len + 1 {
-                break;
-            }
-            // Check prefix still matches under the index key collations.
             let mut matches = true;
             for (k, target) in prefix_values.iter().enumerate() {
-                let coll = key_info.collations[k].as_ref();
-                if mem_compare(&entry[k], target, coll) != Ordering::Equal {
+                let kv = icur.value(k).map_err(map_sqlite_err)?;
+                let coll = key_info.collations[k].as_ref().or(binary_fallback.as_ref());
+                if mem_compare(&kv, target, coll) != Ordering::Equal {
                     matches = false;
                     break;
                 }
@@ -374,17 +1202,224 @@ impl<'a> SqliteSqlCatalog<'a> {
             if !matches {
                 break;
             }
-            // Trailing field of a rowid secondary index entry is the table rowid.
-            let Some(rid) = entry.last().and_then(SqlValue::as_i64) else {
+            let rid_val = icur.value(rid_col).map_err(map_sqlite_err)?;
+            let Some(rid) = rid_val.as_i64() else {
                 return Ok(None);
             };
-            if seen_rowids.insert(rid) {
-                if let Some(vals) = reader.get(rid, Some(&point_opts)).map_err(map_sqlite_err)? {
-                    rows.push((Some(rid), vals));
+            if rcur.seek(rid).map_err(map_sqlite_err)? == SeekResult::Exact {
+                let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                if meter.is_some() {
+                    mem.reserve(estimate_vals_bytes(&vals))?;
                 }
+                rows.push(ScannedRow {
+                    rowid: Some(rid),
+                    values: vals,
+                });
             }
             if !icur.next().map_err(map_sqlite_err)? {
                 break;
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_index_range_scan(
+        &self,
+        reader: &TableReader,
+        index_name: &str,
+        low: &Bound,
+        high: &Bound,
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<RawRowList>> {
+        let Ok(idx_reader) = self.db.index(index_name) else {
+            return Ok(None);
+        };
+        let idx_info = idx_reader.info();
+        if idx_info.without_rowid_primary_key || idx_info.partial || idx_info.key_count == 0 {
+            return Ok(None);
+        }
+        let Ok(key_info) = idx_reader.key_info(Some(&self.options.collations)) else {
+            return Ok(None);
+        };
+        let is_desc = key_info.desc.first().copied().unwrap_or(false);
+        let binary_fallback = (key_info.encoding != TextEncoding::Utf8)
+            .then(|| Collation::builtin(BuiltinCollation::Binary, key_info.encoding));
+        let lead_coll = key_info
+            .collations
+            .first()
+            .and_then(|c| c.as_ref())
+            .or(binary_fallback.as_ref());
+
+        // For ASC indexes, scan from `low` upward until `high`.
+        // For DESC indexes, index order is reversed, so scan from `high` downward until `low`.
+        let (start_bound, stop_bound) = if is_desc {
+            (high, low)
+        } else {
+            (low, high)
+        };
+
+        let mut icur = idx_reader.cursor().map_err(map_sqlite_err)?;
+        let width = icur.width();
+        if width < 2 {
+            return Ok(None);
+        }
+        let rid_col = width - 1;
+        let positioned = match start_bound {
+            Bound::Unbounded => icur.next().map_err(map_sqlite_err)?,
+            Bound::Included(v) => {
+                let Ok(mut sk) = SearchKey::new(key_info.clone(), std::slice::from_ref(v), 1)
+                else {
+                    return Ok(None);
+                };
+                icur.seek_key(&mut sk, SeekOp::Ge).map_err(map_sqlite_err)?
+            }
+            Bound::Excluded(v) => {
+                let Ok(mut sk) = SearchKey::new(key_info.clone(), std::slice::from_ref(v), -1)
+                else {
+                    return Ok(None);
+                };
+                icur.seek_key(&mut sk, SeekOp::Gt).map_err(map_sqlite_err)?
+            }
+        };
+        if !positioned {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+        let mut rows = Vec::new();
+        let mut mem = ScanMemGuard::new(meter);
+
+        loop {
+            if let Some(m) = meter {
+                m.charge_steps(1)?;
+            }
+            let k0 = icur.value(0).map_err(map_sqlite_err)?;
+            if !k0.is_null() {
+                let past_stop = match stop_bound {
+                    Bound::Unbounded => false,
+                    Bound::Included(sv) => {
+                        let cmp = mem_compare(&k0, sv, lead_coll);
+                        if is_desc {
+                            cmp == Ordering::Less
+                        } else {
+                            cmp == Ordering::Greater
+                        }
+                    }
+                    Bound::Excluded(sv) => {
+                        let cmp = mem_compare(&k0, sv, lead_coll);
+                        if is_desc {
+                            cmp != Ordering::Greater
+                        } else {
+                            cmp != Ordering::Less
+                        }
+                    }
+                };
+                if past_stop {
+                    break;
+                }
+                let rid_val = icur.value(rid_col).map_err(map_sqlite_err)?;
+                let Some(rid) = rid_val.as_i64() else {
+                    return Ok(None);
+                };
+                if rcur.seek(rid).map_err(map_sqlite_err)? == SeekResult::Exact {
+                    let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                    if meter.is_some() {
+                        mem.reserve(estimate_vals_bytes(&vals))?;
+                    }
+                    rows.push(ScannedRow {
+                        rowid: Some(rid),
+                        values: vals,
+                    });
+                }
+            } else if is_desc {
+                // In DESC order NULL sorts last; once we hit NULL, no non-null keys follow.
+                break;
+            }
+            if !icur.next().map_err(map_sqlite_err)? {
+                break;
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    fn try_index_in_scan(
+        &self,
+        reader: &TableReader,
+        index_name: &str,
+        values: &[SqlValue],
+        scan_opts: &[usize],
+        sparse: Option<(usize, &[usize])>,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<RawRowList>> {
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Ok(idx_reader) = self.db.index(index_name) else {
+            return Ok(None);
+        };
+        let idx_info = idx_reader.info();
+        if idx_info.without_rowid_primary_key || idx_info.partial || idx_info.key_count == 0 {
+            return Ok(None);
+        }
+        let Ok(key_info) = idx_reader.key_info(Some(&self.options.collations)) else {
+            return Ok(None);
+        };
+        let binary_fallback = (key_info.encoding != TextEncoding::Utf8)
+            .then(|| Collation::builtin(BuiltinCollation::Binary, key_info.encoding));
+        let lead_coll = key_info
+            .collations
+            .first()
+            .and_then(|c| c.as_ref())
+            .or(binary_fallback.as_ref());
+        let mut icur = idx_reader.cursor().map_err(map_sqlite_err)?;
+        let width = icur.width();
+        if width < 2 {
+            return Ok(None);
+        }
+        let rid_col = width - 1;
+        let mut rcur = reader.cursor_cids(scan_opts).map_err(map_sqlite_err)?;
+        let mut rows = Vec::new();
+        let mut seen_rowids = HashSet::new();
+        let mut mem = ScanMemGuard::new(meter);
+
+        for target in values {
+            let Ok(mut sk) = SearchKey::new(key_info.clone(), std::slice::from_ref(target), 1)
+            else {
+                return Ok(None);
+            };
+            if !icur.seek_key(&mut sk, SeekOp::Ge).map_err(map_sqlite_err)? {
+                continue;
+            }
+            loop {
+                if let Some(m) = meter {
+                    m.charge_steps(1)?;
+                }
+                let k0 = icur.value(0).map_err(map_sqlite_err)?;
+                if mem_compare(&k0, target, lead_coll) != Ordering::Equal {
+                    break;
+                }
+                let rid_val = icur.value(rid_col).map_err(map_sqlite_err)?;
+                let Some(rid) = rid_val.as_i64() else {
+                    return Ok(None);
+                };
+                if seen_rowids.insert(rid)
+                    && rcur.seek(rid).map_err(map_sqlite_err)? == SeekResult::Exact
+                {
+                    let vals = Self::decode_cursor_row(&mut rcur, sparse)?;
+                    if meter.is_some() {
+                        mem.reserve(estimate_vals_bytes(&vals))?;
+                    }
+                    rows.push(ScannedRow {
+                        rowid: Some(rid),
+                        values: vals,
+                    });
+                }
+                if !icur.next().map_err(map_sqlite_err)? {
+                    break;
+                }
             }
         }
         Ok(Some(rows))
@@ -556,6 +1591,19 @@ impl SqlCatalog for SqliteSqlCatalog<'_> {
         }
     }
 
+    fn get_table_arc(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<Arc<TableMeta>>> {
+        if !Self::check_schema(schema) {
+            return Ok(None);
+        }
+        match self.db.schema().object(name) {
+            Some(SchemaObject::Table(t)) => {
+                let meta = t.sql_meta.get_or_init(|| Arc::new(Self::build_table_meta(t)));
+                Ok(Some(Arc::clone(meta)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn get_view(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<ViewMeta>> {
         if !Self::check_schema(schema) {
             return Ok(None);
@@ -575,7 +1623,7 @@ impl SqlCatalog for SqliteSqlCatalog<'_> {
         schema: Option<&str>,
         name: &str,
         hint: &TableScanHint,
-        _needed_columns: Option<&[usize]>,
+        needed_columns: Option<&[usize]>,
         meter: Option<&dyn Meter>,
     ) -> SqlResult<Vec<ScannedRow>> {
         if !Self::check_schema(schema) {
@@ -585,7 +1633,44 @@ impl SqlCatalog for SqliteSqlCatalog<'_> {
             )));
         }
         let reader = self.db.table(name).map_err(map_sqlite_err)?;
-        self.scan_with_virtuals(&reader, hint, meter)
+        self.scan_with_virtuals(&reader, hint, needed_columns, meter)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn visit_table(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        hint: &TableScanHint,
+        needed_columns: Option<&[usize]>,
+        meter: Option<&dyn Meter>,
+        visit: &mut dyn FnMut(Option<i64>, &[SqlValue]) -> SqlResult<bool>,
+    ) -> SqlResult<()> {
+        if !Self::check_schema(schema) {
+            return Err(SqlError::runtime(format!(
+                "no such table: {}.{name}",
+                schema.unwrap_or("")
+            )));
+        }
+        let reader = self.db.table(name).map_err(map_sqlite_err)?;
+        self.visit_with_virtuals(&reader, hint, needed_columns, meter, visit)
+    }
+
+    fn count_table_rows(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<u64>> {
+        if !Self::check_schema(schema) {
+            return Ok(None);
+        }
+        let reader = self.db.table(name).map_err(map_sqlite_err)?;
+        let cnt = reader.count().map_err(map_sqlite_err)?;
+        if let Some(m) = meter {
+            m.charge_steps(1 + (cnt / 64))?;
+        }
+        Ok(Some(cnt))
     }
 
     fn call_tvf(
@@ -611,7 +1696,7 @@ struct VirtualColumnPlan<'a> {
 }
 
 impl<'a> VirtualColumnPlan<'a> {
-    fn build(table: &'a TableInfo) -> SqlResult<Self> {
+    fn build_for(table: &'a TableInfo, needed_columns: Option<&[usize]>) -> SqlResult<Self> {
         let scope_cols: Vec<ScopeColumn> = table
             .columns
             .iter()
@@ -624,10 +1709,12 @@ impl<'a> VirtualColumnPlan<'a> {
             })
             .collect();
 
-        // Collect all VIRTUAL generated columns and their dependencies on other VIRTUAL columns.
+        // Collect only the requested VIRTUAL generated columns (or all if `needed_columns` is None).
         let mut virt_cids: Vec<usize> = Vec::new();
         for col in &table.columns {
-            if col.generated == Some(GeneratedKind::Virtual) {
+            if col.generated == Some(GeneratedKind::Virtual)
+                && needed_columns.is_none_or(|n| n.contains(&col.cid))
+            {
                 virt_cids.push(col.cid);
             }
         }
@@ -742,9 +1829,14 @@ fn bound_to_int(v: &SqlValue) -> Option<i64> {
 impl SqliteDatabase {
     /// Build default [`QueryOptions`] pre-wired with this database's text encoding and [`Meter`].
     pub fn default_query_options(&self) -> QueryOptions {
+        let meter = if self.btree().pager().is_noop_meter() {
+            None
+        } else {
+            Some(self.btree().pager().meter().clone())
+        };
         QueryOptions {
             collations: CollationRegistry::new(self.encoding()),
-            meter: Some(self.btree().pager().meter().clone()),
+            meter,
             ..QueryOptions::default()
         }
     }
@@ -771,14 +1863,40 @@ impl SqliteDatabase {
         if self.is_closed() {
             return Err(SqliteError::DatabaseClosed);
         }
-        let mut effective = options.clone();
-        if effective.meter.is_none() {
+        if options.meter.is_none() && !self.btree().pager().is_noop_meter() {
+            let mut effective = options.clone();
             effective.meter = Some(self.btree().pager().meter().clone());
+            let catalog = SqliteSqlCatalog {
+                db: self,
+                options: &effective,
+            };
+            return execute_query(&catalog, sql, params, &effective).map_err(SqliteError::from);
         }
-        let catalog = SqliteSqlCatalog {
-            db: self,
-            options: &effective,
-        };
-        execute_query(&catalog, sql, params, &effective).map_err(SqliteError::from)
+        let catalog = SqliteSqlCatalog { db: self, options };
+        execute_query(&catalog, sql, params, options).map_err(SqliteError::from)
+    }
+
+    /// Execute an already-parsed [`SelectStmt`] against this database (avoids re-parsing).
+    pub(crate) fn query_parsed_with_options(
+        &self,
+        stmt: &SelectStmt,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> SqliteResult<QueryResult> {
+        if self.is_closed() {
+            return Err(SqliteError::DatabaseClosed);
+        }
+        if options.meter.is_none() && !self.btree().pager().is_noop_meter() {
+            let mut effective = options.clone();
+            effective.meter = Some(self.btree().pager().meter().clone());
+            let catalog = SqliteSqlCatalog {
+                db: self,
+                options: &effective,
+            };
+            return execute_select_stmt(&catalog, stmt, params, &effective)
+                .map_err(SqliteError::from);
+        }
+        let catalog = SqliteSqlCatalog { db: self, options };
+        execute_select_stmt(&catalog, stmt, params, options).map_err(SqliteError::from)
     }
 }

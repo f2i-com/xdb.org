@@ -83,13 +83,14 @@ fn parse_statement_inner(
             Some(0),
         ));
     };
-    let mut s = Scanner::new(sql, options.dialect);
+    let mut s = Scanner::new_lazy(sql, options.dialect);
     let mut i = end;
     loop {
-        if let Some(m) = meter {
-            m.charge_steps(1).map_err(SqlParseError::from_limit)?;
-        }
         s.scan(i);
+        if let Some(m) = meter {
+            let steps = ((s.end.saturating_sub(i)) as u64 / 64).max(1);
+            m.charge_steps(steps).map_err(SqlParseError::from_limit)?;
+        }
         if s.kind == tk::EOF {
             break;
         }
@@ -98,7 +99,7 @@ fn parse_statement_inner(
                 "more than one statement",
                 SqlParseErrorKind::Unsupported,
                 Some(i),
-                Some(sql.len()),
+                Some(sql_end(sql)),
             ));
         }
         i = s.end;
@@ -126,6 +127,7 @@ fn parse_expression_inner(
     meter: Option<&dyn Meter>,
 ) -> ParseResult<Expr> {
     let select = Parser::new(sql, options, meter).parse_wrapped_expression()?;
+    let end_limit = sql_end(sql);
     if select.with.is_some()
         || select.order_by.is_some()
         || select.order_by_all.is_some()
@@ -135,7 +137,7 @@ fn parse_expression_inner(
             "not an expression",
             SqlParseErrorKind::Syntax,
             Some(0),
-            Some(sql.len()),
+            Some(end_limit),
         ));
     }
     let SelectBody::Values(mut values) = select.body else {
@@ -143,7 +145,7 @@ fn parse_expression_inner(
             "not an expression",
             SqlParseErrorKind::Syntax,
             Some(0),
-            Some(sql.len()),
+            Some(end_limit),
         ));
     };
     if values.rows.len() != 1 {
@@ -151,16 +153,20 @@ fn parse_expression_inner(
             "not an expression",
             SqlParseErrorKind::Syntax,
             Some(0),
-            Some(sql.len()),
+            Some(end_limit),
         ));
     }
     let mut items = values.rows.pop().unwrap().items;
     if items.len() != 1 {
         let at = items[0].span().end;
-        let mut s = Scanner::new(sql, options.dialect);
+        let mut s = Scanner::new_lazy(sql, options.dialect);
         let mut i = at;
         loop {
             s.scan(i);
+            if let Some(m) = meter {
+                let steps = ((s.end.saturating_sub(i)) as u64 / 64).max(1);
+                m.charge_steps(steps).map_err(SqlParseError::from_limit)?;
+            }
             if s.kind != tk::SPACE && s.kind != tk::COMMENT {
                 break;
             }

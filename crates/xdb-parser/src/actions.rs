@@ -36,11 +36,12 @@ pub(crate) struct TableArgs {
 
 #[derive(Debug)]
 pub(crate) struct OneSelect {
-    pub body: SelectBody,
     pub order_by: Option<Vec<OrderingTerm>>,
     pub order_by_all: Option<OrderByAll>,
     pub limit: Option<LimitClause>,
-    pub chain_heights: Vec<u32>,
+    pub prefix_max_h: u32,
+    pub last_h: u32,
+    pub chain_len: usize,
     pub coroutine: bool,
     pub last_row_no_affinity: bool,
     pub values: bool,
@@ -143,10 +144,10 @@ pub(crate) enum SemVal {
     Deferrable(DeferrableClause),
     InitDeferred(InitiallyDeferred),
     Generated {
-        expr: Expr,
+        expr: Box<Expr>,
         storage_token: Option<Name>,
     },
-    ColConstraint(ColumnConstraint),
+    ColConstraint(Box<ColumnConstraint>),
     ColConstraints(Vec<ColumnConstraint>),
     ColName {
         name: Name,
@@ -169,15 +170,16 @@ pub(crate) enum SemVal {
         replace: Option<Vec<StarReplacement>>,
     },
     StarReplacements(Vec<StarReplacement>),
-    FromSource(Box<FromSource>),
+    FromSource(Box<FromSource>, u32),
     StlPrefix {
         left: Box<FromSource>,
         op: JoinOperator,
+        count: u32,
     },
     FromTable(Box<FromTable>),
     JoinOp(JoinOperator),
     OnUsing {
-        on: Option<Expr>,
+        on: Option<Box<Expr>>,
         using: Option<Vec<Name>>,
     },
     IndexedBy {
@@ -185,7 +187,7 @@ pub(crate) enum SemVal {
         not_indexed: bool,
     },
     WhereReturning {
-        where_clause: Option<Expr>,
+        where_clause: Option<Box<Expr>>,
         returning: Option<Vec<ResultColumn>>,
     },
     SetClauses(Vec<SetClause>),
@@ -227,6 +229,7 @@ pub(crate) enum SemVal {
     TriggerStep(TriggerStep),
     AlterAdd(Box<AlterAddData>),
     VtabHead(Box<VtabHeadData>),
+    VtabArgSpan(Span),
     VtabArgs(Vec<VtabArg>),
     Stmt(Box<Statement>),
 }
@@ -345,8 +348,11 @@ pub fn dequote_number(token: &str) -> DequotedNumber {
                 prev.is_ascii_digit() && nxt.is_ascii_digit()
             };
             if !ok {
-                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                // Report snapshot ONCE on the first invalid `_` (matches SQLite `util.c:339`
+                // and prevents O(K*N) heap-churn DoS on tokens with many invalid underscores).
+                let end = token.len();
                 error = Some(String::from_utf8_lossy(&buf[..end]).into_owned());
+                break;
             }
         }
         if c == 0 {
@@ -354,7 +360,11 @@ pub fn dequote_number(token: &str) -> DequotedNumber {
         }
         i += 1;
     }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let len = if error.is_some() {
+        out
+    } else {
+        out.saturating_sub(1)
+    };
     DequotedNumber {
         text: String::from_utf8_lossy(&buf[..len]).into_owned(),
         is_float: if is_hex { false } else { is_float },
@@ -682,27 +692,30 @@ fn take_opt_result_cols(p: &mut Parser<'_>, k: usize) -> Option<Vec<ResultColumn
     }
 }
 
-fn take_from_source(p: &mut Parser<'_>, k: usize) -> FromSource {
+fn take_from_source_with_count(p: &mut Parser<'_>, k: usize) -> (FromSource, u32) {
     match take(p, k) {
-        SemVal::FromSource(f) => *f,
-        _ => FromSource::Table(FromTable {
-            span: Span::default(),
-            schema: None,
-            name: Name {
+        SemVal::FromSource(f, cnt) => (*f, cnt),
+        _ => (
+            FromSource::Table(FromTable {
                 span: Span::default(),
-                name: String::new(),
-                quote: QuoteStyle::None,
-            },
-            alias: None,
-            indexed_by: None,
-            not_indexed: false,
-        }),
+                schema: None,
+                name: Name {
+                    span: Span::default(),
+                    name: String::new(),
+                    quote: QuoteStyle::None,
+                },
+                alias: None,
+                indexed_by: None,
+                not_indexed: false,
+            }),
+            1,
+        ),
     }
 }
 
 fn take_opt_from_source(p: &mut Parser<'_>, k: usize) -> Option<FromSource> {
     match take(p, k) {
-        SemVal::FromSource(f) => Some(*f),
+        SemVal::FromSource(f, _) => Some(*f),
         _ => None,
     }
 }
@@ -830,8 +843,13 @@ fn take_pragma_text(p: &mut Parser<'_>, k: usize) -> String {
 
 // ─────────────────────────── domain helpers ───────────────────────────
 
+#[inline]
 fn select_height(one: &OneSelect) -> u32 {
-    one.chain_heights.iter().copied().max().unwrap_or(0)
+    if one.chain_len == 0 {
+        0
+    } else {
+        one.prefix_max_h.max(one.last_h)
+    }
 }
 
 fn double_link(p: &mut Parser<'_>, acc: &CompoundAcc) {
@@ -860,7 +878,10 @@ fn double_link(p: &mut Parser<'_>, acc: &CompoundAcc) {
             }
         }
     }
-    if !acc.last_values && acc.chain > 1 && acc.chain > p.max_compound {
+    let hard_max = p.max_compound.max(1000);
+    if (!acc.last_values && acc.chain > 1 && acc.chain > p.max_compound)
+        || (!acc.ops.is_empty() && acc.chain > hard_max)
+    {
         let rs = p.rs;
         let re = p.re;
         p.error(
@@ -877,11 +898,12 @@ fn finish_select(
     b: usize,
     acc_slot: usize,
     with_clause: Option<WithClause>,
+    with_h: u32,
 ) -> SemVal {
     let mut acc = take_compound_acc(p, acc_slot);
     double_link(p, &acc);
     let last = acc.terms.pop();
-    p.h[b] = p.h[acc_slot];
+    p.h[b] = p.h[acc_slot].max(with_h);
     p.f[b] = 0;
     let (order_by, order_by_all, limit) = match last {
         Some(l) => (l.order_by, l.order_by_all, l.limit),
@@ -897,11 +919,10 @@ fn finish_select(
     }))
 }
 
-fn single_acc(p: &mut Parser<'_>, b: usize, one: OneSelect) -> SemVal {
+fn single_acc(p: &mut Parser<'_>, b: usize, body: SelectBody, one: OneSelect) -> SemVal {
     p.h[b] = select_height(&one);
     p.f[b] = 0;
-    let body = one.body.clone();
-    let chain = one.chain_heights.len();
+    let chain = one.chain_len;
     let last_values = one.values;
     SemVal::CompoundAcc(Box::new(CompoundAcc {
         body,
@@ -975,9 +996,11 @@ fn one_select(
         p.h[s.columns.unwrap()]
     };
     for k in [
+        Some(s.from),
         Some(s.where_slot),
         s.group_by,
         Some(s.having),
+        s.window,
         Some(s.order_by),
         Some(s.limit),
     ]
@@ -1004,17 +1027,83 @@ fn one_select(
     single_acc(
         p,
         b,
+        SelectBody::Core(Box::new(core)),
         OneSelect {
-            body: SelectBody::Core(Box::new(core)),
             order_by,
             order_by_all,
             limit,
-            chain_heights: vec![h],
+            prefix_max_h: 0,
+            last_h: h,
+            chain_len: 1,
             coroutine: false,
             last_row_no_affinity: false,
             values: false,
         },
     )
+}
+
+#[inline]
+pub(crate) fn mvalues_append_in_place(p: &mut Parser<'_>, b: usize) {
+    let items = take_exprs(p, b + 3);
+    let row_h = p.h[b + 3];
+    let mut constant = true;
+    let mut any_aff = false;
+    for it in &items {
+        // Fast literal check avoids recursive `is_constant` + `has_affinity` on 99% of VALUES rows.
+        if matches!(
+            it,
+            Expr::Number(_)
+                | Expr::String(_)
+                | Expr::Blob(_)
+                | Expr::Null { .. }
+                | Expr::Boolean { .. }
+                | Expr::Variable(_)
+        ) {
+            continue;
+        }
+        if !is_constant(it) {
+            constant = false;
+            break;
+        }
+        if !any_aff && has_affinity(it) {
+            any_aff = true;
+        }
+    }
+    let row_no_aff = constant && !any_aff;
+    let row = ValuesRow {
+        span: Span::new(p.st[b + 2].max(0) as usize, p.en[b + 4].max(0) as usize),
+        items,
+    };
+    let row_end = row.span.end;
+    let has_with = p.has_with;
+    let schema_mode = p.schema_mode;
+    if let SemVal::CompoundAcc(ref mut acc) = p.v[b] {
+        if let SelectBody::Values(ref mut values) = acc.body {
+            values.rows.push(row);
+            values.span.end = row_end;
+        }
+        let one = &mut acc.terms[0];
+        let union_all =
+            has_with || schema_mode || !constant || (!one.coroutine && !one.last_row_no_affinity);
+        if union_all {
+            if one.chain_len > 0 {
+                one.prefix_max_h = one.prefix_max_h.max(one.last_h);
+            }
+            one.last_h = row_h;
+            one.chain_len += 1;
+            one.coroutine = false;
+            one.last_row_no_affinity = row_no_aff;
+        } else if !one.coroutine {
+            if one.chain_len > 0 {
+                one.last_h = 1;
+            }
+            one.coroutine = true;
+        }
+        one.values = !one.coroutine || one.chain_len > 1;
+        acc.chain = one.chain_len;
+        acc.last_values = one.values;
+        p.h[b] = select_height(one);
+    }
 }
 
 fn add_values_row(
@@ -1027,54 +1116,74 @@ fn add_values_row(
 ) -> SemVal {
     let items = take_exprs(p, row_slot);
     let row_h = p.h[row_slot];
-    let constant = items.iter().all(is_constant);
-    let row_no_aff = constant && !items.iter().any(has_affinity);
+    let mut constant = true;
+    let mut any_aff = false;
+    for it in &items {
+        if !is_constant(it) {
+            constant = false;
+            break;
+        }
+        if !any_aff && has_affinity(it) {
+            any_aff = true;
+        }
+    }
+    let row_no_aff = constant && !any_aff;
     let row = ValuesRow {
         span: Span::new(p.st[lp].max(0) as usize, p.en[rp].max(0) as usize),
         items,
     };
     let row_end = row.span.end;
-    let one = &mut acc.terms[0];
-    if let SelectBody::Values(ref mut values) = one.body {
+    if let SelectBody::Values(ref mut values) = acc.body {
         values.rows.push(row);
         values.span.end = row_end;
     }
+    let one = &mut acc.terms[0];
     let union_all = p.has_with
         || p.schema_mode
         || !constant
         || (!one.coroutine && !one.last_row_no_affinity);
     if union_all {
-        one.chain_heights.push(row_h);
+        if one.chain_len > 0 {
+            one.prefix_max_h = one.prefix_max_h.max(one.last_h);
+        }
+        one.last_h = row_h;
+        one.chain_len += 1;
         one.coroutine = false;
         one.last_row_no_affinity = row_no_aff;
     } else if !one.coroutine {
-        if let Some(last) = one.chain_heights.last_mut() {
-            *last = 1;
+        if one.chain_len > 0 {
+            one.last_h = 1;
         }
         one.coroutine = true;
     }
-    one.values = !one.coroutine || one.chain_heights.len() > 1;
-    acc.chain = one.chain_heights.len();
+    one.values = !one.coroutine || one.chain_len > 1;
+    acc.chain = one.chain_len;
     acc.last_values = one.values;
-    acc.body = one.body.clone();
     p.h[b] = select_height(one);
     SemVal::CompoundAcc(acc)
 }
+
+/// Maximum tables allowed in a single SQLite join (`SQLITE_MAX_JOIN_TABLES = 64`).
+const MAX_JOIN_TABLES: u32 = 64;
 
 fn append_from_term(
     p: &mut Parser<'_>,
     prefix_slot: usize,
     term: FromSource,
+    term_h: u32,
+    term_count: u32,
     on_using_slot: usize,
 ) -> SemVal {
+    let h = p.h[prefix_slot].max(term_h).max(p.h[on_using_slot]);
     let prefix = match take(p, prefix_slot) {
-        SemVal::StlPrefix { left, op } => Some((left, op)),
+        SemVal::StlPrefix { left, op, count } => Some((left, op, count)),
         _ => None,
     };
     let (on, using) = match take(p, on_using_slot) {
-        SemVal::OnUsing { on, using } => (on, using),
+        SemVal::OnUsing { on, using } => (on.map(|b| *b), using),
         _ => (None, None),
     };
+    p.h[prefix_slot] = h;
     match prefix {
         None => {
             if on.is_some() || using.is_some() {
@@ -1088,9 +1197,21 @@ fn append_from_term(
                     SqlParseErrorKind::Syntax,
                 );
             }
-            SemVal::FromSource(Box::new(term))
+            SemVal::FromSource(Box::new(term), term_count)
         }
-        Some((left, operator)) => {
+        Some((left, operator, left_count)) => {
+            let total_count = left_count.saturating_add(term_count);
+            if total_count > MAX_JOIN_TABLES {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "at most 64 tables in a join",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Limit,
+                );
+                return SemVal::FromSource(left, total_count);
+            }
             if (operator.flags & join_flag::NATURAL) != 0 && (on.is_some() || using.is_some()) {
                 p.error(
                     "a NATURAL join may not have an ON or USING clause".to_string(),
@@ -1101,14 +1222,17 @@ fn append_from_term(
             }
             let start = left.span().start;
             let end = p.re.max(0) as usize;
-            SemVal::FromSource(Box::new(FromSource::Join {
-                span: Span::new(start, end),
-                left,
-                operator,
-                right: Box::new(term),
-                on: on.map(Box::new),
-                using,
-            }))
+            SemVal::FromSource(
+                Box::new(FromSource::Join {
+                    span: Span::new(start, end),
+                    left,
+                    operator,
+                    right: Box::new(term),
+                    on: on.map(Box::new),
+                    using,
+                }),
+                total_count,
+            )
         }
     }
 }
@@ -1220,35 +1344,37 @@ fn build_column_def(p: &mut Parser<'_>, name_slot: usize, carg_slot: usize) -> C
     }
 }
 
-fn check_text(p: &Parser<'_>, lp_slot: usize, rp_slot: usize) -> String {
+fn check_text(p: &mut Parser<'_>, lp_slot: usize, rp_slot: usize) -> String {
     let (a, z) = trimmed(
         p.sql,
         p.en[lp_slot].max(0) as usize,
         p.st[rp_slot].max(0) as usize,
     );
-    p.sql[a..z].to_string()
+    p.alloc_sql_slice(a, z)
 }
 
 fn default_constraint(
-    p: &Parser<'_>,
+    p: &mut Parser<'_>,
     form: DefaultForm,
     expr: Expr,
     text_start: usize,
     text_end: usize,
 ) -> SemVal {
     let (a, z) = trimmed(p.sql, text_start, text_end);
-    SemVal::ColConstraint(ColumnConstraint::Default {
+    let name = p.clone_constraint_name();
+    let text = p.alloc_sql_slice(a, z);
+    SemVal::ColConstraint(Box::new(ColumnConstraint::Default {
         span: p.rule_span(),
-        name: p.constraint_name.clone(),
+        name,
         form,
         expr,
-        text: p.sql[a..z].to_string(),
+        text,
         text_span: Span::new(a, z),
-    })
+    }))
 }
 
 fn build_generated_constraint(
-    p: &Parser<'_>,
+    p: &mut Parser<'_>,
     expr: Expr,
     storage_token: Option<Name>,
     always: bool,
@@ -1263,14 +1389,15 @@ fn build_generated_constraint(
             None
         }
     });
-    SemVal::ColConstraint(ColumnConstraint::Generated {
+    let name = p.clone_constraint_name();
+    SemVal::ColConstraint(Box::new(ColumnConstraint::Generated {
         span: p.rule_span(),
-        name: p.constraint_name.clone(),
+        name,
         expr,
         storage_token,
         storage,
         always,
-    })
+    }))
 }
 
 fn variable_number(p: &mut Parser<'_>, z: &str, s: usize, e: usize) -> usize {
@@ -1354,7 +1481,13 @@ fn function_call(
             SqlParseErrorKind::Limit,
         );
     }
-    let ha = args_slot.map(|k| p.h[k]).unwrap_or(0);
+    let mut ha = args_slot.map(|k| p.h[k]).unwrap_or(0);
+    if let Some(k) = order_by_slot {
+        ha = ha.max(p.h[k]);
+    }
+    if let Some(k) = filter_over_slot {
+        ha = ha.max(p.h[k]);
+    }
     let fa = args_slot.map(|k| p.f[k]).unwrap_or(0);
     let rs = p.rs;
     let re = p.re;
@@ -1829,18 +1962,13 @@ fn alter_action(p: &mut Parser<'_>, b: usize, action: AlterTableAction) -> SemVa
 
 // ─────────────────────────── main dispatch ───────────────────────────
 
+#[inline]
 pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemVal {
     match action {
         ActionId::PassThrough | ActionId::Pass0 => take(p, b),
         ActionId::Nul => SemVal::Empty,
         ActionId::Yes => SemVal::Bool(true),
         ActionId::No => SemVal::Bool(false),
-        ActionId::EmptyTableOptions => SemVal::TableOptions(Vec::new()),
-        ActionId::EmptyColConstraints => SemVal::ColConstraints(Vec::new()),
-        ActionId::EmptyTableConstraints => SemVal::TableConstraints(Vec::new()),
-        ActionId::EmptyResultCols => SemVal::ResultCols(Vec::new()),
-        ActionId::EmptyExprs => SemVal::Exprs(Vec::new()),
-        ActionId::EmptyVtabArgs => SemVal::VtabArgs(Vec::new()),
         ActionId::Pass1 => {
             p.h[b] = p.h[b + 1];
             p.f[b] = p.f[b + 1];
@@ -1851,6 +1979,74 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             p.f[b] = p.f[b + 2];
             take(p, b + 2)
         }
+        ActionId::ScanPt => SemVal::Usize(p.look_start),
+        ActionId::TermInteger => {
+            let z = text(p, b);
+            let zb = z.as_bytes();
+            let is_hex = zb.len() > 1 && zb[0] == b'0' && (zb[1] | 0x20) == b'x';
+            p.h[b] = 1;
+            p.f[b] = if is_zero_integer(z) { FALSE } else { 0 };
+            SemVal::Expr(Expr::Number(NumberLiteral {
+                span: p.rule_span(),
+                text: z.to_string(),
+                is_float: false,
+                is_hex,
+                separators: false,
+            }))
+        }
+        ActionId::TermString => {
+            p.h[b] = 1;
+            SemVal::Expr(Expr::String(StringLiteral {
+                span: p.rule_span(),
+                value: dequote(text(p, b)),
+            }))
+        }
+        ActionId::ExprColumn1 => {
+            p.h[b] = 1;
+            SemVal::Expr(Expr::Column(ColumnRef {
+                span: p.rule_span(),
+                schema: None,
+                table: None,
+                column: tok_name(p, b),
+            }))
+        }
+        ActionId::NExprListSingle => {
+            p.f[b] &= FUNC;
+            let mut list = Vec::with_capacity(2);
+            list.push(take_expr(p, b));
+            SemVal::Exprs(list)
+        }
+        ActionId::ParenExprList => {
+            p.h[b] = p.h[b + 1];
+            p.f[b] = p.f[b + 1] & FUNC;
+            SemVal::Exprs(take_exprs(p, b + 1))
+        }
+        _ => run_action_cold(action, p, b),
+    }
+}
+
+#[inline(never)]
+fn run_action_cold(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemVal {
+    match action {
+        ActionId::PassThrough
+        | ActionId::Pass0
+        | ActionId::Nul
+        | ActionId::Yes
+        | ActionId::No
+        | ActionId::Pass1
+        | ActionId::Pass2
+        | ActionId::ScanPt
+        | ActionId::TermInteger
+        | ActionId::TermString
+        | ActionId::ExprColumn1
+        | ActionId::NExprListSingle
+        | ActionId::ParenExprList => unreachable!(),
+        ActionId::EmptyTableOptions => SemVal::TableOptions(Vec::new()),
+        ActionId::EmptyColConstraints => SemVal::ColConstraints(Vec::new()),
+        ActionId::EmptyTableConstraints => SemVal::TableConstraints(Vec::new()),
+        ActionId::EmptyResultCols => SemVal::ResultCols(Vec::new()),
+        ActionId::EmptyExprs => SemVal::Exprs(Vec::new()),
+        ActionId::EmptyVtabArgs => SemVal::VtabArgs(Vec::new()),
 
         // ── command list ──
         ActionId::Explain => {
@@ -2055,34 +2251,39 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         // ── typetoken / signed ──
         ActionId::TypeNamePlain => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
+                text,
                 args: Vec::new(),
             })
         }
         ActionId::TypeToken1 => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
+            let a1 = p.alloc_sql_slice(p.st[b + 2].max(0) as usize, p.en[b + 2].max(0) as usize);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
-                args: vec![text(p, b + 2).to_string()],
+                text,
+                args: vec![a1],
             })
         }
         ActionId::TypeToken2 => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
+            let a1 = p.alloc_sql_slice(p.st[b + 2].max(0) as usize, p.en[b + 2].max(0) as usize);
+            let a2 = p.alloc_sql_slice(p.st[b + 4].max(0) as usize, p.en[b + 4].max(0) as usize);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
-                args: vec![text(p, b + 2).to_string(), text(p, b + 4).to_string()],
+                text,
+                args: vec![a1, a2],
             })
         }
         ActionId::PlusNumSigned => SemVal::Str(text(p, b + 1).to_string()),
         ActionId::PlusNumPlain => SemVal::Str(text(p, b).to_string()),
         ActionId::MinusNum => SemVal::Str(format!("-{}", text(p, b + 1))),
 
-        // ── scanpt / scantok ──
-        ActionId::ScanPt => SemVal::Usize(p.look_start),
+        // ── scanpt / scantok (ScanPt handled in hot dispatch) ──
 
         // ── column constraints ──
         ActionId::CargListAppend => {
@@ -2091,7 +2292,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 _ => Vec::new(),
             };
             if let SemVal::ColConstraint(c) = take(p, b + 1) {
-                list.push(c);
+                list.push(*c);
             }
             SemVal::ColConstraints(list)
         }
@@ -2163,35 +2364,52 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             };
             default_constraint(p, DefaultForm::Identifier, expr, s, e)
         }
-        ActionId::CconsNull => SemVal::ColConstraint(ColumnConstraint::Null {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            on_conflict: take_opt_conflict(p, b + 1),
-        }),
-        ActionId::CconsNotNull => SemVal::ColConstraint(ColumnConstraint::NotNull {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            on_conflict: take_opt_conflict(p, b + 2),
-        }),
-        ActionId::CconsPrimaryKey => SemVal::ColConstraint(ColumnConstraint::PrimaryKey {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            order: take_opt_sort_order(p, b + 2),
-            on_conflict: take_opt_conflict(p, b + 3),
-            autoincrement: take_bool(p, b + 4),
-        }),
-        ActionId::CconsUnique => SemVal::ColConstraint(ColumnConstraint::Unique {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            on_conflict: take_opt_conflict(p, b + 1),
-        }),
-        ActionId::CconsCheck => SemVal::ColConstraint(ColumnConstraint::Check(CheckConstraint {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            expr: take_expr(p, b + 2),
-            text: check_text(p, b + 1, b + 3),
-            on_conflict: None,
-        })),
+        ActionId::CconsNull => {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::Null {
+                span: p.rule_span(),
+                name,
+                on_conflict: take_opt_conflict(p, b + 1),
+            }))
+        }
+        ActionId::CconsNotNull => {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::NotNull {
+                span: p.rule_span(),
+                name,
+                on_conflict: take_opt_conflict(p, b + 2),
+            }))
+        }
+        ActionId::CconsPrimaryKey => {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::PrimaryKey {
+                span: p.rule_span(),
+                name,
+                order: take_opt_sort_order(p, b + 2),
+                on_conflict: take_opt_conflict(p, b + 3),
+                autoincrement: take_bool(p, b + 4),
+            }))
+        }
+        ActionId::CconsUnique => {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::Unique {
+                span: p.rule_span(),
+                name,
+                on_conflict: take_opt_conflict(p, b + 1),
+            }))
+        }
+        ActionId::CconsCheck => {
+            let name = p.clone_constraint_name();
+            let expr = take_expr(p, b + 2);
+            let text = check_text(p, b + 1, b + 3);
+            SemVal::ColConstraint(Box::new(ColumnConstraint::Check(CheckConstraint {
+                span: p.rule_span(),
+                name,
+                expr,
+                text,
+                on_conflict: None,
+            })))
+        }
         ActionId::CconsReferences => {
             let (on_delete, on_update, match_name) = match take(p, b + 3) {
                 SemVal::RefArgs {
@@ -2202,9 +2420,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 _ => (None, None, None),
             };
             let span = p.rule_span();
-            SemVal::ColConstraint(ColumnConstraint::References {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::References {
                 span,
-                name: p.constraint_name.clone(),
+                name,
                 clause: ForeignKeyClause {
                     span,
                     table: take_name(p, b + 1),
@@ -2214,41 +2433,45 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                     match_name,
                     deferrable: None,
                 },
-            })
+            }))
         }
         ActionId::CconsDeferrable => {
             let clause = take_opt_deferrable(p, b).unwrap();
-            SemVal::ColConstraint(ColumnConstraint::Deferrable {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::Deferrable {
                 span: p.rule_span(),
-                name: p.constraint_name.clone(),
+                name,
                 clause,
-            })
+            }))
         }
-        ActionId::CconsCollate => SemVal::ColConstraint(ColumnConstraint::Collate {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            collation: tok_name(p, b + 1),
-        }),
+        ActionId::CconsCollate => {
+            let name = p.clone_constraint_name();
+            SemVal::ColConstraint(Box::new(ColumnConstraint::Collate {
+                span: p.rule_span(),
+                name,
+                collation: tok_name(p, b + 1),
+            }))
+        }
         ActionId::CconsGeneratedAlways => match take(p, b + 3) {
             SemVal::Generated {
                 expr,
                 storage_token,
-            } => build_generated_constraint(p, expr, storage_token, true),
+            } => build_generated_constraint(p, *expr, storage_token, true),
             _ => unreachable!(),
         },
         ActionId::CconsGeneratedShort => match take(p, b + 1) {
             SemVal::Generated {
                 expr,
                 storage_token,
-            } => build_generated_constraint(p, expr, storage_token, false),
+            } => build_generated_constraint(p, *expr, storage_token, false),
             _ => unreachable!(),
         },
         ActionId::GeneratedNoStorage => SemVal::Generated {
-            expr: take_expr(p, b + 1),
+            expr: Box::new(take_expr(p, b + 1)),
             storage_token: None,
         },
         ActionId::GeneratedWithStorage => SemVal::Generated {
-            expr: take_expr(p, b + 1),
+            expr: Box::new(take_expr(p, b + 1)),
             storage_token: Some(tok_name(p, b + 3)),
         },
         ActionId::RefArgsEmpty => SemVal::RefArgs {
@@ -2345,27 +2568,35 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             SemVal::TableConstraints(Vec::new())
         }
         ActionId::TconsPrimaryKey => {
+            let name = p.clone_constraint_name();
             SemVal::TableConstraints(vec![TableConstraint::PrimaryKey {
                 span: p.rule_span(),
-                name: p.constraint_name.clone(),
+                name,
                 columns: take_ordering_terms(p, b + 3),
                 autoincrement: take_bool(p, b + 4),
                 on_conflict: take_opt_conflict(p, b + 6),
             }])
         }
-        ActionId::TconsUnique => SemVal::TableConstraints(vec![TableConstraint::Unique {
-            span: p.rule_span(),
-            name: p.constraint_name.clone(),
-            columns: take_ordering_terms(p, b + 2),
-            on_conflict: take_opt_conflict(p, b + 4),
-        }]),
+        ActionId::TconsUnique => {
+            let name = p.clone_constraint_name();
+            SemVal::TableConstraints(vec![TableConstraint::Unique {
+                span: p.rule_span(),
+                name,
+                columns: take_ordering_terms(p, b + 2),
+                on_conflict: take_opt_conflict(p, b + 4),
+            }])
+        }
         ActionId::TconsCheck => {
+            let name = p.clone_constraint_name();
+            let expr = take_expr(p, b + 2);
+            let text = check_text(p, b + 1, b + 3);
+            let on_conflict = take_opt_conflict(p, b + 4);
             SemVal::TableConstraints(vec![TableConstraint::Check(CheckConstraint {
                 span: p.rule_span(),
-                name: p.constraint_name.clone(),
-                expr: take_expr(p, b + 2),
-                text: check_text(p, b + 1, b + 3),
-                on_conflict: take_opt_conflict(p, b + 4),
+                name,
+                expr,
+                text,
+                on_conflict,
             })])
         }
         ActionId::TconsForeignKey => {
@@ -2377,9 +2608,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 } => (on_delete, on_update, match_name),
                 _ => (None, None, None),
             };
+            let name = p.clone_constraint_name();
             SemVal::TableConstraints(vec![TableConstraint::ForeignKey {
                 span: p.rule_span(),
-                name: p.constraint_name.clone(),
+                name,
                 columns: take_id_list_items(p, b + 3),
                 clause: ForeignKeyClause {
                     span: Span::new(p.st[b + 5].max(0) as usize, p.re.max(0) as usize),
@@ -2456,6 +2688,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
 
         // ── SELECT ──
         ActionId::SelectWith => {
+            let with_h = p.h[b + 1];
             let ctes = match take(p, b + 1) {
                 SemVal::Ctes(v) => v,
                 _ => Vec::new(),
@@ -2465,9 +2698,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 recursive: false,
                 ctes,
             };
-            finish_select(p, b, b + 2, Some(w))
+            finish_select(p, b, b + 2, Some(w), with_h)
         }
         ActionId::SelectWithRecursive => {
+            let with_h = p.h[b + 2];
             let ctes = match take(p, b + 2) {
                 SemVal::Ctes(v) => v,
                 _ => Vec::new(),
@@ -2477,9 +2711,9 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 recursive: true,
                 ctes,
             };
-            finish_select(p, b, b + 3, Some(w))
+            finish_select(p, b, b + 3, Some(w), with_h)
         }
-        ActionId::SelectNoWith => finish_select(p, b, b, None),
+        ActionId::SelectNoWith => finish_select(p, b, b, None, 0),
         ActionId::SelectCompound => {
             let mut acc = take_compound_acc(p, b);
             let op = match take(p, b + 1) {
@@ -2488,14 +2722,26 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             };
             let mut rhs_acc = take_compound_acc(p, b + 2);
             let one = rhs_acc.terms.remove(0);
-            let mut h = select_height(&one);
+            let h = select_height(&one);
             let mut values = one.values;
-            if one.chain_heights.len() > 1 {
-                h = 1;
+            if one.chain_len > 1 {
                 values = false;
             }
+            acc.chain = acc.chain.saturating_add(1);
+            let hard_max = p.max_compound.max(1000);
+            if acc.chain > hard_max {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "too many terms in compound SELECT",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Syntax,
+                );
+                return SemVal::CompoundAcc(acc);
+            }
             let left_start = acc.body.span().start;
-            let right_end = one.body.span().end;
+            let right_end = rhs_acc.body.span().end;
             let left = std::mem::replace(
                 &mut acc.body,
                 SelectBody::Values(ValuesClause {
@@ -2507,11 +2753,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 span: Span::new(left_start, right_end),
                 op,
                 left: Box::new(left),
-                right: Box::new(one.body.clone()),
+                right: Box::new(rhs_acc.body),
             };
             acc.terms.push(one);
             acc.ops.push(op);
-            acc.chain += 1;
             acc.last_values = values;
             if h > p.h[b] {
                 p.h[b] = h;
@@ -2565,8 +2810,18 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         ActionId::ValuesSingle => {
             let items = take_exprs(p, b + 2);
             let h = p.h[b + 2];
-            let constant = items.iter().all(is_constant);
-            let no_aff = constant && !items.iter().any(has_affinity);
+            let mut constant = true;
+            let mut any_aff = false;
+            for it in &items {
+                if !is_constant(it) {
+                    constant = false;
+                    break;
+                }
+                if !any_aff && has_affinity(it) {
+                    any_aff = true;
+                }
+            }
+            let no_aff = constant && !any_aff;
             let row = ValuesRow {
                 span: Span::new(p.st[b + 1].max(0) as usize, p.en[b + 3].max(0) as usize),
                 items,
@@ -2578,12 +2833,14 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             single_acc(
                 p,
                 b,
+                SelectBody::Values(values),
                 OneSelect {
-                    body: SelectBody::Values(values),
                     order_by: None,
                     order_by_all: None,
                     limit: None,
-                    chain_heights: vec![h],
+                    prefix_max_h: 0,
+                    last_h: h,
+                    chain_len: 1,
                     coroutine: false,
                     last_row_no_affinity: no_aff,
                     values: true,
@@ -2609,11 +2866,12 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             } else {
                 expr.span().end
             };
+            let text = p.alloc_sql_slice(a, z);
             list.push(ResultColumn::Expr(ResultExpr {
                 span: Span::new(start, end),
                 expr,
                 alias,
-                text: p.sql[a..z].to_string(),
+                text,
             }));
             let h = p.h[b + 2];
             if h > p.h[b] {
@@ -2652,7 +2910,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
 
         // ── FROM ──
         ActionId::StlPrefix => {
-            let left = Box::new(take_from_source(p, b));
+            let (left, count) = take_from_source_with_count(p, b);
             let op = match take(p, b + 1) {
                 SemVal::JoinOp(j) => j,
                 _ => JoinOperator {
@@ -2661,11 +2919,15 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                     flags: join_flag::INNER,
                 },
             };
-            SemVal::StlPrefix { left, op }
+            SemVal::StlPrefix {
+                left: Box::new(left),
+                op,
+                count,
+            }
         }
         ActionId::SelTabTable => {
             let term = from_table(p, b + 1, b + 3, None);
-            append_from_term(p, b, term, b + 4)
+            append_from_term(p, b, term, 0, 1, b + 4)
         }
         ActionId::SelTabTableIndexed => {
             let indexed = match take(p, b + 4) {
@@ -2676,9 +2938,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 _ => None,
             };
             let term = from_table(p, b + 1, b + 4, indexed);
-            append_from_term(p, b, term, b + 5)
+            append_from_term(p, b, term, 0, 1, b + 5)
         }
         ActionId::SelTabFunction => {
+            let term_h = p.h[b + 4];
             let (schema, name) = nm_dbnm(take_name(p, b + 1), take_opt_name(p, b + 2));
             let args = take_exprs(p, b + 4);
             let alias = take_opt_name(p, b + 6);
@@ -2690,25 +2953,38 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 args,
                 alias,
             });
-            append_from_term(p, b, term, b + 7)
+            append_from_term(p, b, term, term_h, 1, b + 7)
         }
         ActionId::SelTabSubquery => {
+            let term_h = p.h[b + 2].saturating_add(1);
+            if p.n_err == 0 {
+                let rs = p.rs;
+                let re = p.re;
+                p.check_height(term_h, rs, re);
+            }
             let span = span_slots(p, b + 1, b + 4);
             let term = FromSource::Subquery(FromSubquery {
                 span,
                 select: Box::new(take_select(p, b + 2)),
                 alias: take_opt_name(p, b + 4),
             });
-            append_from_term(p, b, term, b + 5)
+            append_from_term(p, b, term, term_h, 1, b + 5)
         }
         ActionId::SelTabGroup => {
+            let term_h = p.h[b + 2].saturating_add(1);
+            if p.n_err == 0 {
+                let rs = p.rs;
+                let re = p.re;
+                p.check_height(term_h, rs, re);
+            }
             let span = span_slots(p, b + 1, b + 4);
+            let (inner, inner_count) = take_from_source_with_count(p, b + 2);
             let term = FromSource::Group(FromGroup {
                 span,
-                source: Box::new(take_from_source(p, b + 2)),
+                source: Box::new(inner),
                 alias: take_opt_name(p, b + 4),
             });
-            append_from_term(p, b, term, b + 5)
+            append_from_term(p, b, term, term_h, inner_count, b + 5)
         }
         ActionId::XFullName1 => xfullname_action(p, None, b, None),
         ActionId::XFullName2 => xfullname_action(p, Some(b), b + 2, None),
@@ -2752,10 +3028,13 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 flags,
             })
         }
-        ActionId::OnUsingOn => SemVal::OnUsing {
-            on: Some(take_expr(p, b + 1)),
-            using: None,
-        },
+        ActionId::OnUsingOn => {
+            p.h[b] = p.h[b + 1];
+            SemVal::OnUsing {
+                on: Some(Box::new(take_expr(p, b + 1))),
+                using: None,
+            }
+        }
         ActionId::OnUsingUsing => SemVal::OnUsing {
             on: None,
             using: Some(take_names(p, b + 2)),
@@ -2824,7 +3103,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             returning: None,
         },
         ActionId::WhereRetWhere => SemVal::WhereReturning {
-            where_clause: Some(take_expr(p, b + 1)),
+            where_clause: Some(Box::new(take_expr(p, b + 1))),
             returning: None,
         },
         ActionId::WhereRetReturning => SemVal::WhereReturning {
@@ -2832,7 +3111,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             returning: Some(take_result_cols(p, b + 1)),
         },
         ActionId::WhereRetBoth => SemVal::WhereReturning {
-            where_clause: Some(take_expr(p, b + 1)),
+            where_clause: Some(Box::new(take_expr(p, b + 1))),
             returning: Some(take_result_cols(p, b + 3)),
         },
         ActionId::CmdDelete => {
@@ -2843,7 +3122,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::WhereReturning {
                     where_clause,
                     returning,
-                } => (where_clause, returning),
+                } => (where_clause.map(|e| *e), returning),
                 _ => (None, None),
             };
             SemVal::Stmt(Box::new(Statement::Delete(Box::new(DeleteStmt {
@@ -2876,7 +3155,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::WhereReturning {
                     where_clause,
                     returning,
-                } => (where_clause, returning),
+                } => (where_clause.map(|e| *e), returning),
                 _ => (None, None),
             };
             SemVal::Stmt(Box::new(Statement::Update(Box::new(UpdateStmt {
@@ -2914,10 +3193,11 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             let table = take_from_table(p, b + 3);
             let columns = take_opt_names(p, b + 4);
             let select = Some(Box::new(take_select(p, b + 5)));
-            let (upsert, returning) = match take(p, b + 6) {
+            let (mut upsert, returning) = match take(p, b + 6) {
                 SemVal::Upsert { clauses, returning } => (clauses, returning),
                 _ => (Vec::new(), None),
             };
+            upsert.reverse();
             SemVal::Stmt(Box::new(Statement::Insert(Box::new(InsertStmt {
                 span: p.rule_span(),
                 with,
@@ -2958,10 +3238,22 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             clauses: Vec::new(),
             returning: None,
         },
-        ActionId::UpsertReturning => SemVal::Upsert {
-            clauses: Vec::new(),
-            returning: Some(take_result_cols(p, b + 1)),
-        },
+        ActionId::UpsertReturning => {
+            if p.in_trigger {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "cannot use RETURNING in a trigger",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Syntax,
+                );
+            }
+            SemVal::Upsert {
+                clauses: Vec::new(),
+                returning: Some(take_result_cols(p, b + 1)),
+            }
+        }
         ActionId::UpsertTargetUpdate => {
             let c = UpsertClause {
                 span: span_slots(p, b, b + 10),
@@ -2975,10 +3267,11 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::Upsert { clauses, returning } => (clauses, returning),
                 _ => (Vec::new(), None),
             };
-            let mut clauses = Vec::with_capacity(rest.len() + 1);
-            clauses.push(c);
-            clauses.append(&mut rest);
-            SemVal::Upsert { clauses, returning }
+            rest.push(c);
+            SemVal::Upsert {
+                clauses: rest,
+                returning,
+            }
         }
         ActionId::UpsertTargetNothing => {
             let c = UpsertClause {
@@ -2993,10 +3286,11 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::Upsert { clauses, returning } => (clauses, returning),
                 _ => (Vec::new(), None),
             };
-            let mut clauses = Vec::with_capacity(rest.len() + 1);
-            clauses.push(c);
-            clauses.append(&mut rest);
-            SemVal::Upsert { clauses, returning }
+            rest.push(c);
+            SemVal::Upsert {
+                clauses: rest,
+                returning,
+            }
         }
         ActionId::UpsertCatchAllNothing => SemVal::Upsert {
             clauses: vec![UpsertClause {
@@ -3020,7 +3314,19 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             }],
             returning: take_opt_result_cols(p, b + 7),
         },
-        ActionId::Returning => SemVal::ResultCols(take_result_cols(p, b + 1)),
+        ActionId::Returning => {
+            if p.in_trigger {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "cannot use RETURNING in a trigger",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Syntax,
+                );
+            }
+            SemVal::ResultCols(take_result_cols(p, b + 1))
+        }
         ActionId::InsertCmdInsert => SemVal::InsertCmd {
             or_conflict: take_opt_conflict(p, b + 1),
             replace_into: false,
@@ -3037,15 +3343,6 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         ActionId::IdListSingle => SemVal::Names(vec![take_name(p, b)]),
 
         // ── expressions ──
-        ActionId::ExprColumn1 => {
-            p.h[b] = 1;
-            SemVal::Expr(Expr::Column(ColumnRef {
-                span: p.rule_span(),
-                schema: None,
-                table: None,
-                column: tok_name(p, b),
-            }))
-        }
         ActionId::ExprColumn2 => {
             set_pexpr(p, b, 2, 0);
             SemVal::Expr(Expr::Column(ColumnRef {
@@ -3097,27 +3394,6 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                     value,
                 }))
             }
-        }
-        ActionId::TermString => {
-            p.h[b] = 1;
-            SemVal::Expr(Expr::String(StringLiteral {
-                span: p.rule_span(),
-                value: dequote(text(p, b)),
-            }))
-        }
-        ActionId::TermInteger => {
-            let z = text(p, b);
-            let zb = z.as_bytes();
-            let is_hex = zb.len() > 1 && zb[0] == b'0' && (zb[1] | 0x20) == b'x';
-            p.h[b] = 1;
-            p.f[b] = if is_zero_integer(z) { FALSE } else { 0 };
-            SemVal::Expr(Expr::Number(NumberLiteral {
-                span: p.rule_span(),
-                text: z.to_string(),
-                is_float: false,
-                is_hex,
-                separators: false,
-            }))
         }
         ActionId::TermQnumber => {
             let r = dequote_number(text(p, b));
@@ -3237,7 +3513,13 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             let mut items = take_exprs(p, b + 1);
             items.push(take_expr(p, b + 3));
             let item_height = p.h[b + 1].max(p.h[b + 3]);
-            p.h[b] = 1;
+            let h = item_height + 1;
+            let rs = p.rs;
+            let re = p.re;
+            if p.n_err == 0 {
+                p.check_height(h, rs, re);
+            }
+            p.h[b] = h;
             p.f[b] = (p.f[b + 1] | p.f[b + 3]) & FUNC;
             SemVal::Expr(Expr::Vector {
                 span: p.rule_span(),
@@ -3310,18 +3592,38 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             let plus = take_tok(p, b) == tk::PLUS;
             let ho = p.h[b + 1];
             let fo = p.f[b + 1];
+            let op_new = if plus { UnaryOp::Pos } else { UnaryOp::Neg };
+            // Match SQLite's `parse.y` in-place `TK_UPLUS` rewrite: both `+ (+ x)` and `- (+ x)`
+            // overwrite the inner `TK_UPLUS` node's operator in place without increasing depth
+            // (so `- + 9223372036854775808` becomes `Unary(Neg, Number("9223372036854775808"))`
+            // -> integer `i64::MIN`, and `- + 0x8000000000000000` -> hex literal too big).
             if (fo & UPLUS) != 0 {
                 p.h[b] = ho;
                 p.f[b] = (fo & FUNC) | if plus { UPLUS } else { 0 };
-            } else {
-                set_pexpr(p, b, ho + 1, fo);
-                if plus {
-                    p.f[b] |= UPLUS;
+                let mut inner = take_expr(p, b + 1);
+                if let Expr::Unary {
+                    ref mut op,
+                    ref mut span,
+                    ..
+                } = inner
+                {
+                    *op = op_new;
+                    *span = p.rule_span();
+                    return SemVal::Expr(inner);
                 }
+                return SemVal::Expr(Expr::Unary {
+                    span: p.rule_span(),
+                    op: op_new,
+                    operand: Box::new(inner),
+                });
+            }
+            set_pexpr(p, b, ho + 1, fo);
+            if plus {
+                p.f[b] |= UPLUS;
             }
             SemVal::Expr(Expr::Unary {
                 span: p.rule_span(),
-                op: if plus { UnaryOp::Pos } else { UnaryOp::Neg },
+                op: op_new,
                 operand: Box::new(take_expr(p, b + 1)),
             })
         }
@@ -3413,9 +3715,11 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         ActionId::ExprInTable => {
             let not = take_bool(p, b + 1);
             let (schema, table) = nm_dbnm(take_name(p, b + 2), take_opt_name(p, b + 3));
+            let args = take_opt_exprs(p, b + 4);
+            let h_args = if args.is_some() { p.h[b + 4] } else { 0 };
             let rs = p.rs;
             let re = p.re;
-            let mut h = p.h[b] + 1;
+            let mut h = p.h[b].max(h_args) + 1;
             p.check_height(h, rs, re);
             if p.n_err == 0 {
                 p.check_height(h, rs, re);
@@ -3432,7 +3736,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 operand: Box::new(take_expr(p, b)),
                 schema,
                 table,
-                args: take_opt_exprs(p, b + 4),
+                args,
             })
         }
         ActionId::ExprExists => {
@@ -3508,11 +3812,6 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             p.f[b] = (p.f[b] | p.f[b + 2]) & FUNC;
             SemVal::Exprs(list)
         }
-        ActionId::NExprListSingle => {
-            p.f[b] &= FUNC;
-            SemVal::Exprs(vec![take_expr(p, b)])
-        }
-        ActionId::ParenExprList => SemVal::Exprs(take_exprs(p, b + 1)),
 
         // ── CREATE INDEX ──
         ActionId::CmdCreateIndex => {
@@ -3553,6 +3852,16 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
 
         // ── CREATE TRIGGER ──
         ActionId::CmdCreateTrigger => {
+            if p.n_var > 0 {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "trigger cannot use variables",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Definition,
+                );
+            }
             let start = take_usize(p, b);
             let d = match take(p, b + 1) {
                 SemVal::TriggerDecl(d) => d,
@@ -3670,18 +3979,41 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             );
             SemVal::Empty
         }
-        ActionId::TriggerCmdUpdate => SemVal::TriggerStep(TriggerStep::Update(Box::new(
-            UpdateStmt {
+        ActionId::TriggerCmdUpdate => {
+            let table = take_from_table(p, b + 2);
+            if table.schema.is_some() && !p.schema_mode {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Definition,
+                );
+            }
+            let set = take_set_clauses(p, b + 5);
+            let set_cols: usize = set.iter().map(|s| s.columns.len()).sum();
+            if set_cols > p.max_columns {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "too many columns in set list",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Syntax,
+                );
+            }
+            SemVal::TriggerStep(TriggerStep::Update(Box::new(UpdateStmt {
                 span: p.rule_span(),
                 with: None,
                 or_conflict: take_opt_conflict(p, b + 1),
-                table: take_from_table(p, b + 2),
-                set: take_set_clauses(p, b + 5),
+                table,
+                set,
                 from: take_opt_from_source(p, b + 6),
                 where_clause: take_opt_expr(p, b + 7),
                 returning: None,
-            },
-        ))),
+            })))
+        }
         ActionId::TriggerCmdInsert => {
             let (or_conflict, replace_into) = match take(p, b + 1) {
                 SemVal::InsertCmd {
@@ -3690,31 +4022,64 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 } => (or_conflict, replace_into),
                 _ => (None, false),
             };
-            let (upsert, returning) = match take(p, b + 6) {
+            let table = take_from_table(p, b + 3);
+            if table.schema.is_some() && !p.schema_mode {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Definition,
+                );
+            }
+            let (mut upsert, returning) = match take(p, b + 6) {
                 SemVal::Upsert { clauses, returning } => (clauses, returning),
                 _ => (Vec::new(), None),
             };
+            upsert.reverse();
+            if returning.is_some() {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "cannot use RETURNING in a trigger",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Syntax,
+                );
+            }
             SemVal::TriggerStep(TriggerStep::Insert(Box::new(InsertStmt {
                 span: p.rule_span(),
                 with: None,
                 or_conflict,
                 replace_into,
-                table: take_from_table(p, b + 3),
+                table,
                 columns: take_opt_names(p, b + 4),
                 select: Some(Box::new(take_select(p, b + 5))),
                 upsert,
                 returning,
             })))
         }
-        ActionId::TriggerCmdDelete => SemVal::TriggerStep(TriggerStep::Delete(Box::new(
-            DeleteStmt {
+        ActionId::TriggerCmdDelete => {
+            let table = take_from_table(p, b + 2);
+            if table.schema.is_some() && !p.schema_mode {
+                let rs = p.rs;
+                let re = p.re;
+                p.error(
+                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers",
+                    rs,
+                    re,
+                    SqlParseErrorKind::Definition,
+                );
+            }
+            SemVal::TriggerStep(TriggerStep::Delete(Box::new(DeleteStmt {
                 span: p.rule_span(),
                 with: None,
-                table: take_from_table(p, b + 2),
+                table,
                 where_clause: take_opt_expr(p, b + 4),
                 returning: None,
-            },
-        ))),
+            })))
+        }
         ActionId::ExprRaiseIgnore => {
             p.h[b] = 1;
             SemVal::Expr(Expr::Raise {
@@ -3933,6 +4298,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             };
             let args = match take(p, b + 2) {
                 SemVal::VtabArgs(a) => a,
+                SemVal::VtabArgSpan(sp) => {
+                    let text = p.alloc_sql_slice(sp.start, sp.end);
+                    vec![VtabArg { span: sp, text }]
+                }
                 _ => Vec::new(),
             };
             SemVal::Stmt(Box::new(Statement::CreateVirtualTable(Box::new(
@@ -3961,22 +4330,27 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         }
         ActionId::VtabArgExtend => {
             if p.rs < 0 {
-                SemVal::VtabArgs(Vec::new())
+                SemVal::Empty
             } else {
-                let sp = p.rule_span();
-                SemVal::VtabArgs(vec![VtabArg {
-                    span: sp,
-                    text: p.sql[sp.start..sp.end].to_string(),
-                }])
+                SemVal::VtabArgSpan(p.rule_span())
             }
         }
         ActionId::VtabArgListAppend => {
             let mut list = match take(p, b) {
                 SemVal::VtabArgs(v) => v,
+                SemVal::VtabArgSpan(sp) => {
+                    let text = p.alloc_sql_slice(sp.start, sp.end);
+                    vec![VtabArg { span: sp, text }]
+                }
                 _ => Vec::new(),
             };
-            if let SemVal::VtabArgs(mut more) = take(p, b + 2) {
-                list.append(&mut more);
+            match take(p, b + 2) {
+                SemVal::VtabArgs(mut more) => list.append(&mut more),
+                SemVal::VtabArgSpan(sp) => {
+                    let text = p.alloc_sql_slice(sp.start, sp.end);
+                    list.push(VtabArg { span: sp, text });
+                }
+                _ => {}
             }
             SemVal::VtabArgs(list)
         }
@@ -4004,13 +4378,17 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 ctes,
             })
         }
-        ActionId::WqItem => SemVal::Cte(Box::new(CommonTableExpr {
-            span: p.rule_span(),
-            name: take_name(p, b),
-            columns: take_opt_id_list_items(p, b + 1),
-            materialized: take_opt_bool(p, b + 2),
-            select: take_select(p, b + 4),
-        })),
+        ActionId::WqItem => {
+            let h = p.h[b + 4];
+            p.h[b] = h;
+            SemVal::Cte(Box::new(CommonTableExpr {
+                span: p.rule_span(),
+                name: take_name(p, b),
+                columns: take_opt_id_list_items(p, b + 1),
+                materialized: take_opt_bool(p, b + 2),
+                select: take_select(p, b + 4),
+            }))
+        }
         ActionId::WithNm => {
             p.has_with = true;
             take(p, b)
@@ -4020,6 +4398,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             _ => SemVal::Ctes(Vec::new()),
         },
         ActionId::WqListAppend => {
+            let rhs_h = p.h[b + 2];
+            if rhs_h > p.h[b] {
+                p.h[b] = rhs_h;
+            }
             let mut list = match take(p, b) {
                 SemVal::Ctes(v) => v,
                 _ => Vec::new(),
@@ -4042,6 +4424,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
 
         // ── windows ──
         ActionId::WindowDefnListAppend => {
+            let rhs_h = p.h[b + 2];
+            if rhs_h > p.h[b] {
+                p.h[b] = rhs_h;
+            }
             let mut list = match take(p, b) {
                 SemVal::WindowList(l) => l,
                 _ => WindowList {
@@ -4099,8 +4485,10 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             SemVal::WindowList(list)
         }
         ActionId::WindowDefnSingle => {
+            let wh = p.h[b + 3];
             let name = take_name(p, b);
             let (mut w, wmeta) = take_window_spec(p, b + 3);
+            p.h[b] = wh;
             w.span = Span::new(p.st[b + 2].max(0) as usize, p.en[b + 4].max(0) as usize);
             let raw = raw_name(p, &name).to_string();
             let meta = WindowDefMeta {
@@ -4124,6 +4512,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             let part = Some(take_exprs(p, b + 2));
             let ob = take_window_order_by(p, b + 3);
             let frame = take_frame_of(p, b + 4);
+            p.h[b] = p.h[b + 2].max(p.h[b + 3]).max(p.h[b + 4]);
             build_window_spec(p, None, part, ob, frame)
         }
         ActionId::WindowBasePartition => {
@@ -4131,25 +4520,32 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             let part = Some(take_exprs(p, b + 3));
             let ob = take_window_order_by(p, b + 4);
             let frame = take_frame_of(p, b + 5);
+            p.h[b] = p.h[b + 3].max(p.h[b + 4]).max(p.h[b + 5]);
             build_window_spec(p, base, part, ob, frame)
         }
         ActionId::WindowOrderBy => {
             let ob = Some(take_ordering_terms(p, b + 2));
             let frame = take_frame_of(p, b + 3);
+            p.h[b] = p.h[b + 2].max(p.h[b + 3]);
             build_window_spec(p, None, None, ob, frame)
         }
         ActionId::WindowBaseOrderBy => {
             let base = Some(take_name(p, b));
             let ob = Some(take_ordering_terms(p, b + 3));
             let frame = take_frame_of(p, b + 4);
+            p.h[b] = p.h[b + 3].max(p.h[b + 4]);
             build_window_spec(p, base, None, ob, frame)
         }
         ActionId::WindowBaseFrame => {
             let base = Some(take_name(p, b));
             let frame = take_frame_of(p, b + 1);
+            p.h[b] = p.h[b + 1];
             build_window_spec(p, base, None, None, frame)
         }
-        ActionId::FrameOptEmpty => build_window_spec(p, None, None, None, None),
+        ActionId::FrameOptEmpty => {
+            p.h[b] = 0;
+            build_window_spec(p, None, None, None, None)
+        }
         ActionId::FrameOptSingle => {
             let units = match take(p, b) {
                 SemVal::FrameUnits(u) => u,
@@ -4163,6 +4559,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::FrameExclude(ex) => Some(ex),
                 _ => None,
             };
+            p.h[b] = p.h[b + 1];
             let frame = build_frame_spec(p, units, from, None, exclude);
             build_window_spec(p, None, None, None, Some(frame))
         }
@@ -4183,6 +4580,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 SemVal::FrameExclude(ex) => Some(ex),
                 _ => None,
             };
+            p.h[b] = p.h[b + 2].max(p.h[b + 4]);
             let frame = build_frame_spec(p, units, from, to, exclude);
             build_window_spec(p, None, None, None, Some(frame))
         }
@@ -4231,14 +4629,20 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             };
             SemVal::FrameExclude(ex)
         }
-        ActionId::WindowClause => match take(p, b + 1) {
-            SemVal::WindowList(l) => SemVal::WindowDefs(l.defs),
-            _ => SemVal::WindowDefs(Vec::new()),
-        },
-        ActionId::FilterOverBoth => SemVal::FilterOver {
-            filter: Some(Box::new(take_expr(p, b))),
-            over: Some(take_window_ref(p, b + 1)),
-        },
+        ActionId::WindowClause => {
+            p.h[b] = p.h[b + 1];
+            match take(p, b + 1) {
+                SemVal::WindowList(l) => SemVal::WindowDefs(l.defs),
+                _ => SemVal::WindowDefs(Vec::new()),
+            }
+        }
+        ActionId::FilterOverBoth => {
+            p.h[b] = p.h[b].max(p.h[b + 1]);
+            SemVal::FilterOver {
+                filter: Some(Box::new(take_expr(p, b))),
+                over: Some(take_window_ref(p, b + 1)),
+            }
+        }
         ActionId::FilterOverOnlyOver => SemVal::FilterOver {
             filter: None,
             over: Some(take_window_ref(p, b)),
@@ -4248,11 +4652,16 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             over: None,
         },
         ActionId::OverClauseSpec => {
+            p.h[b] = p.h[b + 2];
             let (mut w, _) = take_window_spec(p, b + 2);
             w.span = Span::new(p.st[b + 1].max(0) as usize, p.en[b + 3].max(0) as usize);
             SemVal::WindowRef(WindowRef::Spec(Box::new(w)))
         }
-        ActionId::FilterClause => take(p, b + 3),
+        ActionId::FilterClause => {
+            p.h[b] = p.h[b + 3];
+            p.f[b] = p.f[b + 3] & FUNC;
+            take(p, b + 3)
+        }
 
         // ── XDB dialect ──
         ActionId::XdbExprDcolonCast => {
@@ -4267,25 +4676,28 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         }
         ActionId::XdbCastType0 => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
+                text,
                 args: Vec::new(),
             })
         }
         ActionId::XdbCastType1 => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
+                text,
                 args: vec![take_str(p, b + 2)],
             })
         }
         ActionId::XdbCastType2 => {
             let sp = p.rule_span();
+            let text = p.alloc_sql_slice(sp.start, sp.end);
             SemVal::TypeName(TypeName {
                 span: sp,
-                text: p.sql[sp.start..sp.end].to_string(),
+                text,
                 args: vec![take_str(p, b + 2), take_str(p, b + 4)],
             })
         }
@@ -4307,9 +4719,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 exclude,
                 replace,
             }));
-            if p.h[b] < 1 {
-                p.h[b] = 1;
-            }
+            p.h[b] = p.h[b].max(p.h[b + 3]).max(1);
             SemVal::ResultCols(list)
         }
         ActionId::XdbSelColTableStarMods => {
@@ -4324,20 +4734,25 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
                 exclude,
                 replace,
             }));
-            if p.h[b] < 2 {
-                p.h[b] = 2;
-            }
+            p.h[b] = p.h[b].max(p.h[b + 5]).max(2);
             SemVal::ResultCols(list)
         }
-        ActionId::XdbStarModsExcludeList => SemVal::StarMods {
-            exclude: Some(take_names(p, b + 2)),
-            replace: None,
-        },
-        ActionId::XdbStarModsExcludeOne => SemVal::StarMods {
-            exclude: Some(vec![take_name(p, b + 1)]),
-            replace: None,
-        },
+        ActionId::XdbStarModsExcludeList => {
+            p.h[b] = 0;
+            SemVal::StarMods {
+                exclude: Some(take_names(p, b + 2)),
+                replace: None,
+            }
+        }
+        ActionId::XdbStarModsExcludeOne => {
+            p.h[b] = 0;
+            SemVal::StarMods {
+                exclude: Some(vec![take_name(p, b + 1)]),
+                replace: None,
+            }
+        }
         ActionId::XdbStarModsReplace => {
+            p.h[b] = p.h[b + 2];
             let replace = match take(p, b + 2) {
                 SemVal::StarReplacements(r) => Some(r),
                 _ => None,
@@ -4348,6 +4763,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             }
         }
         ActionId::XdbStarModsExcludeListReplace => {
+            p.h[b] = p.h[b + 6];
             let exclude = Some(take_names(p, b + 2));
             let replace = match take(p, b + 6) {
                 SemVal::StarReplacements(r) => Some(r),
@@ -4356,6 +4772,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             SemVal::StarMods { exclude, replace }
         }
         ActionId::XdbStarModsExcludeOneReplace => {
+            p.h[b] = p.h[b + 4];
             let exclude = Some(vec![take_name(p, b + 1)]);
             let replace = match take(p, b + 4) {
                 SemVal::StarReplacements(r) => Some(r),
@@ -4364,6 +4781,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
             SemVal::StarMods { exclude, replace }
         }
         ActionId::XdbRepListAppend => {
+            p.h[b] = p.h[b].max(p.h[b + 2]);
             let mut list = match take(p, b) {
                 SemVal::StarReplacements(r) => r,
                 _ => Vec::new(),

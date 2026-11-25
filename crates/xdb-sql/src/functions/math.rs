@@ -8,10 +8,10 @@ use crate::errors::{SqlError, SqlResult};
 /// non-numeric strings/blobs (whose `atof` rc <= 0) return `NULL` for math functions!
 fn math_real_arg(v: &SqlValue) -> Option<f64> {
     match v {
-        SqlValue::Null => None,
+        SqlValue::Null | SqlValue::Blob(_) => None,
         SqlValue::Int(i) => Some(*i as f64),
         SqlValue::Real(r) => Some(*r),
-        SqlValue::Text(b) | SqlValue::Blob(b) => {
+        SqlValue::Text(b) => {
             let r = xdb_core::value::atof(b);
             if r.rc > 0 {
                 Some(r.value)
@@ -115,7 +115,7 @@ pub fn call_math(lower_name: &str, args: &[SqlValue]) -> SqlResult<Option<SqlVal
                 ));
             }
             match &args[0] {
-                SqlValue::Null => SqlValue::Null,
+                SqlValue::Null | SqlValue::Blob(_) => SqlValue::Null,
                 SqlValue::Int(i) => SqlValue::Int(i.signum()),
                 SqlValue::Real(r) => SqlValue::Int(if *r > 0.0 {
                     1
@@ -124,7 +124,7 @@ pub fn call_math(lower_name: &str, args: &[SqlValue]) -> SqlResult<Option<SqlVal
                 } else {
                     0
                 }),
-                SqlValue::Text(b) | SqlValue::Blob(b) => {
+                SqlValue::Text(b) => {
                     let r = xdb_core::value::atof(b);
                     if r.rc <= 0 {
                         SqlValue::Null

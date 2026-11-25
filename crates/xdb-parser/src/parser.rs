@@ -5,11 +5,13 @@ use std::collections::HashMap;
 
 use xdb_core::Meter;
 
-use crate::actions::{run_action, SemVal};
-use crate::ast::{Name, SelectStmt, Span, Statement};
+use crate::actions::{mvalues_append_in_place, run_action, SemVal};
+use crate::ast::{Expr, Name, SelectStmt, Span, Statement};
 use crate::errors::{ParseResult, SqlParseError, SqlParseErrorKind};
 use crate::lalr_tables::{ActionId, LalrTables, SQLITE_GRAMMAR, XDB_GRAMMAR};
-use crate::tokenizer::{classify_context_keyword, classify_ilike, is_ilike, Dialect, Scanner};
+use crate::tokenizer::{
+    classify_context_keyword_metered, classify_ilike_metered, is_ilike, sql_end, Dialect, Scanner,
+};
 use crate::tokens::tk;
 
 /// Expression properties tracked at parse time (`EP_*` subset).
@@ -65,6 +67,37 @@ pub struct ParsedAt {
     pub end: usize,
 }
 
+const INIT_STACK_CAP: usize = 32;
+const MAX_POOLED_STACK_CAP: usize = 64;
+
+struct ParserStacks {
+    state: Vec<u16>,
+    v: Vec<SemVal>,
+    st: Vec<isize>,
+    en: Vec<isize>,
+    h: Vec<u32>,
+    f: Vec<u8>,
+}
+
+impl ParserStacks {
+    fn new_initial() -> Self {
+        let mut v = Vec::with_capacity(INIT_STACK_CAP);
+        v.resize_with(INIT_STACK_CAP, || SemVal::Empty);
+        Self {
+            state: vec![0; INIT_STACK_CAP],
+            v,
+            st: vec![-1; INIT_STACK_CAP],
+            en: vec![-1; INIT_STACK_CAP],
+            h: vec![0; INIT_STACK_CAP],
+            f: vec![0; INIT_STACK_CAP],
+        }
+    }
+}
+
+thread_local! {
+    static PARSER_STACK_POOL: std::cell::Cell<Option<ParserStacks>> = const { std::cell::Cell::new(None) };
+}
+
 /// Stateful LALR(1) SQL parser instance.
 pub struct Parser<'a> {
     pub(crate) sql: &'a str,
@@ -82,7 +115,7 @@ pub struct Parser<'a> {
     probe: Scanner<'a>,
     meter: Option<&'a dyn Meter>,
 
-    // Parser stack
+    // Parser stack (pooled 32-slot heap vectors reused via thread-local cache)
     pub(crate) state: Vec<u16>,
     pub(crate) v: Vec<SemVal>,
     pub(crate) st: Vec<isize>,
@@ -90,7 +123,14 @@ pub struct Parser<'a> {
     pub(crate) h: Vec<u32>,
     pub(crate) f: Vec<u8>,
     top: usize,
+    high_water: usize,
+    dirty: bool,
+    stack_cap: usize,
     stack_end: usize,
+    pending_steps: u64,
+    pending_mem: u64,
+    reserved_stack_mem: u64,
+    reserved_ast_mem: u64,
 
     // Rule currently being reduced
     pub(crate) rs: isize,
@@ -125,18 +165,55 @@ impl std::fmt::Debug for Parser<'_> {
     }
 }
 
+impl Drop for Parser<'_> {
+    fn drop(&mut self) {
+        if let Some(m) = self.meter {
+            let total = self.reserved_stack_mem.saturating_add(self.reserved_ast_mem);
+            if total > 0 {
+                m.release_memory(total);
+                self.reserved_stack_mem = 0;
+                self.reserved_ast_mem = 0;
+            }
+        }
+        if self.v.capacity() <= MAX_POOLED_STACK_CAP
+            && self.state.capacity() <= MAX_POOLED_STACK_CAP
+            && self.v.len() >= INIT_STACK_CAP
+        {
+            self.clear_stack_values();
+            let stacks = ParserStacks {
+                state: std::mem::take(&mut self.state),
+                v: std::mem::take(&mut self.v),
+                st: std::mem::take(&mut self.st),
+                en: std::mem::take(&mut self.en),
+                h: std::mem::take(&mut self.h),
+                f: std::mem::take(&mut self.f),
+            };
+            let _ = PARSER_STACK_POOL.try_with(|pool| {
+                pool.set(Some(stacks));
+            });
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
     pub fn new(sql: &'a str, options: &ParseOptions, meter: Option<&'a dyn Meter>) -> Self {
         let tables = match options.dialect {
             Dialect::Sqlite => &SQLITE_GRAMMAR,
             Dialect::Xdb => &XDB_GRAMMAR,
         };
-        let scanner = Scanner::new(sql, options.dialect);
-        let probe = Scanner::new(sql, options.dialect);
+        let scanner = Scanner::new_lazy(sql, options.dialect);
+        let probe = Scanner::new_lazy(sql, options.dialect);
         let limit = scanner.limit;
-        let init_cap = tables.yy_stack_depth.min(options.max_parser_depth.max(1));
-        let mut v = Vec::with_capacity(init_cap);
-        v.resize_with(init_cap, || SemVal::Empty);
+        let stacks = PARSER_STACK_POOL
+            .try_with(|pool| pool.take())
+            .ok()
+            .flatten()
+            .unwrap_or_else(ParserStacks::new_initial);
+        let init_cap = INIT_STACK_CAP
+            .min(tables.yy_stack_depth)
+            .min(options.max_parser_depth.max(1));
+        let stack_cap = stacks.v.len();
+        let meter = meter.filter(|m| !m.is_noop());
         Self {
             sql,
             schema_mode: options.schema,
@@ -152,14 +229,21 @@ impl<'a> Parser<'a> {
             scanner,
             probe,
             meter,
-            state: vec![0; init_cap],
-            v,
-            st: vec![-1; init_cap],
-            en: vec![-1; init_cap],
-            h: vec![0; init_cap],
-            f: vec![0; init_cap],
+            state: stacks.state,
+            v: stacks.v,
+            st: stacks.st,
+            en: stacks.en,
+            h: stacks.h,
+            f: stacks.f,
             top: 0,
+            high_water: 0,
+            dirty: false,
+            stack_cap,
             stack_end: init_cap - 1,
+            pending_steps: 0,
+            pending_mem: 0,
+            reserved_stack_mem: 0,
+            reserved_ast_mem: 0,
             rs: -1,
             re: -1,
             look_type: 0,
@@ -189,17 +273,19 @@ impl<'a> Parser<'a> {
         kind: SqlParseErrorKind,
     ) {
         self.n_err += 1;
-        let s = if start >= 0 {
-            Some(start as usize)
-        } else {
-            None
-        };
-        let e = if end >= 0 { Some(end as usize) } else { None };
-        self.err = Some(SqlParseError::new(message, kind, s, e));
+        if self.err.is_none() {
+            let s = if start >= 0 {
+                Some(start as usize)
+            } else {
+                None
+            };
+            let e = if end >= 0 { Some(end as usize) } else { None };
+            self.err = Some(SqlParseError::new(message, kind, s, e));
+        }
     }
 
     pub(crate) fn syntax_error_at(&mut self, s: usize, e: usize) {
-        if s >= self.limit {
+        if s >= self.limit || self.sql.as_bytes().get(s).copied().unwrap_or(0) == 0 {
             self.error(
                 "incomplete input",
                 s as isize,
@@ -242,19 +328,27 @@ impl<'a> Parser<'a> {
 
     /// Parse one statement starting at byte `offset`.
     pub fn parse_at(&mut self, offset: usize) -> ParseResult<ParsedAt> {
+        if offset > self.sql.len() || !self.sql.is_char_boundary(offset) {
+            return Err(SqlParseError::new(
+                "invalid UTF-8 offset",
+                SqlParseErrorKind::Syntax,
+                Some(offset.min(self.sql.len())),
+                Some(offset.min(self.sql.len())),
+            ));
+        }
         let mut i = offset;
         loop {
             self.scanner.scan(i);
             if self.scanner.kind == tk::SPACE || self.scanner.kind == tk::COMMENT {
-                if let Some(m) = self.meter {
-                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                if !self.charge_steps_for_len(self.scanner.end.saturating_sub(i)) {
+                    return Err(self.err.take().expect("limit error"));
                 }
                 i = self.scanner.end;
                 continue;
             }
             if self.scanner.kind == tk::SEMI {
-                if let Some(m) = self.meter {
-                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                if !self.charge_step() || !self.flush_meters() {
+                    return Err(self.err.take().expect("limit error"));
                 }
                 return Ok(ParsedAt {
                     statement: None,
@@ -262,22 +356,31 @@ impl<'a> Parser<'a> {
                 });
             }
             if self.scanner.kind == tk::EOF {
+                if !self.flush_meters() {
+                    return Err(self.err.take().expect("limit error"));
+                }
                 return Ok(ParsedAt {
                     statement: None,
-                    end: offset,
+                    end: i,
                 });
             }
             break;
         }
         self.reset_stack();
+        self.dirty = true;
         let mut last: Option<u16> = None;
+        let mut have_first = true;
         loop {
-            self.scanner.scan(i);
+            if have_first {
+                have_first = false;
+            } else {
+                self.scanner.scan(i);
+            }
             let mut kind = self.scanner.kind;
             let mut end = self.scanner.end;
             if kind == tk::SPACE || kind == tk::COMMENT {
-                if let Some(m) = self.meter {
-                    m.charge_steps(1).map_err(SqlParseError::from_limit)?;
+                if !self.charge_steps_for_len(end.saturating_sub(i)) {
+                    return Err(self.err.take().expect("limit error"));
                 }
                 i = end;
                 continue;
@@ -292,14 +395,31 @@ impl<'a> Parser<'a> {
                 }
                 end = i;
             } else if kind == tk::WINDOW || kind == tk::OVER || kind == tk::FILTER {
-                kind = classify_context_keyword(&mut self.probe, kind, end, last);
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
+                kind = classify_context_keyword_metered(
+                    &mut self.probe,
+                    kind,
+                    end,
+                    last,
+                    self.meter,
+                )
+                .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ID
                 && self.dialect == Dialect::Xdb
                 && end - i == 5
                 && is_ilike(self.sql.as_bytes(), i)
             {
-                kind = classify_ilike(&mut self.probe, end);
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
+                kind = classify_ilike_metered(&mut self.probe, end, self.meter)
+                    .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
                 return Err(SqlParseError::new(
                     format!("unrecognized token: \"{}\"", &self.sql[i..end]),
                     SqlParseErrorKind::Syntax,
@@ -311,11 +431,15 @@ impl<'a> Parser<'a> {
             last = Some(kind);
             i = end;
             if let Some(err) = self.err.take() {
+                let _ = self.flush_meters();
                 return Err(err);
             }
             if self.done {
                 break;
             }
+        }
+        if !self.flush_meters() {
+            return Err(self.err.take().expect("limit error"));
         }
         Ok(ParsedAt {
             statement: if self.done { self.result.take() } else { None },
@@ -326,6 +450,7 @@ impl<'a> Parser<'a> {
     /// Parse the entire input wrapped as `VALUES(<sql>)`.
     pub fn parse_wrapped_expression(&mut self) -> ParseResult<SelectStmt> {
         self.reset_stack();
+        self.dirty = true;
         self.feed(tk::VALUES, 0, 0);
         if let Some(err) = self.err.take() {
             return Err(err);
@@ -342,6 +467,9 @@ impl<'a> Parser<'a> {
             let mut kind = self.scanner.kind;
             let mut end = self.scanner.end;
             if kind == tk::SPACE || kind == tk::COMMENT {
+                if !self.charge_steps_for_len(end.saturating_sub(i)) {
+                    return Err(self.err.take().expect("limit error"));
+                }
                 i = end;
                 continue;
             }
@@ -358,14 +486,31 @@ impl<'a> Parser<'a> {
                 }
                 end = i;
             } else if kind == tk::WINDOW || kind == tk::OVER || kind == tk::FILTER {
-                kind = classify_context_keyword(&mut self.probe, kind, end, last);
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
+                kind = classify_context_keyword_metered(
+                    &mut self.probe,
+                    kind,
+                    end,
+                    last,
+                    self.meter,
+                )
+                .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ID
                 && self.dialect == Dialect::Xdb
                 && end - i == 5
                 && is_ilike(self.sql.as_bytes(), i)
             {
-                kind = classify_ilike(&mut self.probe, end);
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
+                kind = classify_ilike_metered(&mut self.probe, end, self.meter)
+                    .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
+                if !self.flush_steps() {
+                    return Err(self.err.take().expect("limit error"));
+                }
                 return Err(SqlParseError::new(
                     format!("unrecognized token: \"{}\"", &self.sql[i..end]),
                     SqlParseErrorKind::Syntax,
@@ -377,11 +522,15 @@ impl<'a> Parser<'a> {
             last = Some(kind);
             i = end;
             if let Some(err) = self.err.take() {
+                let _ = self.flush_meters();
                 return Err(err);
             }
             if self.done {
                 break;
             }
+        }
+        if !self.flush_meters() {
+            return Err(self.err.take().expect("limit error"));
         }
         if self.done {
             if !closed {
@@ -389,7 +538,7 @@ impl<'a> Parser<'a> {
                     "not an expression",
                     SqlParseErrorKind::Syntax,
                     Some(i),
-                    Some(self.limit),
+                    Some(sql_end(self.sql)),
                 ));
             }
             if let Some(Statement::Select(sel)) = self.result.take() {
@@ -406,20 +555,39 @@ impl<'a> Parser<'a> {
 
     // ─────────────────────────── LALR stack machine ───────────────────────────
 
-    fn reset_stack(&mut self) {
-        self.top = 0;
-        let init_len = self.tables.yy_stack_depth.min(self.max_depth.max(1));
-        self.stack_end = init_len - 1;
-        if self.state.len() < init_len {
-            self.state.resize(init_len, 0);
-            self.v.resize_with(init_len, || SemVal::Empty);
-            self.st.resize(init_len, -1);
-            self.en.resize(init_len, -1);
-            self.h.resize(init_len, 0);
-            self.f.resize(init_len, 0);
+    fn clear_stack_values(&mut self) {
+        if self.high_water == 0 && matches!(self.v[0], SemVal::Empty | SemVal::Tok(_)) {
+            return;
         }
+        let end = self.high_water.min(self.v.len().saturating_sub(1));
+        for slot in &mut self.v[..=end] {
+            if !matches!(*slot, SemVal::Empty | SemVal::Tok(_)) {
+                *slot = SemVal::Empty;
+            }
+        }
+        self.high_water = 0;
+    }
+
+    fn reset_stack(&mut self) {
+        if !self.dirty {
+            self.state[0] = 0;
+            self.st[0] = -1;
+            self.en[0] = -1;
+            self.h[0] = 0;
+            self.f[0] = 0;
+            return;
+        }
+        self.clear_stack_values();
+        self.top = 0;
+        self.stack_end = self.stack_cap.min(self.max_depth.max(1)) - 1;
+        if let Some(m) = self.meter {
+            if self.reserved_ast_mem > 0 {
+                m.release_memory(self.reserved_ast_mem);
+                self.reserved_ast_mem = 0;
+            }
+        }
+        self.pending_mem = 0;
         self.state[0] = 0;
-        self.v[0] = SemVal::Empty;
         self.st[0] = -1;
         self.en[0] = -1;
         self.h[0] = 0;
@@ -435,6 +603,7 @@ impl<'a> Parser<'a> {
         self.err = None;
         self.done = false;
         self.result = None;
+        self.dirty = false;
     }
 
     fn grow(&mut self) -> bool {
@@ -446,19 +615,32 @@ impl<'a> Parser<'a> {
                 return false;
             }
         }
-        if new_size > self.state.len() {
+        if new_size > self.stack_cap {
+            let added = new_size - self.stack_cap;
+            if let Some(m) = self.meter {
+                let slot_bytes = (std::mem::size_of::<SemVal>() + 24) as u64;
+                let bytes = (added as u64).saturating_mul(slot_bytes);
+                if let Err(e) = m.reserve_memory(bytes) {
+                    self.n_err += 1;
+                    self.err = Some(SqlParseError::from_limit(e));
+                    return false;
+                }
+                self.reserved_stack_mem = self.reserved_stack_mem.saturating_add(bytes);
+            }
             self.state.resize(new_size, 0);
-            self.v.resize_with(new_size, || SemVal::Empty);
+            self.v.resize_with(new_size, SemVal::default);
             self.st.resize(new_size, -1);
             self.en.resize(new_size, -1);
             self.h.resize(new_size, 0);
             self.f.resize(new_size, 0);
+            self.stack_cap = new_size;
         }
         self.stack_end = new_size - 1;
         true
     }
 
     fn overflow(&mut self) {
+        self.clear_stack_values();
         self.top = 0;
         if self.n_err == 0 {
             self.error(
@@ -470,15 +652,108 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[inline]
     fn charge_step(&mut self) -> bool {
+        if self.meter.is_none() {
+            return true;
+        }
+        self.pending_steps += 1;
+        if self.pending_steps >= 64 {
+            return self.flush_steps();
+        }
+        true
+    }
+
+    #[inline]
+    fn charge_steps_for_len(&mut self, bytes: usize) -> bool {
+        if self.meter.is_none() {
+            return true;
+        }
+        let steps = ((bytes as u64) >> 6).max(1);
+        self.pending_steps = self.pending_steps.saturating_add(steps);
+        if self.pending_steps >= 64 {
+            return self.flush_steps();
+        }
+        true
+    }
+
+    #[inline]
+    pub(crate) fn alloc_sql_slice(&mut self, a: usize, z: usize) -> String {
+        if z <= a {
+            return String::new();
+        }
+        if self.meter.is_some() {
+            let len = (z - a) as u64;
+            if !self.charge_ast_mem(len) {
+                return String::new();
+            }
+        }
+        self.sql[a..z].to_string()
+    }
+
+    #[inline]
+    pub(crate) fn clone_constraint_name(&mut self) -> Option<Name> {
+        let len = self.constraint_name.as_ref()?.name.len();
+        if self.meter.is_some() {
+            let est = (len as u64).saturating_add(48);
+            if !self.charge_ast_mem(est) {
+                return None;
+            }
+        }
+        self.constraint_name.clone()
+    }
+
+    fn flush_steps(&mut self) -> bool {
+        if self.pending_steps == 0 {
+            return true;
+        }
+        let steps = self.pending_steps;
+        self.pending_steps = 0;
         if let Some(m) = self.meter {
-            if let Err(e) = m.charge_steps(1) {
+            if let Err(e) = m.charge_steps(steps) {
                 self.n_err += 1;
-                self.err = Some(SqlParseError::from_limit(e));
+                if self.err.is_none() {
+                    self.err = Some(SqlParseError::from_limit(e));
+                }
                 return false;
             }
         }
         true
+    }
+
+    #[inline]
+    fn charge_ast_mem(&mut self, bytes: u64) -> bool {
+        if self.meter.is_none() {
+            return true;
+        }
+        self.pending_mem = self.pending_mem.saturating_add(bytes);
+        if self.pending_mem >= 4096 {
+            return self.flush_ast_mem();
+        }
+        true
+    }
+
+    fn flush_ast_mem(&mut self) -> bool {
+        if self.pending_mem == 0 {
+            return true;
+        }
+        let bytes = self.pending_mem;
+        self.pending_mem = 0;
+        if let Some(m) = self.meter {
+            if let Err(e) = m.reserve_memory(bytes) {
+                self.n_err += 1;
+                if self.err.is_none() {
+                    self.err = Some(SqlParseError::from_limit(e));
+                }
+                return false;
+            }
+            self.reserved_ast_mem = self.reserved_ast_mem.saturating_add(bytes);
+        }
+        true
+    }
+
+    fn flush_meters(&mut self) -> bool {
+        self.flush_steps() && self.flush_ast_mem()
     }
 
     fn feed(&mut self, major: u16, ts: usize, te: usize) {
@@ -486,7 +761,7 @@ impl<'a> Parser<'a> {
         self.look_type = major;
         self.look_start = ts;
         self.look_end = te;
-        if !self.charge_step() {
+        if !self.charge_steps_for_len(te.saturating_sub(ts)) {
             return;
         }
         let mut act = self.state[self.top];
@@ -502,6 +777,9 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 act = self.reduce(rule);
+                if self.err.is_some() {
+                    return;
+                }
             } else if act <= t.yy_max_shiftreduce {
                 self.shift(act, major, ts, te);
                 return;
@@ -523,6 +801,9 @@ impl<'a> Parser<'a> {
             return;
         }
         self.top = k;
+        if k > self.high_water {
+            self.high_water = k;
+        }
         if act > t.yy_max_shift {
             act += t.yy_min_reduce - t.yy_min_shiftreduce;
         }
@@ -531,7 +812,11 @@ impl<'a> Parser<'a> {
         self.st[k] = ts as isize;
         self.en[k] = te as isize;
         self.h[k] = 0;
-        self.f[k] = 0;
+        self.f[k] = if major == tk::STRING && self.scanner.has_doubled_quote {
+            1
+        } else {
+            0
+        };
     }
 
     fn reduce(&mut self, rule: usize) -> u16 {
@@ -540,7 +825,10 @@ impl<'a> Parser<'a> {
         let b = self.top + 1 - n;
         let mut rs = -1isize;
         let mut re = -1isize;
-        if n == 0 {
+        if n == 1 {
+            rs = self.st[b];
+            re = self.en[b];
+        } else if n == 0 {
             self.v[b] = SemVal::Empty;
             self.h[b] = 0;
             self.f[b] = 0;
@@ -557,13 +845,215 @@ impl<'a> Parser<'a> {
         self.rs = rs;
         self.re = re;
         let action = t.rule_action[rule];
-        if action != ActionId::PassThrough && action != ActionId::Pass0 {
+        let mut needs_cleanup = true;
+        if action == ActionId::PassThrough || action == ActionId::Pass0 {
+            // Leave `self.v[b]` untouched.
+        } else if action == ActionId::Pass1 {
+            self.h[b] = self.h[b + 1];
+            self.f[b] = self.f[b + 1];
+            self.v[b] = std::mem::take(&mut self.v[b + 1]);
+            if b > self.high_water {
+                self.high_water = b;
+            }
+        } else if action == ActionId::Pass2 {
+            self.h[b] = self.h[b + 2];
+            self.f[b] = self.f[b + 2];
+            self.v[b] = std::mem::take(&mut self.v[b + 2]);
+            if b > self.high_water {
+                self.high_water = b;
+            }
+        } else if action == ActionId::Nul {
+            if n > 0 && !matches!(self.v[b], SemVal::Empty | SemVal::Tok(_)) {
+                self.v[b] = SemVal::Empty;
+            }
+        } else if action == ActionId::NExprListAppend {
+            let item = match std::mem::take(&mut self.v[b + 2]) {
+                SemVal::Expr(e) => e,
+                _ => Expr::Null {
+                    span: Span::default(),
+                },
+            };
+            if let SemVal::Exprs(ref mut list) = self.v[b] {
+                list.push(item);
+            } else {
+                self.v[b] = SemVal::Exprs(vec![item]);
+            }
+            if self.h[b + 2] > self.h[b] {
+                self.h[b] = self.h[b + 2];
+            }
+            self.f[b] = (self.f[b] | self.f[b + 2]) & expr_flag::HAS_FUNC;
+            if b > self.high_water {
+                self.high_water = b;
+            }
+            if self.meter.is_some() && !self.charge_ast_mem(128) {
+                return 0;
+            }
+            needs_cleanup = false;
+        } else if action == ActionId::MvaluesAppend {
+            mvalues_append_in_place(self, b);
+            if b > self.high_water {
+                self.high_water = b;
+            }
+            if self.err.is_some() {
+                return 0;
+            }
+            if self.meter.is_some() && !self.charge_ast_mem(192) {
+                return 0;
+            }
+            needs_cleanup = false;
+        } else if self.meter.is_none()
+            && matches!(
+                action,
+                ActionId::TermInteger
+                    | ActionId::TermString
+                    | ActionId::ExprColumn1
+                    | ActionId::NExprListSingle
+            )
+        {
+            match action {
+                ActionId::TermInteger => {
+                    let s = rs.max(0) as usize;
+                    let e = re.max(0) as usize;
+                    let z = &self.sql[s..e];
+                    let zb = z.as_bytes();
+                    let is_hex = zb.len() > 1 && zb[0] == b'0' && (zb[1] | 0x20) == b'x';
+                    let is_zero = if is_hex {
+                        zb[2..].iter().all(|&c| c == b'0')
+                    } else {
+                        zb.iter().all(|&c| c == b'0')
+                    };
+                    self.h[b] = 1;
+                    self.f[b] = if is_zero { expr_flag::IS_FALSE } else { 0 };
+                    self.v[b] = SemVal::Expr(Expr::Number(crate::ast::NumberLiteral {
+                        span: Span::new(s, e),
+                        text: z.to_string(),
+                        is_float: false,
+                        is_hex,
+                        separators: false,
+                    }));
+                }
+                ActionId::TermString => {
+                    let s = rs.max(0) as usize;
+                    let e = re.max(0) as usize;
+                    let value = if e >= s + 2 && self.f[b] == 0 && self.sql.as_bytes()[s] == b'\'' {
+                        self.sql[s + 1..e - 1].to_string()
+                    } else {
+                        crate::text::dequote(&self.sql[s..e])
+                    };
+                    self.h[b] = 1;
+                    self.f[b] = 0;
+                    self.v[b] = SemVal::Expr(Expr::String(crate::ast::StringLiteral {
+                        span: Span::new(s, e),
+                        value,
+                    }));
+                }
+                ActionId::NExprListSingle => {
+                    self.f[b] &= expr_flag::HAS_FUNC;
+                    let item = match std::mem::take(&mut self.v[b]) {
+                        SemVal::Expr(e) => e,
+                        _ => Expr::Null {
+                            span: Span::default(),
+                        },
+                    };
+                    let mut list = Vec::with_capacity(2);
+                    list.push(item);
+                    self.v[b] = SemVal::Exprs(list);
+                }
+                _ => {
+                    self.v[b] = run_action(action, self, b);
+                }
+            }
+            if b > self.high_water {
+                self.high_water = b;
+            }
+            needs_cleanup = false;
+        } else {
+            let pre_charged = if self.meter.is_some() && n >= 1 {
+                let mut total = 0u64;
+                for k in b..=self.top {
+                    if self.en[k] > self.st[k]
+                        && matches!(
+                            self.v[k],
+                            SemVal::Tok(
+                                tk::STRING
+                                    | tk::BLOB
+                                    | tk::ID
+                                    | tk::INTEGER
+                                    | tk::FLOAT
+                                    | tk::QNUMBER
+                                    | tk::VARIABLE
+                            )
+                        )
+                    {
+                        let tok_len = (self.en[k] - self.st[k]) as u64;
+                        if tok_len >= 256 {
+                            if !self.charge_ast_mem(tok_len) {
+                                return 0;
+                            }
+                            total = total.saturating_add(tok_len);
+                        }
+                    }
+                }
+                total
+            } else {
+                0
+            };
             let val = run_action(action, self, b);
+            if self.err.is_some() {
+                self.v[b] = val;
+                if b > self.high_water {
+                    self.high_water = b;
+                }
+                return 0;
+            }
+            let mem_est = if self.meter.is_some() {
+                let est = match &val {
+                    SemVal::Expr(e) => {
+                        let payload = match e {
+                            Expr::String(s) => s.value.len() as u64,
+                            Expr::Blob(b) => b.value.len() as u64,
+                            Expr::Number(n) => n.text.len() as u64,
+                            Expr::Column(c) => {
+                                (c.schema.as_ref().map_or(0, |x| x.name.len())
+                                    + c.table.as_ref().map_or(0, |x| x.name.len())
+                                    + c.column.name.len()) as u64
+                            }
+                            Expr::Variable(v) => v.text.len() as u64,
+                            Expr::Function(f) => f.name.name.len() as u64,
+                            _ => 0,
+                        };
+                        (std::mem::size_of::<Expr>() as u64).saturating_add(payload)
+                    }
+                    SemVal::Exprs(_) | SemVal::ResultCols(_) | SemVal::ColDefs(_) => 128,
+                    SemVal::Str(s) => 24u64.saturating_add(s.len() as u64),
+                    SemVal::Name(nm) => 24u64.saturating_add(nm.name.len() as u64),
+                    SemVal::CompoundAcc(_) | SemVal::Select(_) | SemVal::Stmt(_) => 192,
+                    SemVal::Empty
+                    | SemVal::Tok(_)
+                    | SemVal::Bool(_)
+                    | SemVal::Usize(_)
+                    | SemVal::VtabArgSpan(_) => 0,
+                    _ => 64,
+                };
+                est.saturating_sub(pre_charged)
+            } else {
+                0
+            };
             self.v[b] = val;
+            if b > self.high_water {
+                self.high_water = b;
+            }
+            if mem_est > 0 && !self.charge_ast_mem(mem_est) {
+                return 0;
+            }
         }
-        // Drop any remaining RHS stack values above `b`.
-        for k in (b + 1)..=self.top {
-            self.v[k] = SemVal::Empty;
+        // Drop any remaining non-trivial RHS stack values above `b`.
+        if needs_cleanup && n > 1 {
+            for k in (b + 1)..=self.top {
+                if !matches!(self.v[k], SemVal::Empty | SemVal::Tok(_)) {
+                    self.v[k] = SemVal::Empty;
+                }
+            }
         }
         let act = t.find_reduce_action(self.state[b - 1], t.rule_lhs[rule]);
         self.top = b;

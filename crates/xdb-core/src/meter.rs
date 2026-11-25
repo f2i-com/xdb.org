@@ -5,7 +5,7 @@
 //! hosts use [`BudgetMeter`] or wire their own VM meter directly into this trait.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Which sandbox ceiling was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +90,13 @@ pub trait Meter: fmt::Debug + Send + Sync {
 
     /// Release `bytes` previously passed to [`Meter::reserve_memory`].
     fn release_memory(&self, bytes: u64);
+
+    /// Returns `true` if this meter is a no-op that never imposes limits or tracks usage,
+    /// allowing hot storage and execution loops to elide dynamic vtable calls.
+    #[inline]
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// Zero-overhead meter that imposes no limits.
@@ -114,6 +121,11 @@ impl Meter for NoopMeter {
 
     #[inline]
     fn release_memory(&self, _bytes: u64) {}
+
+    #[inline]
+    fn is_noop(&self) -> bool {
+        true
+    }
 }
 
 /// Snapshot of current [`BudgetMeter`] usage.
@@ -137,7 +149,10 @@ pub struct BudgetMeter {
     memory_bytes: AtomicU64,
     peak_memory_bytes: AtomicU64,
     page_reads: AtomicU64,
-    exhausted: AtomicBool,
+    /// `0` = not exhausted, `1` = Steps, `2` = Memory, `3` = PageReads.
+    tripped_kind: AtomicU8,
+    /// Usage value observed at the moment the meter first tripped.
+    tripped_used: AtomicU64,
 }
 
 impl BudgetMeter {
@@ -148,12 +163,18 @@ impl BudgetMeter {
             memory_bytes: AtomicU64::new(0),
             peak_memory_bytes: AtomicU64::new(0),
             page_reads: AtomicU64::new(0),
-            exhausted: AtomicBool::new(false),
+            tripped_kind: AtomicU8::new(0),
+            tripped_used: AtomicU64::new(0),
         }
     }
 
     pub fn limits(&self) -> ResourceLimits {
         self.limits
+    }
+
+    #[inline]
+    pub fn memory_bytes(&self) -> u64 {
+        self.memory_bytes.load(Ordering::Relaxed)
     }
 
     pub fn usage(&self) -> MeterUsage {
@@ -162,31 +183,80 @@ impl BudgetMeter {
             memory_bytes: self.memory_bytes.load(Ordering::Relaxed),
             peak_memory_bytes: self.peak_memory_bytes.load(Ordering::Relaxed),
             page_reads: self.page_reads.load(Ordering::Relaxed),
-            exhausted: self.exhausted.load(Ordering::Relaxed),
+            exhausted: self.tripped_kind.load(Ordering::Acquire) != 0,
         }
     }
 
-    fn check_not_exhausted(&self, kind: LimitKind) -> Result<(), ResourceLimitError> {
-        if self.exhausted.load(Ordering::Acquire) {
-            let (used, limit) = match kind {
-                LimitKind::Steps => (
-                    self.steps.load(Ordering::Relaxed),
-                    self.limits.max_steps.unwrap_or(0),
-                ),
-                LimitKind::Memory => (
-                    self.memory_bytes.load(Ordering::Relaxed),
-                    self.limits.max_memory_bytes.unwrap_or(0),
-                ),
-                LimitKind::PageReads => (
-                    self.page_reads.load(Ordering::Relaxed),
-                    self.limits.max_page_reads.unwrap_or(0),
-                ),
-            };
-            return Err(ResourceLimitError { kind, used, limit });
+    #[inline]
+    fn kind_code(kind: LimitKind) -> u8 {
+        match kind {
+            LimitKind::Steps => 1,
+            LimitKind::Memory => 2,
+            LimitKind::PageReads => 3,
+        }
+    }
+
+    const TRIP_IN_PROGRESS: u8 = 255;
+
+    #[inline]
+    fn check_not_exhausted(&self, fallback: LimitKind) -> Result<(), ResourceLimitError> {
+        let mut code = self.tripped_kind.load(Ordering::Acquire);
+        if code != 0 {
+            while code == Self::TRIP_IN_PROGRESS {
+                std::hint::spin_loop();
+                code = self.tripped_kind.load(Ordering::Acquire);
+            }
+            return Err(self.exhausted_error(code, fallback));
         }
         Ok(())
     }
 
+    #[cold]
+    fn record_trip(&self, kind: LimitKind, attempted: u64, limit: u64) -> ResourceLimitError {
+        match self.tripped_kind.compare_exchange(
+            0,
+            Self::TRIP_IN_PROGRESS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.tripped_used.store(attempted, Ordering::Relaxed);
+                self.tripped_kind
+                    .store(Self::kind_code(kind), Ordering::Release);
+                ResourceLimitError {
+                    kind,
+                    used: attempted,
+                    limit,
+                }
+            }
+            Err(mut code) => {
+                while code == Self::TRIP_IN_PROGRESS {
+                    std::hint::spin_loop();
+                    code = self.tripped_kind.load(Ordering::Acquire);
+                }
+                self.exhausted_error(code, kind)
+            }
+        }
+    }
+
+    #[cold]
+    fn exhausted_error(&self, code: u8, fallback: LimitKind) -> ResourceLimitError {
+        let kind = match code {
+            1 => LimitKind::Steps,
+            2 => LimitKind::Memory,
+            3 => LimitKind::PageReads,
+            _ => fallback,
+        };
+        let limit = match kind {
+            LimitKind::Steps => self.limits.max_steps.unwrap_or(0),
+            LimitKind::Memory => self.limits.max_memory_bytes.unwrap_or(0),
+            LimitKind::PageReads => self.limits.max_page_reads.unwrap_or(0),
+        };
+        let used = self.tripped_used.load(Ordering::Relaxed);
+        ResourceLimitError { kind, used, limit }
+    }
+
+    #[inline]
     fn try_add_bounded(
         &self,
         counter: &AtomicU64,
@@ -194,29 +264,45 @@ impl BudgetMeter {
         limit: Option<u64>,
         kind: LimitKind,
     ) -> Result<u64, ResourceLimitError> {
-        let mut cur = counter.load(Ordering::Relaxed);
-        loop {
-            let next_wide = u128::from(cur) + u128::from(delta);
-            let next = next_wide.min(u128::from(u64::MAX)) as u64;
-            if let Some(lim) = limit {
-                if next_wide > u128::from(lim) {
-                    self.exhausted.store(true, Ordering::Release);
-                    return Err(ResourceLimitError {
-                        kind,
-                        used: next,
-                        limit: lim,
-                    });
+        if delta == 0 {
+            return Ok(counter.load(Ordering::Relaxed));
+        }
+        let Some(lim) = limit else {
+            let mut cur = counter.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_add(delta);
+                match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+                {
+                    Ok(_) => return Ok(next),
+                    Err(v) => cur = v,
                 }
             }
-            match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return Ok(next),
-                Err(v) => cur = v,
+        };
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            match cur.checked_add(delta) {
+                Some(next) if next <= lim => {
+                    match counter.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Ok(next),
+                        Err(v) => cur = v,
+                    }
+                }
+                opt_next => {
+                    let attempted = opt_next.unwrap_or(u64::MAX);
+                    return Err(self.record_trip(kind, attempted, lim));
+                }
             }
         }
     }
 }
 
 impl Meter for BudgetMeter {
+    #[inline]
     fn charge_steps(&self, cost: u64) -> Result<(), ResourceLimitError> {
         self.check_not_exhausted(LimitKind::Steps)?;
         self.try_add_bounded(&self.steps, cost, self.limits.max_steps, LimitKind::Steps)?;
@@ -231,7 +317,13 @@ impl Meter for BudgetMeter {
             self.limits.max_page_reads,
             LimitKind::PageReads,
         )?;
-        self.charge_steps(count.saturating_mul(16))
+        self.try_add_bounded(
+            &self.steps,
+            count.saturating_mul(16),
+            self.limits.max_steps,
+            LimitKind::Steps,
+        )?;
+        Ok(())
     }
 
     fn reserve_memory(&self, bytes: u64) -> Result<(), ResourceLimitError> {

@@ -40,8 +40,8 @@ pub use collation::{
 pub use compare::{blob_compare, compare_op, int_float_compare, mem_compare, CompareOp};
 pub use fp_core::{fp10_convert2, fp10_convert2_full, fp_decode, FpDecoded, FpSpecial};
 pub use fp_format::{
-    format_float, real_to_text, FloatConversion, FloatFormatSpec, SignPrefix, DEFAULT_FP_DIGITS,
-    FP_PRECISION_LIMIT,
+    format_float, real_to_text, real_to_text_buf, FloatConversion, FloatFormatSpec, SignPrefix,
+    DEFAULT_FP_DIGITS, FP_PRECISION_LIMIT,
 };
 pub use int64::{
     add_i64, div_i64, i64_to_real, int64_to_text, mul_i64, real_same_as_int, real_to_exact_i64,

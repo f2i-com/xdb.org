@@ -105,8 +105,47 @@ pub fn rem_i64(a: i64, b: i64) -> Option<i64> {
     Some(a % b)
 }
 
+const DEC_DIGITS_LUT: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
+
+/// Stack-allocated `i64 -> ASCII` formatter (2 digits per division, zero heap allocations).
+#[inline]
+pub fn int64_to_text_buf(v: i64, buf: &mut [u8; 24]) -> &[u8] {
+    let neg = v < 0;
+    let mut n = v.unsigned_abs();
+    let mut pos = buf.len();
+    while n >= 100 {
+        let rem = ((n % 100) as usize) * 2;
+        n /= 100;
+        pos -= 2;
+        buf[pos] = DEC_DIGITS_LUT[rem];
+        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
+    }
+    if n >= 10 {
+        let rem = (n as usize) * 2;
+        pos -= 2;
+        buf[pos] = DEC_DIGITS_LUT[rem];
+        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
+    } else {
+        pos -= 1;
+        buf[pos] = b'0' + (n as u8);
+    }
+    if neg {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    &buf[pos..]
+}
+
 /// `sqlite3Int64ToText` (`util.c:1088`): plain decimal with a leading `'-'` for negatives.
 #[inline]
 pub fn int64_to_text(v: i64) -> String {
-    v.to_string()
+    let mut buf = [0u8; 24];
+    let s = int64_to_text_buf(v, &mut buf);
+    // SAFETY-free: `DEC_DIGITS_LUT`, `'0'..='9'`, `'-'` are strictly ASCII.
+    std::str::from_utf8(s).expect("ASCII").to_string()
 }

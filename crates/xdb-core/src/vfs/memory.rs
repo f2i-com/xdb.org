@@ -80,7 +80,16 @@ impl MemFsState {
         let old_size = node.data.len();
         if new_size > old_size {
             let delta = new_size - old_size;
-            let next_total = self.total_bytes.saturating_add(delta);
+            let next_total = match self.total_bytes.checked_add(delta) {
+                Some(n) => n,
+                None => {
+                    return Err(IoError::with_path(
+                        IoErrorCode::Full,
+                        "VFS total size overflow",
+                        path,
+                    ));
+                }
+            };
             if let Some(cap) = self.max_total_bytes {
                 if next_total > cap {
                     return Err(IoError::with_path(
@@ -89,6 +98,14 @@ impl MemFsState {
                         path,
                     ));
                 }
+            }
+            if node.data.try_reserve(delta).is_err() && node.data.try_reserve_exact(delta).is_err()
+            {
+                return Err(IoError::with_path(
+                    IoErrorCode::IoErrNoMem,
+                    format!("VFS allocation failed growing to {new_size} bytes"),
+                    path,
+                ));
             }
             node.data.resize(new_size, 0);
             self.total_bytes = next_total;
@@ -200,7 +217,16 @@ impl MemoryVfs {
             .as_ref()
             .map_or(0, |n| n.lock().expect("node poisoned").data.len());
         let new_len = bytes.len();
-        let next_total = st.total_bytes.saturating_sub(old_len).saturating_add(new_len);
+        let next_total = match st.total_bytes.saturating_sub(old_len).checked_add(new_len) {
+            Some(n) => n,
+            None => {
+                return Err(IoError::with_path(
+                    IoErrorCode::Full,
+                    "VFS total size overflow",
+                    &path,
+                ));
+            }
+        };
         if let Some(cap) = st.max_total_bytes {
             if next_total > cap {
                 return Err(IoError::with_path(
@@ -267,11 +293,12 @@ impl Vfs for MemoryVfs {
         };
         drop(st);
 
+        let readonly = flags.mode == OpenMode::ReadOnly;
         let lock = self.locks.open_handle(self.node_lock_key(node_id));
         Ok(Box::new(MemoryFile {
             path: path.to_string(),
-            readonly: flags.mode == OpenMode::ReadOnly,
-            delete_on_close: flags.delete_on_close,
+            readonly,
+            delete_on_close: flags.delete_on_close && !readonly,
             node,
             state: self.state.clone(),
             lock,

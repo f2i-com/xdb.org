@@ -18,12 +18,19 @@ pub fn dequote(z: &str) -> String {
     if q == b'[' {
         q = b']';
     }
-    let mut out = String::with_capacity(bytes.len().saturating_sub(2));
+    let len = bytes.len();
+    if len >= 2 {
+        let inner = &bytes[1..len - 1];
+        if bytes[len - 1] == q && !inner.contains(&q) {
+            return z[1..len - 1].to_string();
+        }
+    }
+    let mut out = String::with_capacity(len.saturating_sub(2));
     let mut run_start = 1;
     let mut i = 1;
-    while i < bytes.len() {
+    while i < len {
         if bytes[i] == q {
-            if i + 1 < bytes.len() && bytes[i + 1] == q {
+            if i + 1 < len && bytes[i + 1] == q {
                 out.push_str(&z[run_start..=i]);
                 i += 2;
                 run_start = i;
@@ -123,6 +130,7 @@ pub fn stored_type(raw_type: Option<&str>) -> StoredType {
         while m > 0 && is_sql_space(bytes[m - 1]) {
             m -= 1;
         }
+        n = m;
         if m >= 9 && matches_at(raw, m - 9, "generated") {
             m -= 9;
             while m > 0 && is_sql_space(bytes[m - 1]) {

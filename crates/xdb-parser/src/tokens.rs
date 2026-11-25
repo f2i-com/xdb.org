@@ -298,164 +298,430 @@ pub const fn falls_back_to_id(t: u16) -> bool {
 
 /// `keywordCode` (`keywordhash.h`): the keyword token for `bytes`, or `tk::ID`.
 /// Matching is ASCII case-insensitive.
+#[inline]
 pub fn keyword_code(bytes: &[u8]) -> u16 {
     let n = bytes.len();
     if !(2..=17).contains(&n) {
         return tk::ID;
     }
-    let mut lower = [0u8; 17];
-    let mut i = 0;
-    while i < n {
-        lower[i] = bytes[i].to_ascii_lowercase();
-        i += 1;
-    }
-    match &lower[..n] {
-        b"abort" => tk::ABORT,
-        b"action" => tk::ACTION,
-        b"add" => tk::ADD,
-        b"after" => tk::AFTER,
-        b"all" => tk::ALL,
-        b"alter" => tk::ALTER,
-        b"always" => tk::ALWAYS,
-        b"analyze" => tk::ANALYZE,
-        b"and" => tk::AND,
-        b"as" => tk::AS,
-        b"asc" => tk::ASC,
-        b"attach" => tk::ATTACH,
-        b"autoincrement" => tk::AUTOINCR,
-        b"before" => tk::BEFORE,
-        b"begin" => tk::BEGIN,
-        b"between" => tk::BETWEEN,
-        b"by" => tk::BY,
-        b"cascade" => tk::CASCADE,
-        b"case" => tk::CASE,
-        b"cast" => tk::CAST,
-        b"check" => tk::CHECK,
-        b"collate" => tk::COLLATE,
-        b"column" => tk::COLUMNKW,
-        b"commit" => tk::COMMIT,
-        b"conflict" => tk::CONFLICT,
-        b"constraint" => tk::CONSTRAINT,
-        b"create" => tk::CREATE,
-        b"cross" => tk::JOIN_KW,
-        b"current" => tk::CURRENT,
-        b"current_date" => tk::CTIME_KW,
-        b"current_time" => tk::CTIME_KW,
-        b"current_timestamp" => tk::CTIME_KW,
-        b"database" => tk::DATABASE,
-        b"default" => tk::DEFAULT,
-        b"deferred" => tk::DEFERRED,
-        b"deferrable" => tk::DEFERRABLE,
-        b"delete" => tk::DELETE,
-        b"desc" => tk::DESC,
-        b"detach" => tk::DETACH,
-        b"distinct" => tk::DISTINCT,
-        b"do" => tk::DO,
-        b"drop" => tk::DROP,
-        b"end" => tk::END,
-        b"each" => tk::EACH,
-        b"else" => tk::ELSE,
-        b"escape" => tk::ESCAPE,
-        b"except" => tk::EXCEPT,
-        b"exclusive" => tk::EXCLUSIVE,
-        b"exclude" => tk::EXCLUDE,
-        b"exists" => tk::EXISTS,
-        b"explain" => tk::EXPLAIN,
-        b"fail" => tk::FAIL,
-        b"filter" => tk::FILTER,
-        b"first" => tk::FIRST,
-        b"following" => tk::FOLLOWING,
-        b"for" => tk::FOR,
-        b"foreign" => tk::FOREIGN,
-        b"from" => tk::FROM,
-        b"full" => tk::JOIN_KW,
-        b"generated" => tk::GENERATED,
-        b"glob" => tk::LIKE_KW,
-        b"group" => tk::GROUP,
-        b"groups" => tk::GROUPS,
-        b"having" => tk::HAVING,
-        b"if" => tk::IF,
-        b"ignore" => tk::IGNORE,
-        b"immediate" => tk::IMMEDIATE,
-        b"in" => tk::IN,
-        b"index" => tk::INDEX,
-        b"indexed" => tk::INDEXED,
-        b"initially" => tk::INITIALLY,
-        b"inner" => tk::JOIN_KW,
-        b"insert" => tk::INSERT,
-        b"instead" => tk::INSTEAD,
-        b"intersect" => tk::INTERSECT,
-        b"into" => tk::INTO,
-        b"is" => tk::IS,
-        b"isnull" => tk::ISNULL,
-        b"join" => tk::JOIN,
-        b"key" => tk::KEY,
-        b"last" => tk::LAST,
-        b"left" => tk::JOIN_KW,
-        b"like" => tk::LIKE_KW,
-        b"limit" => tk::LIMIT,
-        b"match" => tk::MATCH,
-        b"materialized" => tk::MATERIALIZED,
-        b"natural" => tk::JOIN_KW,
-        b"no" => tk::NO,
-        b"not" => tk::NOT,
-        b"nothing" => tk::NOTHING,
-        b"notnull" => tk::NOTNULL,
-        b"null" => tk::NULL,
-        b"nulls" => tk::NULLS,
-        b"of" => tk::OF,
-        b"offset" => tk::OFFSET,
-        b"on" => tk::ON,
-        b"or" => tk::OR,
-        b"order" => tk::ORDER,
-        b"others" => tk::OTHERS,
-        b"outer" => tk::JOIN_KW,
-        b"over" => tk::OVER,
-        b"partition" => tk::PARTITION,
-        b"plan" => tk::PLAN,
-        b"pragma" => tk::PRAGMA,
-        b"preceding" => tk::PRECEDING,
-        b"primary" => tk::PRIMARY,
-        b"query" => tk::QUERY,
-        b"raise" => tk::RAISE,
-        b"range" => tk::RANGE,
-        b"recursive" => tk::RECURSIVE,
-        b"references" => tk::REFERENCES,
-        b"regexp" => tk::LIKE_KW,
-        b"reindex" => tk::REINDEX,
-        b"release" => tk::RELEASE,
-        b"rename" => tk::RENAME,
-        b"replace" => tk::REPLACE,
-        b"restrict" => tk::RESTRICT,
-        b"returning" => tk::RETURNING,
-        b"right" => tk::JOIN_KW,
-        b"rollback" => tk::ROLLBACK,
-        b"row" => tk::ROW,
-        b"rows" => tk::ROWS,
-        b"savepoint" => tk::SAVEPOINT,
-        b"select" => tk::SELECT,
-        b"set" => tk::SET,
-        b"table" => tk::TABLE,
-        b"temp" | b"temporary" => tk::TEMP,
-        b"then" => tk::THEN,
-        b"ties" => tk::TIES,
-        b"to" => tk::TO,
-        b"transaction" => tk::TRANSACTION,
-        b"trigger" => tk::TRIGGER,
-        b"unbounded" => tk::UNBOUNDED,
-        b"union" => tk::UNION,
-        b"unique" => tk::UNIQUE,
-        b"update" => tk::UPDATE,
-        b"using" => tk::USING,
-        b"vacuum" => tk::VACUUM,
-        b"values" => tk::VALUES,
-        b"view" => tk::VIEW,
-        b"virtual" => tk::VIRTUAL,
-        b"when" => tk::WHEN,
-        b"where" => tk::WHERE,
-        b"window" => tk::WINDOW,
-        b"with" => tk::WITH,
-        b"without" => tk::WITHOUT,
+    match (n, bytes[0] | 0x20) {
+        (2, b'a') if bytes[1] | 0x20 == b's' => tk::AS,
+        (2, b'b') if bytes[1] | 0x20 == b'y' => tk::BY,
+        (2, b'd') if bytes[1] | 0x20 == b'o' => tk::DO,
+        (2, b'i') => match bytes[1] | 0x20 {
+            b'f' => tk::IF,
+            b'n' => tk::IN,
+            b's' => tk::IS,
+            _ => tk::ID,
+        },
+        (2, b'n') if bytes[1] | 0x20 == b'o' => tk::NO,
+        (2, b'o') => match bytes[1] | 0x20 {
+            b'f' => tk::OF,
+            b'n' => tk::ON,
+            b'r' => tk::OR,
+            _ => tk::ID,
+        },
+        (2, b't') if bytes[1] | 0x20 == b'o' => tk::TO,
+
+        (3, b'a') => {
+            if bytes.eq_ignore_ascii_case(b"and") {
+                tk::AND
+            } else if bytes.eq_ignore_ascii_case(b"all") {
+                tk::ALL
+            } else if bytes.eq_ignore_ascii_case(b"asc") {
+                tk::ASC
+            } else if bytes.eq_ignore_ascii_case(b"add") {
+                tk::ADD
+            } else {
+                tk::ID
+            }
+        }
+        (3, b'e') if bytes.eq_ignore_ascii_case(b"end") => tk::END,
+        (3, b'f') if bytes.eq_ignore_ascii_case(b"for") => tk::FOR,
+        (3, b'k') if bytes.eq_ignore_ascii_case(b"key") => tk::KEY,
+        (3, b'n') if bytes.eq_ignore_ascii_case(b"not") => tk::NOT,
+        (3, b'r') if bytes.eq_ignore_ascii_case(b"row") => tk::ROW,
+        (3, b's') if bytes.eq_ignore_ascii_case(b"set") => tk::SET,
+
+        (4, b'c') => {
+            if bytes.eq_ignore_ascii_case(b"case") {
+                tk::CASE
+            } else if bytes.eq_ignore_ascii_case(b"cast") {
+                tk::CAST
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'd') => {
+            if bytes.eq_ignore_ascii_case(b"desc") {
+                tk::DESC
+            } else if bytes.eq_ignore_ascii_case(b"drop") {
+                tk::DROP
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'e') => {
+            if bytes.eq_ignore_ascii_case(b"else") {
+                tk::ELSE
+            } else if bytes.eq_ignore_ascii_case(b"each") {
+                tk::EACH
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'f') => {
+            if bytes.eq_ignore_ascii_case(b"from") {
+                tk::FROM
+            } else if bytes.eq_ignore_ascii_case(b"full") {
+                tk::JOIN_KW
+            } else if bytes.eq_ignore_ascii_case(b"fail") {
+                tk::FAIL
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'g') if bytes.eq_ignore_ascii_case(b"glob") => tk::LIKE_KW,
+        (4, b'i') if bytes.eq_ignore_ascii_case(b"into") => tk::INTO,
+        (4, b'j') if bytes.eq_ignore_ascii_case(b"join") => tk::JOIN,
+        (4, b'l') => {
+            if bytes.eq_ignore_ascii_case(b"left") {
+                tk::JOIN_KW
+            } else if bytes.eq_ignore_ascii_case(b"like") {
+                tk::LIKE_KW
+            } else if bytes.eq_ignore_ascii_case(b"last") {
+                tk::LAST
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'n') if bytes.eq_ignore_ascii_case(b"null") => tk::NULL,
+        (4, b'o') if bytes.eq_ignore_ascii_case(b"over") => tk::OVER,
+        (4, b'p') if bytes.eq_ignore_ascii_case(b"plan") => tk::PLAN,
+        (4, b'r') if bytes.eq_ignore_ascii_case(b"rows") => tk::ROWS,
+        (4, b't') => {
+            if bytes.eq_ignore_ascii_case(b"then") {
+                tk::THEN
+            } else if bytes.eq_ignore_ascii_case(b"temp") {
+                tk::TEMP
+            } else if bytes.eq_ignore_ascii_case(b"ties") {
+                tk::TIES
+            } else {
+                tk::ID
+            }
+        }
+        (4, b'v') if bytes.eq_ignore_ascii_case(b"view") => tk::VIEW,
+        (4, b'w') => {
+            if bytes.eq_ignore_ascii_case(b"with") {
+                tk::WITH
+            } else if bytes.eq_ignore_ascii_case(b"when") {
+                tk::WHEN
+            } else {
+                tk::ID
+            }
+        }
+
+        (5, b'a') => {
+            if bytes.eq_ignore_ascii_case(b"alter") {
+                tk::ALTER
+            } else if bytes.eq_ignore_ascii_case(b"after") {
+                tk::AFTER
+            } else if bytes.eq_ignore_ascii_case(b"abort") {
+                tk::ABORT
+            } else {
+                tk::ID
+            }
+        }
+        (5, b'b') if bytes.eq_ignore_ascii_case(b"begin") => tk::BEGIN,
+        (5, b'c') => {
+            if bytes.eq_ignore_ascii_case(b"check") {
+                tk::CHECK
+            } else if bytes.eq_ignore_ascii_case(b"cross") {
+                tk::JOIN_KW
+            } else {
+                tk::ID
+            }
+        }
+        (5, b'f') if bytes.eq_ignore_ascii_case(b"first") => tk::FIRST,
+        (5, b'g') if bytes.eq_ignore_ascii_case(b"group") => tk::GROUP,
+        (5, b'i') => {
+            if bytes.eq_ignore_ascii_case(b"index") {
+                tk::INDEX
+            } else if bytes.eq_ignore_ascii_case(b"inner") {
+                tk::JOIN_KW
+            } else {
+                tk::ID
+            }
+        }
+        (5, b'l') if bytes.eq_ignore_ascii_case(b"limit") => tk::LIMIT,
+        (5, b'm') if bytes.eq_ignore_ascii_case(b"match") => tk::MATCH,
+        (5, b'n') if bytes.eq_ignore_ascii_case(b"nulls") => tk::NULLS,
+        (5, b'o') => {
+            if bytes.eq_ignore_ascii_case(b"order") {
+                tk::ORDER
+            } else if bytes.eq_ignore_ascii_case(b"outer") {
+                tk::JOIN_KW
+            } else {
+                tk::ID
+            }
+        }
+        (5, b'q') if bytes.eq_ignore_ascii_case(b"query") => tk::QUERY,
+        (5, b'r') => {
+            if bytes.eq_ignore_ascii_case(b"right") {
+                tk::JOIN_KW
+            } else if bytes.eq_ignore_ascii_case(b"range") {
+                tk::RANGE
+            } else if bytes.eq_ignore_ascii_case(b"raise") {
+                tk::RAISE
+            } else {
+                tk::ID
+            }
+        }
+        (5, b't') if bytes.eq_ignore_ascii_case(b"table") => tk::TABLE,
+        (5, b'u') => {
+            if bytes.eq_ignore_ascii_case(b"union") {
+                tk::UNION
+            } else if bytes.eq_ignore_ascii_case(b"using") {
+                tk::USING
+            } else {
+                tk::ID
+            }
+        }
+        (5, b'w') if bytes.eq_ignore_ascii_case(b"where") => tk::WHERE,
+
+        (6, b'a') => {
+            if bytes.eq_ignore_ascii_case(b"action") {
+                tk::ACTION
+            } else if bytes.eq_ignore_ascii_case(b"always") {
+                tk::ALWAYS
+            } else if bytes.eq_ignore_ascii_case(b"attach") {
+                tk::ATTACH
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'b') if bytes.eq_ignore_ascii_case(b"before") => tk::BEFORE,
+        (6, b'c') => {
+            if bytes.eq_ignore_ascii_case(b"create") {
+                tk::CREATE
+            } else if bytes.eq_ignore_ascii_case(b"commit") {
+                tk::COMMIT
+            } else if bytes.eq_ignore_ascii_case(b"column") {
+                tk::COLUMNKW
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'd') => {
+            if bytes.eq_ignore_ascii_case(b"delete") {
+                tk::DELETE
+            } else if bytes.eq_ignore_ascii_case(b"detach") {
+                tk::DETACH
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'e') => {
+            if bytes.eq_ignore_ascii_case(b"exists") {
+                tk::EXISTS
+            } else if bytes.eq_ignore_ascii_case(b"except") {
+                tk::EXCEPT
+            } else if bytes.eq_ignore_ascii_case(b"escape") {
+                tk::ESCAPE
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'f') if bytes.eq_ignore_ascii_case(b"filter") => tk::FILTER,
+        (6, b'g') if bytes.eq_ignore_ascii_case(b"groups") => tk::GROUPS,
+        (6, b'h') if bytes.eq_ignore_ascii_case(b"having") => tk::HAVING,
+        (6, b'i') => {
+            if bytes.eq_ignore_ascii_case(b"insert") {
+                tk::INSERT
+            } else if bytes.eq_ignore_ascii_case(b"ignore") {
+                tk::IGNORE
+            } else if bytes.eq_ignore_ascii_case(b"isnull") {
+                tk::ISNULL
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'o') => {
+            if bytes.eq_ignore_ascii_case(b"offset") {
+                tk::OFFSET
+            } else if bytes.eq_ignore_ascii_case(b"others") {
+                tk::OTHERS
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'p') if bytes.eq_ignore_ascii_case(b"pragma") => tk::PRAGMA,
+        (6, b'r') => {
+            if bytes.eq_ignore_ascii_case(b"rename") {
+                tk::RENAME
+            } else if bytes.eq_ignore_ascii_case(b"regexp") {
+                tk::LIKE_KW
+            } else {
+                tk::ID
+            }
+        }
+        (6, b's') if bytes.eq_ignore_ascii_case(b"select") => tk::SELECT,
+        (6, b'u') => {
+            if bytes.eq_ignore_ascii_case(b"update") {
+                tk::UPDATE
+            } else if bytes.eq_ignore_ascii_case(b"unique") {
+                tk::UNIQUE
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'v') => {
+            if bytes.eq_ignore_ascii_case(b"values") {
+                tk::VALUES
+            } else if bytes.eq_ignore_ascii_case(b"vacuum") {
+                tk::VACUUM
+            } else {
+                tk::ID
+            }
+        }
+        (6, b'w') if bytes.eq_ignore_ascii_case(b"window") => tk::WINDOW,
+
+        (7, b'a') if bytes.eq_ignore_ascii_case(b"analyze") => tk::ANALYZE,
+        (7, b'b') if bytes.eq_ignore_ascii_case(b"between") => tk::BETWEEN,
+        (7, b'c') => {
+            if bytes.eq_ignore_ascii_case(b"collate") {
+                tk::COLLATE
+            } else if bytes.eq_ignore_ascii_case(b"current") {
+                tk::CURRENT
+            } else if bytes.eq_ignore_ascii_case(b"cascade") {
+                tk::CASCADE
+            } else {
+                tk::ID
+            }
+        }
+        (7, b'd') if bytes.eq_ignore_ascii_case(b"default") => tk::DEFAULT,
+        (7, b'e') => {
+            if bytes.eq_ignore_ascii_case(b"explain") {
+                tk::EXPLAIN
+            } else if bytes.eq_ignore_ascii_case(b"exclude") {
+                tk::EXCLUDE
+            } else {
+                tk::ID
+            }
+        }
+        (7, b'f') if bytes.eq_ignore_ascii_case(b"foreign") => tk::FOREIGN,
+        (7, b'i') => {
+            if bytes.eq_ignore_ascii_case(b"indexed") {
+                tk::INDEXED
+            } else if bytes.eq_ignore_ascii_case(b"instead") {
+                tk::INSTEAD
+            } else {
+                tk::ID
+            }
+        }
+        (7, b'n') => {
+            if bytes.eq_ignore_ascii_case(b"notnull") {
+                tk::NOTNULL
+            } else if bytes.eq_ignore_ascii_case(b"nothing") {
+                tk::NOTHING
+            } else if bytes.eq_ignore_ascii_case(b"natural") {
+                tk::JOIN_KW
+            } else {
+                tk::ID
+            }
+        }
+        (7, b'p') if bytes.eq_ignore_ascii_case(b"primary") => tk::PRIMARY,
+        (7, b'r') => {
+            if bytes.eq_ignore_ascii_case(b"replace") {
+                tk::REPLACE
+            } else if bytes.eq_ignore_ascii_case(b"release") {
+                tk::RELEASE
+            } else if bytes.eq_ignore_ascii_case(b"reindex") {
+                tk::REINDEX
+            } else {
+                tk::ID
+            }
+        }
+        (7, b't') if bytes.eq_ignore_ascii_case(b"trigger") => tk::TRIGGER,
+        (7, b'v') if bytes.eq_ignore_ascii_case(b"virtual") => tk::VIRTUAL,
+        (7, b'w') if bytes.eq_ignore_ascii_case(b"without") => tk::WITHOUT,
+
+        (8, b'c') if bytes.eq_ignore_ascii_case(b"conflict") => tk::CONFLICT,
+        (8, b'd') => {
+            if bytes.eq_ignore_ascii_case(b"distinct") {
+                tk::DISTINCT
+            } else if bytes.eq_ignore_ascii_case(b"database") {
+                tk::DATABASE
+            } else if bytes.eq_ignore_ascii_case(b"deferred") {
+                tk::DEFERRED
+            } else {
+                tk::ID
+            }
+        }
+        (8, b'r') => {
+            if bytes.eq_ignore_ascii_case(b"rollback") {
+                tk::ROLLBACK
+            } else if bytes.eq_ignore_ascii_case(b"restrict") {
+                tk::RESTRICT
+            } else {
+                tk::ID
+            }
+        }
+
+        (9, b'e') if bytes.eq_ignore_ascii_case(b"exclusive") => tk::EXCLUSIVE,
+        (9, b'f') if bytes.eq_ignore_ascii_case(b"following") => tk::FOLLOWING,
+        (9, b'g') if bytes.eq_ignore_ascii_case(b"generated") => tk::GENERATED,
+        (9, b'i') => {
+            if bytes.eq_ignore_ascii_case(b"intersect") {
+                tk::INTERSECT
+            } else if bytes.eq_ignore_ascii_case(b"immediate") {
+                tk::IMMEDIATE
+            } else if bytes.eq_ignore_ascii_case(b"initially") {
+                tk::INITIALLY
+            } else {
+                tk::ID
+            }
+        }
+        (9, b'p') => {
+            if bytes.eq_ignore_ascii_case(b"partition") {
+                tk::PARTITION
+            } else if bytes.eq_ignore_ascii_case(b"preceding") {
+                tk::PRECEDING
+            } else {
+                tk::ID
+            }
+        }
+        (9, b'r') => {
+            if bytes.eq_ignore_ascii_case(b"returning") {
+                tk::RETURNING
+            } else if bytes.eq_ignore_ascii_case(b"recursive") {
+                tk::RECURSIVE
+            } else {
+                tk::ID
+            }
+        }
+        (9, b's') if bytes.eq_ignore_ascii_case(b"savepoint") => tk::SAVEPOINT,
+        (9, b't') if bytes.eq_ignore_ascii_case(b"temporary") => tk::TEMP,
+        (9, b'u') if bytes.eq_ignore_ascii_case(b"unbounded") => tk::UNBOUNDED,
+
+        (10, b'c') if bytes.eq_ignore_ascii_case(b"constraint") => tk::CONSTRAINT,
+        (10, b'd') if bytes.eq_ignore_ascii_case(b"deferrable") => tk::DEFERRABLE,
+        (10, b'r') if bytes.eq_ignore_ascii_case(b"references") => tk::REFERENCES,
+
+        (11, b't') if bytes.eq_ignore_ascii_case(b"transaction") => tk::TRANSACTION,
+
+        (12, b'c')
+            if bytes.eq_ignore_ascii_case(b"current_date")
+                || bytes.eq_ignore_ascii_case(b"current_time") =>
+        {
+            tk::CTIME_KW
+        }
+        (12, b'm') if bytes.eq_ignore_ascii_case(b"materialized") => tk::MATERIALIZED,
+
+        (13, b'a') if bytes.eq_ignore_ascii_case(b"autoincrement") => tk::AUTOINCR,
+
+        (17, b'c') if bytes.eq_ignore_ascii_case(b"current_timestamp") => tk::CTIME_KW,
+
         _ => tk::ID,
     }
 }

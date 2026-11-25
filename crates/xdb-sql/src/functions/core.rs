@@ -1,6 +1,6 @@
 //! SQLite 3.54.1 core scalar functions (`func.c`).
 
-use xdb_core::value::{int_value, is_sql_xdigit, mem_compare, numeric_value, real_value, SqlValue};
+use xdb_core::value::{int_value, is_sql_xdigit, mem_compare, real_value, SqlValue};
 
 use crate::errors::{SqlError, SqlResult};
 use crate::functions::like::{like_invoke, GLOB_INFO, LIKE_INFO};
@@ -153,7 +153,7 @@ pub fn call_core_scalar(
             match text_bytes_of(&args[0]) {
                 None => SqlValue::Null,
                 Some(b) => {
-                    if b.is_empty() {
+                    if b.is_empty() || b[0] == 0 {
                         SqlValue::Null
                     } else {
                         let (cp, _) = utf8_read(&b, 0);
@@ -306,7 +306,15 @@ pub fn call_core_scalar(
             }
             minmax_scalar(args, ctx, true)
         }
-        "like" => like_invoke(args, ctx, LIKE_INFO)?,
+        "like" => like_invoke(
+            args,
+            ctx,
+            if ctx.case_sensitive_like {
+                crate::functions::LIKE_CASE_SENSITIVE_INFO
+            } else {
+                LIKE_INFO
+            },
+        )?,
         "glob" => {
             if args.len() != 2 {
                 return Err(wrong_arity("glob"));
@@ -318,13 +326,14 @@ pub fn call_core_scalar(
             if args.len() != 2 {
                 return Err(wrong_arity("likelihood"));
             }
-            let p = real_value(&args[1]);
-            if !(0.0..=1.0).contains(&p) || args[1].is_null() {
-                return Err(SqlError::runtime(
-                    "second argument of likelihood() must be a constant between 0.0 and 1.0",
-                ));
+            match args[1] {
+                SqlValue::Real(p) if (0.0..=1.0).contains(&p) => args[0].clone(),
+                _ => {
+                    return Err(SqlError::runtime(
+                        "second argument of likelihood() must be a constant between 0.0 and 1.0",
+                    ));
+                }
             }
-            args[0].clone()
         }
         "likely" | "unlikely" => {
             if args.len() != 1 {
@@ -402,14 +411,7 @@ fn abs_fn(v: &SqlValue) -> SqlResult<SqlValue> {
             None => Err(SqlError::runtime("integer overflow")),
         },
         SqlValue::Real(r) => Ok(SqlValue::real(r.abs())),
-        SqlValue::Text(_) | SqlValue::Blob(_) => match numeric_value(v) {
-            SqlValue::Int(i) => match i.checked_abs() {
-                Some(a) => Ok(SqlValue::Int(a)),
-                None => Err(SqlError::runtime("integer overflow")),
-            },
-            SqlValue::Real(r) => Ok(SqlValue::real(r.abs())),
-            other => Ok(other),
-        },
+        SqlValue::Text(_) | SqlValue::Blob(_) => Ok(SqlValue::real(real_value(v).abs())),
     }
 }
 
@@ -473,6 +475,7 @@ fn unhex_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue>
     let Some(src) = text_bytes_of(&args[0]) else {
         return Ok(SqlValue::Null);
     };
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
     let skip_chars: Option<std::collections::HashSet<u32>> = if args.len() == 2 {
         let Some(ign) = text_bytes_of(&args[1]) else {
             return Ok(SqlValue::Null);
@@ -486,7 +489,9 @@ fn unhex_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue>
                 ctx.charge_steps(1)?;
             }
             let (cp, next) = utf8_read(&ign, p);
-            chars.insert(cp);
+            if chars.insert(cp) {
+                mem.reserve(8)?;
+            }
             p = next;
         }
         Some(chars)
@@ -495,13 +500,12 @@ fn unhex_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue>
     };
 
     let cap = (src.len() / 2).min(ctx.limits.max_length);
-    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
     mem.reserve(cap as u64)?;
     let mut out = Vec::with_capacity(cap);
     let mut hi: Option<u8> = None;
     let mut i = 0;
     let mut ticks = 0u64;
-    while i < src.len() {
+    while i < src.len() && src[i] != 0 {
         ticks += 1;
         if (ticks & 255) == 0 {
             ctx.charge_steps(1)?;
@@ -723,7 +727,9 @@ fn substr_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue
     let Some(bytes) = text_bytes_of(&args[0]) else {
         return Ok(SqlValue::Null);
     };
-    let n_bytes = bytes.len();
+    // SQLite `substrFunc` (`func.c:372,423,433`) treats TEXT as NUL-terminated for
+    // character counting and UTF-8 stepping (BLOBs above preserve embedded NULs).
+    let n_bytes = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let mut start_byte: usize;
 
     if p1 < 0 {
@@ -731,6 +737,9 @@ fn substr_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue
         let mut total_chars: i64 = 0;
         let mut idx = 0;
         while idx < n_bytes {
+            if (total_chars & 255) == 0 {
+                ctx.charge_steps(1)?;
+            }
             idx = skip_utf8(&bytes, idx);
             total_chars += 1;
         }
@@ -759,13 +768,22 @@ fn substr_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue
 
     start_byte = 0;
     let mut skip = p1;
+    let mut iter_count = 0u64;
     while skip > 0 && start_byte < n_bytes {
+        if (iter_count & 255) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        iter_count += 1;
         start_byte = skip_utf8(&bytes, start_byte);
         skip -= 1;
     }
     let mut end_byte = start_byte;
     let mut take = p2;
     while take > 0 && end_byte < n_bytes {
+        if (iter_count & 255) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        iter_count += 1;
         end_byte = skip_utf8(&bytes, end_byte);
         take -= 1;
     }
@@ -880,27 +898,59 @@ fn replace_fn(
     ) else {
         return Ok(SqlValue::Null);
     };
-    // SQLite replaceFunc reads all three as NUL-terminated C strings.
-    let src = &src[..c_str_len(&src)];
-    let pat = &pat[..c_str_len(&pat)];
-    let rep = &rep[..c_str_len(&rep)];
-    if pat.is_empty() {
+    let src: &[u8] = &src;
+    let pat: &[u8] = &pat;
+    let rep: &[u8] = &rep;
+    if pat.is_empty() || pat[0] == 0 || pat.len() > src.len() {
+        let mut out_mem = crate::utf8::MemoryGuard::new(ctx.meter);
+        out_mem.reserve(src.len() as u64)?;
         return Ok(SqlValue::Text(src.into()));
     }
-    let mut acc = ByteAccum::new(ctx.limits.max_length, false, ctx.meter);
-    let mut i = 0;
-    let mut last = 0;
-    let mut scan_ops = 0u64;
-    while i + pat.len() <= src.len() {
-        scan_ops += 1;
-        if (scan_ops & 63) == 0 {
-            ctx.charge_steps((pat.len().max(1) as u64).min(64))?;
+    // Linear-time O(N + M) metered KMP non-overlapping replace (handles embedded NUL bytes too!).
+    let m = pat.len();
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    mem.reserve((m as u64).saturating_mul(std::mem::size_of::<usize>() as u64))?;
+    let mut lps = vec![0usize; m];
+    let mut len = 0usize;
+    let mut k = 1usize;
+    while k < m {
+        if (k & 127) == 0 {
+            ctx.charge_steps(1)?;
         }
-        if &src[i..i + pat.len()] == pat {
-            acc.push_bytes(&src[last..i])?;
-            acc.push_bytes(rep)?;
-            i += pat.len();
-            last = i;
+        if pat[k] == pat[len] {
+            len += 1;
+            lps[k] = len;
+            k += 1;
+        } else if len != 0 {
+            len = lps[len - 1];
+        } else {
+            lps[k] = 0;
+            k += 1;
+        }
+    }
+
+    let mut acc = ByteAccum::new(ctx.limits.max_length, false, ctx.meter);
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut ops = 0u64;
+    while i < src.len() {
+        ops += 1;
+        if (ops & 127) == 0 {
+            ctx.charge_steps(1)?;
+        }
+        if src[i] == pat[j] {
+            i += 1;
+            j += 1;
+            if j == m {
+                let match_start = i - m;
+                acc.push_bytes(&src[last..match_start])?;
+                acc.push_bytes(rep)?;
+                last = i;
+                j = 0;
+            }
+        } else if j != 0 {
+            j = lps[j - 1];
         } else {
             i += 1;
         }
@@ -927,12 +977,52 @@ fn trim_fn(
     } else {
         std::borrow::Cow::Borrowed(b" ")
     };
+    // SQLite `trimFunc` (`func.c:1610`) stops scanning `zCharSet` at the first NUL byte.
+    let cut_len = cut_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(cut_bytes.len());
+    let cut_bytes: &[u8] = &cut_bytes[..cut_len];
 
-    // Split `cut_bytes` into individual UTF-8 character byte slices.
+    // Fast O(N) stack-bitset path for ASCII trim character sets (99.9% of calls).
+    if cut_bytes.is_ascii() {
+        let mut mask = [false; 128];
+        for &b in cut_bytes.iter() {
+            mask[usize::from(b)] = true;
+        }
+        let mut start = 0usize;
+        let mut end = src.len();
+        if trim_left {
+            while start < end && src[start] < 128 && mask[usize::from(src[start])] {
+                start += 1;
+            }
+        }
+        if trim_right {
+            while end > start && src[end - 1] < 128 && mask[usize::from(src[end - 1])] {
+                end -= 1;
+            }
+        }
+        if src.len() >= 256 {
+            ctx.charge_steps((src.len() / 256) as u64)?;
+        }
+        let mut out_mem = crate::utf8::MemoryGuard::new(ctx.meter);
+        out_mem.reserve((end - start) as u64)?;
+        return Ok(SqlValue::Text(src[start..end].into()));
+    }
+
+    // Split `cut_bytes` into individual UTF-8 character byte slices (metered).
+    let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
+    if !cut_bytes.is_empty() {
+        ctx.charge_steps((cut_bytes.len() / 64) as u64 + 1)?;
+        mem.reserve(
+            (cut_bytes.len() as u64)
+                .saturating_mul(std::mem::size_of::<&[u8]>() as u64),
+        )?;
+    }
     let mut cut_chars: Vec<&[u8]> = Vec::new();
     let mut p = 0;
     while p < cut_bytes.len() {
-        let next = skip_utf8(&cut_bytes, p);
+        let next = skip_utf8(cut_bytes, p);
         cut_chars.push(&cut_bytes[p..next]);
         p = next;
     }
@@ -973,6 +1063,7 @@ fn trim_fn(
         }
     }
 
+    mem.reserve((end - start) as u64)?;
     Ok(SqlValue::Text(src[start..end].into()))
 }
 

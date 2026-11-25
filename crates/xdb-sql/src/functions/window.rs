@@ -8,7 +8,9 @@ use std::cmp::Ordering;
 use xdb_core::value::{
     add, apply_numeric_affinity, int_value, mem_compare, must_be_int, subtract, Collation, SqlValue,
 };
-use xdb_parser::{FrameBound, FrameBoundType, FrameExclude, FrameSpec, FrameUnits, SortOrder};
+use xdb_parser::{
+    FrameBound, FrameBoundType, FrameExclude, FrameSpec, FrameUnits, NullsOrder, SortOrder,
+};
 
 use crate::errors::{SqlError, SqlResult};
 
@@ -236,10 +238,15 @@ where
                     *slot = SqlValue::Null;
                     continue;
                 }
-                let n_pos = int_value(&args[1]);
+                let Some(n_pos) = must_be_int(&args[1]) else {
+                    return Err(SqlError::runtime(
+                        "second argument to nth_value must be a positive integer",
+                    ));
+                };
                 if n_pos <= 0 {
-                    *slot = SqlValue::Null;
-                    continue;
+                    return Err(SqlError::runtime(
+                        "second argument to nth_value must be a positive integer",
+                    ));
                 }
                 let rows = frame_rows_for(i)?;
                 *slot = usize::try_from(n_pos - 1)
@@ -357,18 +364,21 @@ fn check_range_offset(v: &Option<SqlValue>, is_start: bool) -> SqlResult<SqlValu
     Ok(num)
 }
 
-/// Compute the partition row indices belonging to the frame of row `row_idx`.
-pub fn compute_frame_rows(
+/// Compute the raw `[start, end)` slice bounds of the frame for `row_idx`,
+/// before applying `EXCLUDE`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_frame_bounds(
     frame: &ResolvedFrame,
     row_idx: usize,
     part_len: usize,
     peers: &PartitionPeers,
     order_vals: &[SqlValue],
     order_dir: SortOrder,
+    order_nulls: Option<NullsOrder>,
     order_coll: Option<&Collation>,
-) -> SqlResult<Vec<usize>> {
+) -> SqlResult<(usize, usize)> {
     if part_len == 0 {
-        return Ok(Vec::new());
+        return Ok((0, 0));
     }
     let (start, end) = match frame.units {
         FrameUnits::Rows => {
@@ -474,8 +484,9 @@ pub fn compute_frame_rows(
                             &off,
                             frame.start_kind == FrameBoundType::Preceding,
                             order_dir,
+                            true,
                         );
-                        find_range_start(order_vals, &bound, order_dir, order_coll)
+                        find_range_start(order_vals, &bound, order_dir, order_nulls, order_coll)
                     }
                 }
             };
@@ -494,15 +505,44 @@ pub fn compute_frame_rows(
                             &off,
                             frame.end_kind == FrameBoundType::Preceding,
                             order_dir,
+                            false,
                         );
-                        find_range_end(order_vals, &bound, order_dir, order_coll)
+                        find_range_end(order_vals, &bound, order_dir, order_nulls, order_coll)
                     }
                 }
             };
             (s, e)
         }
     };
+    if start >= end {
+        Ok((0, 0))
+    } else {
+        Ok((start, end))
+    }
+}
 
+/// Compute the partition row indices belonging to the frame of row `row_idx`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_frame_rows(
+    frame: &ResolvedFrame,
+    row_idx: usize,
+    part_len: usize,
+    peers: &PartitionPeers,
+    order_vals: &[SqlValue],
+    order_dir: SortOrder,
+    order_nulls: Option<NullsOrder>,
+    order_coll: Option<&Collation>,
+) -> SqlResult<Vec<usize>> {
+    let (start, end) = compute_frame_bounds(
+        frame,
+        row_idx,
+        part_len,
+        peers,
+        order_vals,
+        order_dir,
+        order_nulls,
+        order_coll,
+    )?;
     if start >= end {
         return Ok(Vec::new());
     }
@@ -522,11 +562,90 @@ pub fn compute_frame_rows(
     Ok(rows)
 }
 
-fn range_bound(cur: &SqlValue, off: &SqlValue, is_preceding: bool, dir: SortOrder) -> SqlValue {
+fn range_bound(
+    cur: &SqlValue,
+    off: &SqlValue,
+    is_preceding: bool,
+    dir: SortOrder,
+    is_start: bool,
+) -> SqlValue {
     let sub = match (is_preceding, dir) {
         (true, SortOrder::Asc) | (false, SortOrder::Desc) => true,
         (false, SortOrder::Asc) | (true, SortOrder::Desc) => false,
     };
+    // Guard ±Inf cancellation (`+Inf - +Inf` must span down to `-Inf`, `-Inf + +Inf` up to `+Inf`,
+    // never producing `NaN`/`NULL`!) and exact `i64 ± Real` without lossy `i64 -> f64` rounding.
+    match (cur, off) {
+        (SqlValue::Real(c), SqlValue::Real(o)) if c.is_infinite() && o.is_infinite() => {
+            if sub {
+                if c.is_sign_positive() {
+                    return SqlValue::Real(f64::NEG_INFINITY);
+                }
+                return SqlValue::Real(f64::NEG_INFINITY);
+            } else {
+                return SqlValue::Real(f64::INFINITY);
+            }
+        }
+        (SqlValue::Int(iv), SqlValue::Real(rv)) => {
+            if rv.is_infinite() {
+                return SqlValue::Real(if sub {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                });
+            }
+            if *rv == 0.0 {
+                return SqlValue::Int(*iv);
+            }
+            if let Some(oi) = xdb_core::value::real_to_exact_i64(*rv) {
+                let exact = if sub {
+                    i128::from(*iv) - i128::from(oi)
+                } else {
+                    i128::from(*iv) + i128::from(oi)
+                };
+                if let Ok(i) = i64::try_from(exact) {
+                    return SqlValue::Int(i);
+                }
+                return SqlValue::real(exact as f64);
+            }
+            // When the resulting boundary magnitude is >= 2^52, every representable f64 in that
+            // region is an exact integer (ULP >= 1), so fractional offsets round to integer
+            // thresholds via floor/ceil in i128. Below 2^52 (e.g. (2^52 + 1) - 1.5 = 2^52 - 0.5),
+            // fractional f64 boundaries are exact and must not be rounded!
+            if iv.unsigned_abs() > (1u64 << 52) && *rv < 18446744073709551616.0 {
+                // `need_lower`: true when comparing `x >= bound`, false when comparing `x <= bound`.
+                let need_lower = (dir == SortOrder::Asc) == is_start;
+                let step_i128 = if (sub && need_lower) || (!sub && !need_lower) {
+                    rv.floor() as i128
+                } else {
+                    rv.ceil() as i128
+                };
+                let exact = if sub {
+                    i128::from(*iv) - step_i128
+                } else {
+                    i128::from(*iv) + step_i128
+                };
+                if exact.unsigned_abs() >= (1u128 << 52) {
+                    if let Ok(i) = i64::try_from(exact) {
+                        return SqlValue::Int(i);
+                    }
+                    return SqlValue::real(exact as f64);
+                }
+            }
+        }
+        (SqlValue::Int(iv), SqlValue::Int(oi)) => {
+            let exact = if sub {
+                i128::from(*iv) - i128::from(*oi)
+            } else {
+                i128::from(*iv) + i128::from(*oi)
+            };
+            if let Ok(i) = i64::try_from(exact) {
+                return SqlValue::Int(i);
+            }
+            return SqlValue::real(exact as f64);
+        }
+        _ => {}
+    }
     if sub {
         subtract(cur, off)
     } else {
@@ -534,47 +653,57 @@ fn range_bound(cur: &SqlValue, off: &SqlValue, is_preceding: bool, dir: SortOrde
     }
 }
 
+fn compare_in_order(
+    a: &SqlValue,
+    b: &SqlValue,
+    dir: SortOrder,
+    nulls: Option<NullsOrder>,
+    coll: Option<&Collation>,
+) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => match nulls {
+            Some(NullsOrder::First) => Ordering::Less,
+            Some(NullsOrder::Last) => Ordering::Greater,
+            None => match dir {
+                SortOrder::Asc => Ordering::Less,
+                SortOrder::Desc => Ordering::Greater,
+            },
+        },
+        (false, true) => match nulls {
+            Some(NullsOrder::First) => Ordering::Greater,
+            Some(NullsOrder::Last) => Ordering::Less,
+            None => match dir {
+                SortOrder::Asc => Ordering::Greater,
+                SortOrder::Desc => Ordering::Less,
+            },
+        },
+        (false, false) => {
+            let ord = mem_compare(a, b, coll);
+            match dir {
+                SortOrder::Asc => ord,
+                SortOrder::Desc => ord.reverse(),
+            }
+        }
+    }
+}
+
 fn find_range_start(
     vals: &[SqlValue],
     bound: &SqlValue,
     dir: SortOrder,
+    nulls: Option<NullsOrder>,
     coll: Option<&Collation>,
 ) -> usize {
-    for (i, v) in vals.iter().enumerate() {
-        if !matches!(v, SqlValue::Int(_) | SqlValue::Real(_)) {
-            continue;
-        }
-        let cmp = mem_compare(v, bound, coll);
-        let in_range = match dir {
-            SortOrder::Asc => cmp != Ordering::Less,
-            SortOrder::Desc => cmp != Ordering::Greater,
-        };
-        if in_range {
-            return i;
-        }
-    }
-    vals.len()
+    vals.partition_point(|v| compare_in_order(v, bound, dir, nulls, coll) == Ordering::Less)
 }
 
 fn find_range_end(
     vals: &[SqlValue],
     bound: &SqlValue,
     dir: SortOrder,
+    nulls: Option<NullsOrder>,
     coll: Option<&Collation>,
 ) -> usize {
-    let mut end = 0;
-    for (i, v) in vals.iter().enumerate() {
-        if !matches!(v, SqlValue::Int(_) | SqlValue::Real(_)) {
-            continue;
-        }
-        let cmp = mem_compare(v, bound, coll);
-        let in_range = match dir {
-            SortOrder::Asc => cmp != Ordering::Greater,
-            SortOrder::Desc => cmp != Ordering::Less,
-        };
-        if in_range {
-            end = i + 1;
-        }
-    }
-    end
+    vals.partition_point(|v| compare_in_order(v, bound, dir, nulls, coll) != Ordering::Greater)
 }

@@ -2,6 +2,7 @@
 //! and the B-tree layer.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::errors::{SqliteError, SqliteResult};
 
@@ -18,6 +19,12 @@ pub trait PageSource: fmt::Debug + Send {
 
     /// Read page `pgno` (1-based) into a fresh `Vec<u8>` of length `page_size()`.
     fn read_page(&mut self, pgno: u32) -> SqliteResult<Vec<u8>>;
+
+    /// Read page `pgno` (1-based) as a shared immutable buffer (`Arc<[u8]>`).
+    /// In-memory / live page sources override this to share pages with zero copying.
+    fn read_page_shared(&mut self, pgno: u32) -> SqliteResult<Arc<[u8]>> {
+        Ok(self.read_page(pgno)?.into())
+    }
 
     /// Release any underlying files and locks. Idempotent.
     fn close(&mut self) -> SqliteResult<()> {

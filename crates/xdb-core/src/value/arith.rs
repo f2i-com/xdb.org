@@ -77,15 +77,79 @@ fn fp_math(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
 }
 
 /// `OP_Add` / `OP_Subtract` / `OP_Multiply` / `OP_Divide` / `OP_Remainder`.
+#[inline]
 pub fn arith(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
-    if let (SqlValue::Int(l), SqlValue::Int(r)) = (left, right) {
-        if let Some(res) = int_math(op, *l, *r) {
-            return res;
+    match (left, right) {
+        (SqlValue::Int(l), SqlValue::Int(r)) => {
+            if let Some(res) = int_math(op, *l, *r) {
+                return res;
+            }
+            return fp_math(op, left, right);
         }
-        return fp_math(op, left, right);
-    }
-    if left.is_null() || right.is_null() {
-        return SqlValue::Null;
+        (SqlValue::Null, _) | (_, SqlValue::Null) => return SqlValue::Null,
+        (SqlValue::Real(l), SqlValue::Real(r)) if op != ArithOp::Remainder => {
+            if l.is_nan() || r.is_nan() {
+                return SqlValue::Null;
+            }
+            let res = match op {
+                ArithOp::Add => *l + *r,
+                ArithOp::Subtract => *l - *r,
+                ArithOp::Multiply => *l * *r,
+                ArithOp::Divide => {
+                    if *r == 0.0 {
+                        return SqlValue::Null;
+                    }
+                    *l / *r
+                }
+                ArithOp::Remainder => unreachable!(),
+            };
+            return SqlValue::real(res);
+        }
+        (SqlValue::Real(l), SqlValue::Int(r)) if op != ArithOp::Remainder => {
+            if l.is_nan() {
+                return SqlValue::Null;
+            }
+            let rf = *r as f64;
+            let res = match op {
+                ArithOp::Add => *l + rf,
+                ArithOp::Subtract => *l - rf,
+                ArithOp::Multiply => *l * rf,
+                ArithOp::Divide => {
+                    if *r == 0 {
+                        return SqlValue::Null;
+                    }
+                    *l / rf
+                }
+                ArithOp::Remainder => unreachable!(),
+            };
+            return SqlValue::real(res);
+        }
+        (SqlValue::Int(l), SqlValue::Real(r)) if op != ArithOp::Remainder => {
+            if r.is_nan() {
+                return SqlValue::Null;
+            }
+            let lf = *l as f64;
+            let res = match op {
+                ArithOp::Add => lf + *r,
+                ArithOp::Subtract => lf - *r,
+                ArithOp::Multiply => lf * *r,
+                ArithOp::Divide => {
+                    if *r == 0.0 {
+                        return SqlValue::Null;
+                    }
+                    lf / *r
+                }
+                ArithOp::Remainder => unreachable!(),
+            };
+            return SqlValue::real(res);
+        }
+        (SqlValue::Real(r), _) | (_, SqlValue::Real(r)) => {
+            if r.is_nan() {
+                return SqlValue::Null;
+            }
+            return fp_math(op, left, right);
+        }
+        _ => {}
     }
     let nl = match left {
         SqlValue::Text(b) | SqlValue::Blob(b) => text_numeric_value(b),

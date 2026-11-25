@@ -24,9 +24,9 @@ pub use btree::{
     DEFAULT_CACHE_BYTES, MAX_RECORD_HEADER,
 };
 pub use database::{
-    open_database, open_database_from_bytes, open_database_from_image, ColumnSpec,
-    IndexEntryCursor, IndexReader, OpenOptions, RowCursor, ScanOptions, SqliteDatabase,
-    TableReader,
+    open_database, open_database_from_bytes, open_database_from_image,
+    open_database_from_owned_bytes, ColumnSpec, IndexEntryCursor, IndexReader, OpenOptions,
+    RowCursor, ScanOptions, SqliteDatabase, TableReader,
 };
 pub use errors::{SqliteError, SqliteFormatErrorCode, SqliteResult};
 pub use format::{
