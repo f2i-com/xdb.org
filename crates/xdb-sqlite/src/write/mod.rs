@@ -8,8 +8,8 @@ pub mod record;
 pub mod seed;
 
 pub use btree::{
-    check_integrity, create_btree, drop_btree, index_delete, index_insert, table_delete,
-    table_insert, table_max_rowid,
+    check_integrity, check_integrity_metered, create_btree, drop_btree, index_delete, index_insert,
+    table_delete, table_insert, table_max_rowid,
 };
 pub use connection::{ConnectionOptions, ExecResult, SqliteConnection};
 pub use pager::WritePager;

@@ -192,16 +192,20 @@ impl<'a> FunctionContext<'a> {
 /// User-defined scalar SQL function callback.
 pub type CustomScalarFn = Arc<dyn Fn(&[SqlValue]) -> SqlResult<SqlValue> + Send + Sync>;
 
+type CustomScalarMap = HashMap<(String, Option<usize>), CustomScalarFn>;
+
 /// Registry of custom scalar functions layered on top of SQLite 3.54.1 built-ins.
+/// Uses `Option<Arc<HashMap<...>>>` so cloning options/registries is O(1) even when
+/// custom scalar functions are registered.
 #[derive(Clone, Default)]
 pub struct FunctionRegistry {
-    scalars: HashMap<(String, Option<usize>), CustomScalarFn>,
+    scalars: Option<Arc<CustomScalarMap>>,
 }
 
 impl fmt::Debug for FunctionRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunctionRegistry")
-            .field("custom_scalars", &self.scalars.len())
+            .field("custom_scalars", &self.scalars.as_ref().map_or(0, |m| m.len()))
             .finish()
     }
 }
@@ -232,18 +236,21 @@ impl FunctionRegistry {
         arity: Option<usize>,
         func: CustomScalarFn,
     ) {
-        self.scalars.insert((name.into().to_ascii_lowercase(), arity), func);
+        let map = self.scalars.get_or_insert_with(|| Arc::new(HashMap::new()));
+        Arc::make_mut(map).insert((name.into().to_ascii_lowercase(), arity), func);
     }
 
     /// Returns true if a custom scalar function is registered for `(name, arity)`.
     #[inline]
     pub fn has_custom_scalar(&self, name: &str, arity: usize) -> bool {
-        if self.scalars.is_empty() {
+        let Some(ref map) = self.scalars else {
+            return false;
+        };
+        if map.is_empty() {
             return false;
         }
         let lower = name.to_ascii_lowercase();
-        self.scalars.contains_key(&(lower.clone(), Some(arity)))
-            || self.scalars.contains_key(&(lower, None))
+        map.contains_key(&(lower.clone(), Some(arity))) || map.contains_key(&(lower, None))
     }
 
     /// Invoke a scalar function (custom overrides built-in).
@@ -254,14 +261,15 @@ impl FunctionRegistry {
         args: &[SqlValue],
         ctx: &FunctionContext<'_>,
     ) -> SqlResult<(SqlValue, bool)> {
-        if !self.scalars.is_empty() {
-            let lower = name.to_ascii_lowercase();
-            if let Some(f) = self
-                .scalars
-                .get(&(lower.clone(), Some(args.len())))
-                .or_else(|| self.scalars.get(&(lower, None)))
-            {
-                return Ok((f(args)?, false));
+        if let Some(ref map) = self.scalars {
+            if !map.is_empty() {
+                let lower = name.to_ascii_lowercase();
+                if let Some(f) = map
+                    .get(&(lower.clone(), Some(args.len())))
+                    .or_else(|| map.get(&(lower, None)))
+                {
+                    return Ok((f(args)?, false));
+                }
             }
         }
         let mut stack_buf = [0u8; 40];

@@ -23,14 +23,15 @@ use crate::catalog::{Bound, QueryOptions, QueryParams, QueryResult, SqlCatalog, 
 use crate::errors::{SqlError, SqlResult};
 use crate::eval::{
     collect_aggregates, collect_windows, eval_expr, expr_affinity, expr_collation,
-    expr_contains_aggregate, expr_contains_window, is_valid_schema_name, resolve_column,
-    CompiledRowPred, EvalEnv, EvalScope, ExprCollation, ScopeColumn, SelectWithMeta,
-    SubqueryRunner, TableRowsWithMeta,
+    expr_contains_aggregate, expr_contains_non_window_aggregate, expr_contains_window,
+    is_valid_schema_name, resolve_column, CompiledRowPred, EvalEnv, EvalScope, ExprCollation,
+    ScopeColumn, SelectWithMeta, SubqueryRunner, TableRowsWithMeta,
 };
 use crate::functions::{
     aggregates::{SumAcc, SumKind},
     call_builtin_tvf, compute_frame_bounds, compute_frame_rows, eval_window_only_partition,
-    is_builtin_window_only, AggregateAcc, PartitionPeers, ResolvedFrame,
+    is_builtin_window_only, json::call_builtin_tvf_with_limit, AggregateAcc, PartitionPeers,
+    ResolvedFrame,
 };
 use crate::utf8::{estimate_value_bytes, MemoryGuard};
 
@@ -405,14 +406,9 @@ impl<'a> QueryExec<'a> {
                     cte.name.name
                 )));
             }
-            let cte_table = if with.recursive {
-                self.eval_recursive_cte(cte, &map, outer_scopes)?
-            } else {
-                let runner = self.child_with_ctes(map.clone());
-                let (cols, rows) = runner.execute_select_stmt(&cte.select, outer_scopes)?;
-                let cte_cols = apply_cte_column_names(cte, &cols)?;
-                CteTable::new_metered(cte_cols, rows, self.options.meter.as_ref())?
-            };
+            // SQLite treats `WITH` and `WITH RECURSIVE` identically: any CTE whose UNION / UNION ALL
+            // branch references itself is evaluated recursively, while invalid self-references error.
+            let cte_table = self.eval_recursive_cte(cte, &map, outer_scopes)?;
             map.insert(lower, Arc::new(cte_table));
         }
         Ok(self.child_with_ctes(map))
@@ -424,6 +420,20 @@ impl<'a> QueryExec<'a> {
         existing: &HashMap<String, Arc<CteTable>>,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<CteTable> {
+        // If an inner `WITH` inside `cte.select` defines the same CTE name, it shadows the outer
+        // CTE name so `cte` is non-recursive and evaluates normally.
+        let shadowed_by_inner_with = cte.select.with.as_ref().is_some_and(|w| {
+            w.ctes
+                .iter()
+                .any(|ic| ic.name.name.eq_ignore_ascii_case(&cte.name.name))
+        });
+        if shadowed_by_inner_with {
+            let runner = self.child_with_ctes(existing.clone());
+            let (cols, rows) = runner.execute_select_stmt(&cte.select, outer_scopes)?;
+            let cte_cols = apply_cte_column_names(cte, &cols)?;
+            return CteTable::new_metered(cte_cols, rows, self.options.meter.as_ref());
+        }
+
         // Flatten left-associative compound branches so we handle BOTH single and multiple
         // recursive terms (`base UNION ALL rec1 UNION ALL rec2`), while treating non-self-referencing
         // compound CTEs as normal non-recursive queries!
@@ -457,6 +467,15 @@ impl<'a> QueryExec<'a> {
             .map(|(i, _)| i);
 
         if let Some(rec_start) = first_rec {
+            if flat[..rec_start]
+                .iter()
+                .any(|(_, b)| select_body_references_table(b, &cte.name.name))
+            {
+                return Err(SqlError::runtime(format!(
+                    "circular reference: {}",
+                    cte.name.name
+                )));
+            }
             if flat[rec_start..].iter().any(|(op, _)| {
                 matches!(
                     op,
@@ -477,6 +496,33 @@ impl<'a> QueryExec<'a> {
                     cte.name.name
                 )));
             }
+            if flat[rec_start..]
+                .iter()
+                .any(|(_, b)| select_body_references_table_in_subquery(b, &cte.name.name))
+            {
+                return Err(SqlError::runtime(format!(
+                    "recursive reference in a subquery: {}",
+                    cte.name.name
+                )));
+            }
+            let base_existing = if let Some(ref inner_with) = cte.select.with {
+                if inner_with
+                    .ctes
+                    .iter()
+                    .any(|ic| select_stmt_references_table(&ic.select, &cte.name.name))
+                {
+                    return Err(SqlError::runtime(format!(
+                        "circular reference: {}",
+                        cte.name.name
+                    )));
+                }
+                let inner_runner = self
+                    .child_with_ctes(existing.clone())
+                    .materialize_with(inner_with, outer_scopes)?;
+                inner_runner.ctes
+            } else {
+                existing.clone()
+            };
             let mut base_body = flat[0].1.clone();
             for (op, b) in &flat[1..rec_start] {
                 base_body = SelectBody::Compound {
@@ -512,7 +558,7 @@ impl<'a> QueryExec<'a> {
                 .collect();
             let any_distinct = rec_branches.iter().any(|(d, _)| *d);
 
-            let base_runner = self.child_with_ctes(existing.clone());
+            let base_runner = self.child_with_ctes(base_existing.clone());
             let (base_cols, base_rows) =
                 base_runner.execute_select_stmt(&base_stmt, outer_scopes)?;
             let cte_cols = apply_cte_column_names(cte, &base_cols)?;
@@ -565,8 +611,10 @@ impl<'a> QueryExec<'a> {
                         let cname = ov_coll.unwrap_or(&cte_cols[ord - 1].collation);
                         term_colls.push(env.lookup_collation(cname)?);
                     } else {
+                        // SQLite resolves recursive CTE ORDER BY column names against the
+                        // initial SELECT's output column names (`base_cols`), not `cte_cols`.
                         let mut sc_vec = outer_scopes.to_vec();
-                        sc_vec.push(EvalScope::simple(&cte_cols, &[]));
+                        sc_vec.push(EvalScope::simple(&base_cols, &[]));
                         let cname = expr_collation(&term.expr, &sc_vec)
                             .name
                             .unwrap_or_else(|| "BINARY".to_string());
@@ -576,7 +624,7 @@ impl<'a> QueryExec<'a> {
                 let compute_keys = |row: &[SqlValue]| -> SqlResult<Vec<SqlValue>> {
                     let mut ks = Vec::with_capacity(ord_terms.len());
                     let mut sc_vec = outer_scopes.to_vec();
-                    sc_vec.push(EvalScope::simple(&cte_cols, row));
+                    sc_vec.push(EvalScope::simple(&base_cols, row));
                     for term in ord_terms {
                         if let Some((ord, _)) = integer_ordinal_with_collation(&term.expr) {
                             ks.push(row[ord - 1].clone());
@@ -656,7 +704,7 @@ impl<'a> QueryExec<'a> {
                             break;
                         }
                     }
-                    let mut step_map = existing.clone();
+                    let mut step_map = base_existing.clone();
                     step_map.insert(
                         key.clone(),
                         Arc::new(CteTable::untracked(cte_cols.clone(), vec![popped])),
@@ -693,15 +741,18 @@ impl<'a> QueryExec<'a> {
                     }
                 }
                 drop(dedup);
+                drop(pq);
                 let final_rows = self.apply_order_and_limit(
                     &cte_cols,
                     all_rows,
                     None,
                     None,
                     None,
+                    None,
                     cte.select.limit.as_ref(),
                     outer_scopes,
                 )?;
+                drop(mem);
                 return CteTable::new_metered(cte_cols, final_rows, self.options.meter.as_ref());
             }
 
@@ -734,7 +785,7 @@ impl<'a> QueryExec<'a> {
                 }
                 self.charge_steps(1)?;
 
-                let mut step_map = existing.clone();
+                let mut step_map = base_existing.clone();
                 step_map.insert(
                     key.clone(),
                     Arc::new(CteTable::untracked(
@@ -778,19 +829,28 @@ impl<'a> QueryExec<'a> {
             }
 
             drop(dedup);
+            drop(frontier);
             let final_rows = self.apply_order_and_limit(
                 &cte_cols,
                 all_rows,
+                None,
                 None,
                 None,
                 cte.select.order_by_all.as_ref(),
                 cte.select.limit.as_ref(),
                 outer_scopes,
             )?;
+            drop(mem);
             return CteTable::new_metered(cte_cols, final_rows, self.options.meter.as_ref());
         }
 
-        // Non-recursive CTE under WITH RECURSIVE: execute normally.
+        // Non-recursive CTE: reject any self-reference as a circular reference.
+        if select_stmt_references_table(&cte.select, &cte.name.name) {
+            return Err(SqlError::runtime(format!(
+                "circular reference: {}",
+                cte.name.name
+            )));
+        }
         let runner = self.child_with_ctes(existing.clone());
         let (cols, rows) = runner.execute_select_stmt(&cte.select, outer_scopes)?;
         let cte_cols = apply_cte_column_names(cte, &cols)?;
@@ -818,6 +878,7 @@ impl<'a> QueryExec<'a> {
                     &out_cols,
                     out_rows,
                     Some(&order_ctx),
+                    None,
                     stmt.order_by.as_deref(),
                     stmt.order_by_all.as_ref(),
                     stmt.limit.as_ref(),
@@ -825,13 +886,34 @@ impl<'a> QueryExec<'a> {
                 )?;
                 Ok((out_cols, out_expl, final_rows))
             }
-            SelectBody::Values(_) | SelectBody::Compound { .. } => {
+            SelectBody::Values(_) => {
                 let (out_cols, out_expl, out_rows) =
                     self.execute_select_body(&stmt.body, outer_scopes)?;
                 let final_rows = self.apply_order_and_limit(
                     &out_cols,
                     out_rows,
                     None,
+                    None,
+                    stmt.order_by.as_deref(),
+                    stmt.order_by_all.as_ref(),
+                    stmt.limit.as_ref(),
+                    outer_scopes,
+                )?;
+                Ok((out_cols, out_expl, final_rows))
+            }
+            SelectBody::Compound { .. } => {
+                let mut branch_col_names: Vec<Vec<String>> = Vec::new();
+                let (out_cols, out_expl, out_rows) = self.execute_select_body_depth(
+                    &stmt.body,
+                    outer_scopes,
+                    self.query_depth,
+                    Some(&mut branch_col_names),
+                )?;
+                let final_rows = self.apply_order_and_limit(
+                    &out_cols,
+                    out_rows,
+                    None,
+                    Some(&branch_col_names),
                     stmt.order_by.as_deref(),
                     stmt.order_by_all.as_ref(),
                     stmt.limit.as_ref(),
@@ -847,7 +929,7 @@ impl<'a> QueryExec<'a> {
         body: &SelectBody,
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<SelectRowsMeta> {
-        self.execute_select_body_depth(body, outer_scopes, self.query_depth)
+        self.execute_select_body_depth(body, outer_scopes, self.query_depth, None)
     }
 
     fn execute_select_body_depth(
@@ -855,12 +937,16 @@ impl<'a> QueryExec<'a> {
         body: &SelectBody,
         outer_scopes: &[EvalScope<'_>],
         depth: usize,
+        mut branch_names: Option<&mut Vec<Vec<String>>>,
     ) -> SqlResult<SelectRowsMeta> {
         self.check_depth(depth)?;
         match body {
             SelectBody::Core(core) => {
                 let (cols, expl, rows, _) =
                     self.execute_select_core(core, outer_scopes, None, None, None)?;
+                if let Some(ref mut bn) = branch_names {
+                    record_compound_branch_names(bn, &cols);
+                }
                 Ok((cols, expl, rows))
             }
             SelectBody::Values(values) => {
@@ -887,7 +973,7 @@ impl<'a> QueryExec<'a> {
                     rows.push(vals);
                 }
                 let w = width.unwrap_or(0);
-                let cols = (1..=w)
+                let cols: Vec<ScopeColumn> = (1..=w)
                     .map(|i| ScopeColumn {
                         table: None,
                         name: format!("column{i}"),
@@ -896,15 +982,26 @@ impl<'a> QueryExec<'a> {
                         is_rowid_alias: false,
                     })
                     .collect();
+                if let Some(ref mut bn) = branch_names {
+                    record_compound_branch_names(bn, &cols);
+                }
                 Ok((cols, vec![ExprCollation::none(); w], rows))
             }
             SelectBody::Compound {
                 op, left, right, ..
             } => {
-                let (mut lcols, mut lcolls, lrows) =
-                    self.execute_select_body_depth(left, outer_scopes, depth + 1)?;
-                let (rcols, rcolls, rrows) =
-                    self.execute_select_body_depth(right, outer_scopes, depth + 1)?;
+                let (mut lcols, mut lcolls, lrows) = self.execute_select_body_depth(
+                    left,
+                    outer_scopes,
+                    depth + 1,
+                    branch_names.as_deref_mut(),
+                )?;
+                let (rcols, rcolls, rrows) = self.execute_select_body_depth(
+                    right,
+                    outer_scopes,
+                    depth + 1,
+                    branch_names,
+                )?;
                 if lcols.len() != rcols.len() {
                     return Err(SqlError::runtime(format!(
                         "SELECTs to the left and right of {} do not have the same number of result columns",
@@ -1195,7 +1292,9 @@ impl<'a> QueryExec<'a> {
                         && core.windows.is_none()
                         && !core.from_first
                         && outer_order_by_all.is_none()
-                        && matches!(&core.from, Some(FromSource::Table(_)))
+                        && (matches!(&core.from, Some(FromSource::Table(_)))
+                            || (outer_order_by.is_none()
+                                && matches!(&core.from, Some(FromSource::Function(_)))))
                     {
                         if let Some(lim) = outer_limit {
                             let lim_const = expr_is_pushdown_const(&lim.count, self.options)
@@ -1366,7 +1465,12 @@ impl<'a> QueryExec<'a> {
                     }
                 }
 
-                // 4. Determine if this is an aggregate query (including aggregates inside named WINDOWs!)
+                // 4. Determine if this is an aggregate query (including aggregates inside
+                // referenced named WINDOWs, while ignoring unreferenced named WINDOWs!).
+                let has_top_level_agg_in_select = expanded.iter().any(|p| {
+                    p.direct_col.is_none()
+                        && expr_contains_non_window_aggregate(&p.expr, self.options)
+                });
                 let has_agg_in_select = expanded
                     .iter()
                     .any(|p| p.direct_col.is_none() && expr_contains_aggregate(&p.expr, self.options));
@@ -1374,30 +1478,35 @@ impl<'a> QueryExec<'a> {
                     ob.iter()
                         .any(|t| expr_contains_aggregate(&t.expr, self.options))
                 });
-                let has_agg_in_named_windows =
+                let used_named_windows = collect_referenced_window_names(
+                    &expanded,
+                    outer_order_by,
+                    core.windows.as_deref().unwrap_or(&[]),
+                );
+                let has_agg_in_used_named_windows =
                     core.windows.as_deref().unwrap_or(&[]).iter().any(|wd| {
-                        wd.window
-                            .partition_by
-                            .as_deref()
-                            .unwrap_or(&[])
-                            .iter()
-                            .any(|e| expr_contains_aggregate(e, self.options))
-                            || wd
+                        used_named_windows.contains(&wd.name.name.to_ascii_lowercase())
+                            && (wd
                                 .window
-                                .order_by
+                                .partition_by
                                 .as_deref()
                                 .unwrap_or(&[])
                                 .iter()
-                                .any(|o| expr_contains_aggregate(&o.expr, self.options))
+                                .any(|e| expr_contains_aggregate(e, self.options))
+                                || wd
+                                    .window
+                                    .order_by
+                                    .as_deref()
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .any(|o| expr_contains_aggregate(&o.expr, self.options)))
                     });
-                let has_agg_in_having = core
-                    .having
-                    .as_ref()
-                    .is_some_and(|h| expr_contains_aggregate(h, self.options));
-                // SQLite rejects `HAVING` unless the query has `GROUP BY` or a SELECT-list aggregate
-                // (aggregates appearing solely in `HAVING` / `ORDER BY` / named `WINDOW` do not qualify).
+                // SQLite rejects `HAVING` unless the query has `GROUP BY` or a direct
+                // (non-window-internal) SELECT-list aggregate.
                 if core.having.is_some()
-                    && !(core.group_by.is_some() || core.group_by_all || has_agg_in_select)
+                    && !(core.group_by.is_some()
+                        || core.group_by_all
+                        || has_top_level_agg_in_select)
                 {
                     return Err(SqlError::runtime(
                         "HAVING clause on a non-aggregate query",
@@ -1406,9 +1515,19 @@ impl<'a> QueryExec<'a> {
                 let is_aggregate = core.group_by.is_some()
                     || core.group_by_all
                     || has_agg_in_select
-                    || has_agg_in_order
-                    || has_agg_in_named_windows
-                    || has_agg_in_having;
+                    || has_agg_in_used_named_windows;
+                if !is_aggregate && has_agg_in_order {
+                    let mut ob_aggs = Vec::new();
+                    if let Some(ob) = outer_order_by {
+                        for t in ob {
+                            collect_aggregates(&t.expr, self.options, &mut ob_aggs);
+                        }
+                    }
+                    let fname = ob_aggs
+                        .first()
+                        .map_or("aggregate", |f| f.name.name.as_str());
+                    return Err(SqlError::runtime(format!("misuse of aggregate: {fname}()")));
+                }
                 if core.having.as_ref().is_some_and(expr_contains_window) {
                     return Err(SqlError::runtime("misuse of window function"));
                 }
@@ -2358,40 +2477,167 @@ impl<'a> QueryExec<'a> {
         };
 
         if let Some((c0, sum_cid, sk)) = single_sum_fast {
-            let mut sum_acc = crate::functions::aggregates::SumAcc::new(sk);
-            self.catalog.visit_table(
-                schema,
-                &ft.name.name,
-                &hint,
-                needed_indices.as_deref(),
-                self.options.meter.as_deref(),
-                &mut |_rid, vals| {
-                    if has_meter {
-                        self.charge_steps(1)?;
-                    }
-                    if let Some(ref mut p) = pred {
-                        if !p.eval_row(vals, env)? {
-                            return Ok(true);
+            let inline_ipk_pred = if !has_meter {
+                pred.as_ref()
+                    .and_then(|p| p.as_single_int_cmp())
+                    .filter(|(c, _, _)| *c == ipk_col)
+                    .map(|(_, op, rhs)| (op, rhs))
+            } else {
+                None
+            };
+            if matches!(sk, SumKind::Sum | SumKind::Total) {
+                // Register-local integer running sum with exact checked_add overflow fallback
+                // into `SumAcc` (avoids per-row `SumAcc` struct branches on all-int scans!).
+                let mut int_sum: i64 = 0;
+                let mut has_val = false;
+                let mut fallback: Option<crate::functions::aggregates::SumAcc> = None;
+                let is_total = matches!(sk, SumKind::Total);
+                let c0_is_ipk = c0 == ipk_col;
+                self.catalog.visit_table(
+                    schema,
+                    &ft.name.name,
+                    &hint,
+                    needed_indices.as_deref(),
+                    self.options.meter.as_deref(),
+                    &mut |_rid, vals| {
+                        if has_meter {
+                            self.charge_steps(1)?;
                         }
-                    }
-                    let SqlValue::Int(cur_ipk) = vals[ipk_col] else {
-                        order_broken = true;
-                        return Ok(false);
-                    };
-                    if prev_ipk.is_some_and(|p| cur_ipk <= p) {
-                        order_broken = true;
-                        return Ok(false);
-                    }
-                    prev_ipk = Some(cur_ipk);
-                    sum_acc.step_value(&vals[sum_cid]);
-                    let out_row = vec![vals[c0].clone(), sum_acc.value_as(sk)?];
-                    if has_meter {
-                        mem.reserve(estimate_row_bytes(&out_row))?;
-                    }
-                    out_rows.push(out_row);
-                    Ok(true)
-                },
-            )?;
+                        let cur_ipk = if let Some((op, rhs)) = inline_ipk_pred {
+                            let SqlValue::Int(k) = vals[ipk_col] else {
+                                order_broken = true;
+                                return Ok(false);
+                            };
+                            let pass = match op {
+                                CompareOp::Eq | CompareOp::Is => k == rhs,
+                                CompareOp::Ne | CompareOp::IsNot => k != rhs,
+                                CompareOp::Lt => k < rhs,
+                                CompareOp::Le => k <= rhs,
+                                CompareOp::Gt => k > rhs,
+                                CompareOp::Ge => k >= rhs,
+                            };
+                            if !pass {
+                                return Ok(true);
+                            }
+                            k
+                        } else {
+                            if let Some(ref mut p) = pred {
+                                if !p.eval_row(vals, env)? {
+                                    return Ok(true);
+                                }
+                            }
+                            let SqlValue::Int(k) = vals[ipk_col] else {
+                                order_broken = true;
+                                return Ok(false);
+                            };
+                            k
+                        };
+                        if prev_ipk.is_some_and(|p| cur_ipk <= p) {
+                            order_broken = true;
+                            return Ok(false);
+                        }
+                        prev_ipk = Some(cur_ipk);
+                        let run_val = if let Some(ref mut fb) = fallback {
+                            fb.step_value(&vals[sum_cid]);
+                            fb.value_as(sk)?
+                        } else {
+                            match &vals[sum_cid] {
+                                SqlValue::Int(v) => {
+                                    if let Some(s) = int_sum.checked_add(*v) {
+                                        int_sum = s;
+                                        has_val = true;
+                                        if is_total {
+                                            SqlValue::Real(int_sum as f64)
+                                        } else {
+                                            SqlValue::Int(int_sum)
+                                        }
+                                    } else {
+                                        let mut sa = crate::functions::aggregates::SumAcc::new(sk);
+                                        if has_val {
+                                            sa.step_value(&SqlValue::Int(int_sum));
+                                        }
+                                        sa.step_value(&vals[sum_cid]);
+                                        let rv = sa.value_as(sk)?;
+                                        fallback = Some(sa);
+                                        rv
+                                    }
+                                }
+                                SqlValue::Null => {
+                                    if is_total {
+                                        SqlValue::Real(int_sum as f64)
+                                    } else if has_val {
+                                        SqlValue::Int(int_sum)
+                                    } else {
+                                        SqlValue::Null
+                                    }
+                                }
+                                other => {
+                                    let mut sa = crate::functions::aggregates::SumAcc::new(sk);
+                                    if has_val {
+                                        sa.step_value(&SqlValue::Int(int_sum));
+                                    }
+                                    sa.step_value(other);
+                                    let rv = sa.value_as(sk)?;
+                                    fallback = Some(sa);
+                                    rv
+                                }
+                            }
+                        };
+                        let v0 = if c0_is_ipk {
+                            SqlValue::Int(cur_ipk)
+                        } else {
+                            vals[c0].clone()
+                        };
+                        let out_row = vec![v0, run_val];
+                        if has_meter {
+                            mem.reserve(estimate_row_bytes(&out_row))?;
+                        }
+                        out_rows.push(out_row);
+                        Ok(true)
+                    },
+                )?;
+            } else {
+                let mut sum_acc = crate::functions::aggregates::SumAcc::new(sk);
+                let c0_is_ipk = c0 == ipk_col;
+                self.catalog.visit_table(
+                    schema,
+                    &ft.name.name,
+                    &hint,
+                    needed_indices.as_deref(),
+                    self.options.meter.as_deref(),
+                    &mut |_rid, vals| {
+                        if has_meter {
+                            self.charge_steps(1)?;
+                        }
+                        if let Some(ref mut p) = pred {
+                            if !p.eval_row(vals, env)? {
+                                return Ok(true);
+                            }
+                        }
+                        let SqlValue::Int(cur_ipk) = vals[ipk_col] else {
+                            order_broken = true;
+                            return Ok(false);
+                        };
+                        if prev_ipk.is_some_and(|p| cur_ipk <= p) {
+                            order_broken = true;
+                            return Ok(false);
+                        }
+                        prev_ipk = Some(cur_ipk);
+                        sum_acc.step_value(&vals[sum_cid]);
+                        let v0 = if c0_is_ipk {
+                            SqlValue::Int(cur_ipk)
+                        } else {
+                            vals[c0].clone()
+                        };
+                        let out_row = vec![v0, sum_acc.value_as(sk)?];
+                        if has_meter {
+                            mem.reserve(estimate_row_bytes(&out_row))?;
+                        }
+                        out_rows.push(out_row);
+                        Ok(true)
+                    },
+                )?;
+            }
         } else {
             let mut accs: Vec<(OnlineAggAcc, Option<SumKind>)> =
                 Vec::with_capacity(win_kinds.len());
@@ -2683,7 +2929,7 @@ impl<'a> QueryExec<'a> {
         //   1..0x80000000 => unique single right-row index `slot - 1` (zero heap Vec!)
         //   >=0x80000000 => index `(slot & 0x7fff_ffff)` into `multi_buckets`
         const MULTI_TAG: u32 = 0x8000_0000;
-        let mut small_int_slots: Vec<u32> = Vec::new();
+        let mut small_int_slots: Vec<u32> = Vec::with_capacity(64);
         let mut multi_buckets: Vec<Vec<usize>> = Vec::new();
         let mut buckets: HashMap<HashKey, Vec<usize>> = HashMap::new();
         let r_proj_width = r_proj_cols.len();
@@ -2794,7 +3040,12 @@ impl<'a> QueryExec<'a> {
         let init_cap = if has_meter {
             r_row_count.max(64)
         } else {
-            r_row_count.max(1024)
+            self.catalog
+                .count_table_rows(lschema, &lt.name.name, None)
+                .ok()
+                .flatten()
+                .map(|c| (c as usize).min(1_000_000))
+                .unwrap_or_else(|| r_row_count.max(1024))
         };
         let mut out_rows: Vec<Vec<SqlValue>> = Vec::with_capacity(init_cap);
         let proj_len = proj_srcs.len();
@@ -2804,112 +3055,188 @@ impl<'a> QueryExec<'a> {
             None
         };
 
-        self.catalog.visit_table(
-            lschema,
-            &lt.name.name,
-            &TableScanHint::FullScan,
-            l_needed.as_deref(),
-            self.options.meter.as_deref(),
-            &mut |_rid, lvals| {
-                if has_meter {
-                    self.charge_steps(1)?;
+        // Zero-branch specialized probe for the common inner FK equi-join:
+        // unique small-int dimension table (`0..4096`), single projected RHS column, unmetered,
+        // `SELECT l.c0, l.c1, r.c2 FROM fact l JOIN dim r ON l.lk = r.rk`.
+        let fast_inner_l2r1 = if !has_meter
+            && !is_left
+            && multi_buckets.is_empty()
+            && buckets.is_empty()
+            && r_proj_width == 1
+        {
+            match proj_3 {
+                Some([JoinProjSrc::Left(c0), JoinProjSrc::Left(c1), JoinProjSrc::RightProj(0)]) => {
+                    Some((c0, c1))
                 }
-                // Fast unique small-int hit (zero slice indirection, single L1 lookup!)
-                if let SqlValue::Int(k) = lvals[lk] {
-                    if (0..4096).contains(&k) {
-                        let slot = small_int_slots.get(k as usize).copied().unwrap_or(0);
-                        if slot > 0 && slot < MULTI_TAG {
-                            let rbase = ((slot - 1) as usize) * r_proj_width;
-                            let out_row = if let Some([s0, s1, s2]) = proj_3 {
-                                let v0 = match s0 {
-                                    JoinProjSrc::Left(c) => lvals[c].clone(),
-                                    JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
-                                };
-                                let v1 = match s1 {
-                                    JoinProjSrc::Left(c) => lvals[c].clone(),
-                                    JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
-                                };
-                                let v2 = match s2 {
-                                    JoinProjSrc::Left(c) => lvals[c].clone(),
-                                    JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
-                                };
-                                vec![v0, v1, v2]
-                            } else {
-                                let mut row = Vec::with_capacity(proj_len);
-                                for &src in &proj_srcs {
-                                    match src {
-                                        JoinProjSrc::Left(c) => row.push(lvals[c].clone()),
-                                        JoinProjSrc::RightProj(p) => {
-                                            row.push(r_proj[rbase + p].clone());
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((c0, c1)) = fast_inner_l2r1 {
+            let slots_len = small_int_slots.len();
+            self.catalog.visit_table(
+                lschema,
+                &lt.name.name,
+                &TableScanHint::FullScan,
+                l_needed.as_deref(),
+                None,
+                &mut |_rid, lvals| {
+                    if let SqlValue::Int(k) = lvals[lk] {
+                        let uk = k as usize;
+                        if k >= 0 && uk < slots_len {
+                            let slot = small_int_slots[uk];
+                            if slot != 0 {
+                                out_rows.push(vec![
+                                    lvals[c0].clone(),
+                                    lvals[c1].clone(),
+                                    r_proj[(slot - 1) as usize].clone(),
+                                ]);
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    if !lvals[lk].is_null() {
+                        let lv = coerce_numeric(&lvals[lk]);
+                        if let Some(HashKey::Num(k)) = HashKey::from_sql(&lv) {
+                            let uk = k as usize;
+                            if k >= 0 && uk < slots_len {
+                                let slot = small_int_slots[uk];
+                                if slot != 0 {
+                                    out_rows.push(vec![
+                                        lvals[c0].clone(),
+                                        lvals[c1].clone(),
+                                        r_proj[(slot - 1) as usize].clone(),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                    Ok(true)
+                },
+            )?;
+        } else {
+            self.catalog.visit_table(
+                lschema,
+                &lt.name.name,
+                &TableScanHint::FullScan,
+                l_needed.as_deref(),
+                self.options.meter.as_deref(),
+                &mut |_rid, lvals| {
+                    if has_meter {
+                        self.charge_steps(1)?;
+                    }
+                    // Fast unique small-int hit (zero slice indirection, single L1 lookup!)
+                    if let SqlValue::Int(k) = lvals[lk] {
+                        if (0..4096).contains(&k) {
+                            let slot = small_int_slots.get(k as usize).copied().unwrap_or(0);
+                            if slot > 0 && slot < MULTI_TAG {
+                                let rbase = ((slot - 1) as usize) * r_proj_width;
+                                let out_row = if let Some([s0, s1, s2]) = proj_3 {
+                                    let v0 = match s0 {
+                                        JoinProjSrc::Left(c) => lvals[c].clone(),
+                                        JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
+                                    };
+                                    let v1 = match s1 {
+                                        JoinProjSrc::Left(c) => lvals[c].clone(),
+                                        JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
+                                    };
+                                    let v2 = match s2 {
+                                        JoinProjSrc::Left(c) => lvals[c].clone(),
+                                        JoinProjSrc::RightProj(p) => r_proj[rbase + p].clone(),
+                                    };
+                                    vec![v0, v1, v2]
+                                } else {
+                                    let mut row = Vec::with_capacity(proj_len);
+                                    for &src in &proj_srcs {
+                                        match src {
+                                            JoinProjSrc::Left(c) => row.push(lvals[c].clone()),
+                                            JoinProjSrc::RightProj(p) => {
+                                                row.push(r_proj[rbase + p].clone());
+                                            }
                                         }
                                     }
+                                    row
+                                };
+                                if has_meter {
+                                    mem.reserve(estimate_row_bytes(&out_row))?;
                                 }
-                                row
-                            };
-                            if has_meter {
-                                mem.reserve(estimate_row_bytes(&out_row))?;
+                                out_rows.push(out_row);
+                                return Ok(true);
                             }
-                            out_rows.push(out_row);
-                            return Ok(true);
                         }
                     }
-                }
-                let mut single_buf = [0usize; 1];
-                let matched_slice: Option<&[usize]> = match &lvals[lk] {
-                    SqlValue::Int(k) if (0..4096).contains(k) => {
-                        let slot = small_int_slots.get(*k as usize).copied().unwrap_or(0);
-                        if slot == 0 {
-                            None
-                        } else if slot < MULTI_TAG {
-                            single_buf[0] = (slot - 1) as usize;
-                            Some(&single_buf[..])
-                        } else {
-                            Some(multi_buckets[(slot & !MULTI_TAG) as usize].as_slice())
+                    let mut single_buf = [0usize; 1];
+                    let matched_slice: Option<&[usize]> = match &lvals[lk] {
+                        SqlValue::Int(k) if (0..4096).contains(k) => {
+                            let slot = small_int_slots.get(*k as usize).copied().unwrap_or(0);
+                            if slot == 0 {
+                                None
+                            } else if slot < MULTI_TAG {
+                                single_buf[0] = (slot - 1) as usize;
+                                Some(&single_buf[..])
+                            } else {
+                                Some(multi_buckets[(slot & !MULTI_TAG) as usize].as_slice())
+                            }
                         }
-                    }
-                    SqlValue::Int(k) => buckets.get(&HashKey::Num(*k)).map(Vec::as_slice),
-                    SqlValue::Null => None,
-                    other => {
-                        let lv = coerce_numeric(other);
-                        if let Some(key) = HashKey::from_sql(&lv) {
-                            if let HashKey::Num(k) = key {
-                                if (0..4096).contains(&k) {
-                                    let slot =
-                                        small_int_slots.get(k as usize).copied().unwrap_or(0);
-                                    if slot == 0 {
-                                        None
-                                    } else if slot < MULTI_TAG {
-                                        single_buf[0] = (slot - 1) as usize;
-                                        Some(&single_buf[..])
+                        SqlValue::Int(k) => buckets.get(&HashKey::Num(*k)).map(Vec::as_slice),
+                        SqlValue::Null => None,
+                        other => {
+                            let lv = coerce_numeric(other);
+                            if let Some(key) = HashKey::from_sql(&lv) {
+                                if let HashKey::Num(k) = key {
+                                    if (0..4096).contains(&k) {
+                                        let slot =
+                                            small_int_slots.get(k as usize).copied().unwrap_or(0);
+                                        if slot == 0 {
+                                            None
+                                        } else if slot < MULTI_TAG {
+                                            single_buf[0] = (slot - 1) as usize;
+                                            Some(&single_buf[..])
+                                        } else {
+                                            Some(
+                                                multi_buckets[(slot & !MULTI_TAG) as usize]
+                                                    .as_slice(),
+                                            )
+                                        }
                                     } else {
-                                        Some(
-                                            multi_buckets[(slot & !MULTI_TAG) as usize].as_slice(),
-                                        )
+                                        buckets.get(&key).map(Vec::as_slice)
                                     }
                                 } else {
                                     buckets.get(&key).map(Vec::as_slice)
                                 }
                             } else {
-                                buckets.get(&key).map(Vec::as_slice)
+                                None
                             }
-                        } else {
-                            None
                         }
-                    }
-                };
-                if let Some(indices) = matched_slice {
-                    for &ridx in indices {
-                        if has_meter {
-                            self.charge_steps(1)?;
+                    };
+                    if let Some(indices) = matched_slice {
+                        for &ridx in indices {
+                            if has_meter {
+                                self.charge_steps(1)?;
+                            }
+                            let rbase = ridx * r_proj_width;
+                            let mut out_row = Vec::with_capacity(proj_len);
+                            for &src in &proj_srcs {
+                                match src {
+                                    JoinProjSrc::Left(c) => out_row.push(lvals[c].clone()),
+                                    JoinProjSrc::RightProj(p) => {
+                                        out_row.push(r_proj[rbase + p].clone());
+                                    }
+                                }
+                            }
+                            if has_meter {
+                                mem.reserve(estimate_row_bytes(&out_row))?;
+                            }
+                            out_rows.push(out_row);
                         }
-                        let rbase = ridx * r_proj_width;
+                    } else if is_left {
                         let mut out_row = Vec::with_capacity(proj_len);
                         for &src in &proj_srcs {
                             match src {
                                 JoinProjSrc::Left(c) => out_row.push(lvals[c].clone()),
-                                JoinProjSrc::RightProj(p) => {
-                                    out_row.push(r_proj[rbase + p].clone());
-                                }
+                                JoinProjSrc::RightProj(_) => out_row.push(SqlValue::Null),
                             }
                         }
                         if has_meter {
@@ -2917,22 +3244,10 @@ impl<'a> QueryExec<'a> {
                         }
                         out_rows.push(out_row);
                     }
-                } else if is_left {
-                    let mut out_row = Vec::with_capacity(proj_len);
-                    for &src in &proj_srcs {
-                        match src {
-                            JoinProjSrc::Left(c) => out_row.push(lvals[c].clone()),
-                            JoinProjSrc::RightProj(_) => out_row.push(SqlValue::Null),
-                        }
-                    }
-                    if has_meter {
-                        mem.reserve(estimate_row_bytes(&out_row))?;
-                    }
-                    out_rows.push(out_row);
-                }
-                Ok(true)
-            },
-        )?;
+                    Ok(true)
+                },
+            )?;
+        }
 
         let order_ctx = OrderEvalContext {
             from_columns: Vec::new(),
@@ -3176,6 +3491,44 @@ impl<'a> QueryExec<'a> {
                 .collect()
         });
 
+        enum GbDirect {
+            Col(usize),
+            Agg(usize, Option<SumKind>),
+        }
+        let direct_plan: Option<Vec<GbDirect>> =
+            if outer_order_by.is_none() && core.distinct.is_none() {
+                let mut dp = Vec::with_capacity(expanded.len());
+                let mut all_direct = true;
+                let mut agg_cursor = 0usize;
+                for p in &expanded {
+                    if let Some(didx) = p.direct_col {
+                        dp.push(GbDirect::Col(didx));
+                    } else if let Expr::Function(f) = &p.expr {
+                        if agg_cursor < agg_calls.len()
+                            && agg_calls[agg_cursor].span.start == f.span.start
+                            && agg_calls[agg_cursor].span.end == f.span.end
+                        {
+                            let (slot, sk) = agg_slots[agg_cursor];
+                            agg_cursor += 1;
+                            dp.push(GbDirect::Agg(slot, sk));
+                        } else {
+                            all_direct = false;
+                            break;
+                        }
+                    } else {
+                        all_direct = false;
+                        break;
+                    }
+                }
+                all_direct.then_some(dp)
+            } else {
+                None
+            };
+        let only_gcol_projected = direct_plan.as_ref().is_some_and(|dp| {
+            dp.iter()
+                .all(|item| !matches!(item, GbDirect::Col(c) if *c != gcol))
+        });
+
         let stride = plan.len();
         let fast_cs_sum: Option<(usize, SumKind)> = if stride == 2 {
             match (&plan[0], &plan[1]) {
@@ -3187,9 +3540,10 @@ impl<'a> QueryExec<'a> {
         } else {
             None
         };
-        let mut small_int_slots: Vec<u32> = Vec::new();
+        let mut small_int_slots: Vec<u32> = Vec::with_capacity(64);
         let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
         let mut group_reps: Vec<Vec<SqlValue>> = Vec::new();
+        let mut group_keys: Vec<SqlValue> = Vec::new();
         let mut group_accs: Vec<OnlineAggAcc> = Vec::new();
         let mut cs_accs: Vec<(i64, crate::functions::aggregates::SumAcc)> = Vec::new();
         let mut mem = self.make_mem_guard();
@@ -3226,15 +3580,25 @@ impl<'a> QueryExec<'a> {
                             if has_meter {
                                 let acc_bytes = (stride as u64)
                                     .saturating_mul(std::mem::size_of::<OnlineAggAcc>() as u64);
-                                mem.reserve(
+                                let rep_bytes = if only_gcol_projected {
+                                    estimate_value_bytes(&vals[gcol]).saturating_add(24)
+                                } else {
                                     estimate_row_bytes(vals)
-                                        .saturating_add(acc_bytes)
-                                        .saturating_add(64),
+                                };
+                                mem.reserve(
+                                    rep_bytes.saturating_add(acc_bytes).saturating_add(64),
                                 )?;
                             }
-                            let new_gid = group_reps.len();
+                            let new_gid = if only_gcol_projected {
+                                let g = group_keys.len();
+                                group_keys.push(SqlValue::Int(*k));
+                                g
+                            } else {
+                                let g = group_reps.len();
+                                group_reps.push(vals.to_vec());
+                                g
+                            };
                             small_int_slots[idx] = (new_gid + 1) as u32;
-                            group_reps.push(vals.to_vec());
                             if let Some((_, sk)) = fast_cs_sum {
                                 cs_accs.push((0, crate::functions::aggregates::SumAcc::new(sk)));
                             } else {
@@ -3262,15 +3626,25 @@ impl<'a> QueryExec<'a> {
                                         let acc_bytes = (stride as u64).saturating_mul(
                                             std::mem::size_of::<OnlineAggAcc>() as u64,
                                         );
-                                        mem.reserve(
+                                        let rep_bytes = if only_gcol_projected {
+                                            estimate_value_bytes(&vals[gcol]).saturating_add(24)
+                                        } else {
                                             estimate_row_bytes(vals)
-                                                .saturating_add(acc_bytes)
-                                                .saturating_add(64),
+                                        };
+                                        mem.reserve(
+                                            rep_bytes.saturating_add(acc_bytes).saturating_add(64),
                                         )?;
                                     }
-                                    let new_gid = group_reps.len();
+                                    let new_gid = if only_gcol_projected {
+                                        let g = group_keys.len();
+                                        group_keys.push(vals[gcol].clone());
+                                        g
+                                    } else {
+                                        let g = group_reps.len();
+                                        group_reps.push(vals.to_vec());
+                                        g
+                                    };
                                     small_int_slots[idx] = (new_gid + 1) as u32;
-                                    group_reps.push(vals.to_vec());
                                     if let Some((_, sk)) = fast_cs_sum {
                                         cs_accs.push((
                                             0,
@@ -3287,15 +3661,25 @@ impl<'a> QueryExec<'a> {
                                 if has_meter {
                                     let acc_bytes = (stride as u64)
                                         .saturating_mul(std::mem::size_of::<OnlineAggAcc>() as u64);
-                                    mem.reserve(
+                                    let rep_bytes = if only_gcol_projected {
+                                        estimate_value_bytes(&vals[gcol]).saturating_add(24)
+                                    } else {
                                         estimate_row_bytes(vals)
-                                            .saturating_add(acc_bytes)
-                                            .saturating_add(64),
+                                    };
+                                    mem.reserve(
+                                        rep_bytes.saturating_add(acc_bytes).saturating_add(64),
                                     )?;
                                 }
-                                let new_gid = group_reps.len();
+                                let new_gid = if only_gcol_projected {
+                                    let g = group_keys.len();
+                                    group_keys.push(vals[gcol].clone());
+                                    g
+                                } else {
+                                    let g = group_reps.len();
+                                    group_reps.push(vals.to_vec());
+                                    g
+                                };
                                 group_index.insert(hkey, new_gid);
-                                group_reps.push(vals.to_vec());
                                 if let Some((_, sk)) = fast_cs_sum {
                                     cs_accs.push((
                                         0,
@@ -3316,16 +3700,28 @@ impl<'a> QueryExec<'a> {
                                     GroupKey::Text(b) | GroupKey::Blob(b) => b.len() as u64,
                                     _ => 0,
                                 };
-                                mem.reserve(
+                                let rep_bytes = if only_gcol_projected {
+                                    estimate_value_bytes(&vals[gcol]).saturating_add(24)
+                                } else {
                                     estimate_row_bytes(vals)
+                                };
+                                mem.reserve(
+                                    rep_bytes
                                         .saturating_add(acc_bytes)
                                         .saturating_add(key_extra)
                                         .saturating_add(64),
                                 )?;
                             }
-                            let new_gid = group_reps.len();
+                            let new_gid = if only_gcol_projected {
+                                let g = group_keys.len();
+                                group_keys.push(vals[gcol].clone());
+                                g
+                            } else {
+                                let g = group_reps.len();
+                                group_reps.push(vals.to_vec());
+                                g
+                            };
                             group_index.insert(hkey, new_gid);
-                            group_reps.push(vals.to_vec());
                             if let Some((_, sk)) = fast_cs_sum {
                                 cs_accs.push((0, crate::functions::aggregates::SumAcc::new(sk)));
                             } else {
@@ -3356,15 +3752,13 @@ impl<'a> QueryExec<'a> {
                 Ok(true)
             },
         )?;
-        if let Some((sum_cid, _)) = fast_cs_sum {
-            group_accs.reserve(cs_accs.len() * 2);
-            for (cnt, sa) in cs_accs {
-                group_accs.push(OnlineAggAcc::CountStar(cnt));
-                group_accs.push(OnlineAggAcc::Sum(sum_cid, sa));
-            }
-        }
 
-        if group_reps.is_empty() {
+        let n_groups = if only_gcol_projected {
+            group_keys.len()
+        } else {
+            group_reps.len()
+        };
+        if n_groups == 0 {
             return Ok(Some(StreamedGroupBy::Rows((
                 rel_meta,
                 expanded,
@@ -3373,76 +3767,74 @@ impl<'a> QueryExec<'a> {
             ))));
         }
 
-        let n_groups = group_reps.len();
         // Direct output emission when `outer_order_by.is_none() && core.distinct.is_none()` and
         // every projected item is either a direct column or a top-level aggregate in `agg_calls`:
-        // skips building `PrecomputedRow`s and the secondary `EvalScope` projection loop!
-        if outer_order_by.is_none() && core.distinct.is_none() {
-            enum GbDirect {
-                Col(usize),
-                Agg(usize, Option<SumKind>),
-            }
-            let mut direct_plan = Vec::with_capacity(expanded.len());
-            let mut all_direct = true;
-            let mut agg_cursor = 0usize;
+        // skips building `PrecomputedRow`s, secondary `EvalScope` projection, AND `cs_accs -> group_accs`!
+        if let Some(direct_plan) = direct_plan {
+            let mut out_cols = Vec::with_capacity(expanded.len());
+            let mut out_colls = Vec::with_capacity(expanded.len());
+            let mut explicit_aliases = Vec::with_capacity(expanded.len());
             for p in &expanded {
                 if let Some(didx) = p.direct_col {
-                    direct_plan.push(GbDirect::Col(didx));
-                } else if let Expr::Function(f) = &p.expr {
-                    if agg_cursor < agg_calls.len()
-                        && agg_calls[agg_cursor].span.start == f.span.start
-                        && agg_calls[agg_cursor].span.end == f.span.end
-                    {
-                        let (slot, sk) = agg_slots[agg_cursor];
-                        agg_cursor += 1;
-                        direct_plan.push(GbDirect::Agg(slot, sk));
+                    let rc = &rel_meta.columns[didx];
+                    let coll = if rc.collation.is_empty() {
+                        "BINARY".to_string()
                     } else {
-                        all_direct = false;
-                        break;
-                    }
-                } else {
-                    all_direct = false;
-                    break;
-                }
-            }
-            if all_direct {
-                let mut out_cols = Vec::with_capacity(expanded.len());
-                let mut out_colls = Vec::with_capacity(expanded.len());
-                let mut explicit_aliases = Vec::with_capacity(expanded.len());
-                for p in &expanded {
-                    if let Some(didx) = p.direct_col {
-                        let rc = &rel_meta.columns[didx];
-                        let coll = if rc.collation.is_empty() {
-                            "BINARY".to_string()
+                        rc.collation.clone()
+                    };
+                    out_cols.push(ScopeColumn {
+                        table: if p.explicit_alias.is_none() {
+                            rc.table.clone()
                         } else {
-                            rc.collation.clone()
-                        };
-                        out_cols.push(ScopeColumn {
-                            table: if p.explicit_alias.is_none() {
-                                rc.table.clone()
-                            } else {
-                                None
-                            },
-                            name: p.output_name.clone(),
-                            affinity: rc.affinity,
-                            collation: coll.clone(),
-                            is_rowid_alias: false,
-                        });
-                        out_colls.push(ExprCollation::implicit(coll));
-                    } else {
-                        out_cols.push(ScopeColumn {
-                            table: None,
-                            name: p.output_name.clone(),
-                            affinity: Affinity::None,
-                            collation: "BINARY".to_string(),
-                            is_rowid_alias: false,
-                        });
-                        out_colls.push(ExprCollation::none());
-                    }
-                    explicit_aliases.push(p.explicit_alias.is_some());
+                            None
+                        },
+                        name: p.output_name.clone(),
+                        affinity: rc.affinity,
+                        collation: coll.clone(),
+                        is_rowid_alias: false,
+                    });
+                    out_colls.push(ExprCollation::implicit(coll));
+                } else {
+                    out_cols.push(ScopeColumn {
+                        table: None,
+                        name: p.output_name.clone(),
+                        affinity: Affinity::None,
+                        collation: "BINARY".to_string(),
+                        is_rowid_alias: false,
+                    });
+                    out_colls.push(ExprCollation::none());
                 }
-                let mut out_rows = Vec::with_capacity(n_groups);
-                for (g, rep) in group_reps.iter().enumerate() {
+                explicit_aliases.push(p.explicit_alias.is_some());
+            }
+            let mut out_rows = Vec::with_capacity(n_groups);
+            if fast_cs_sum.is_some() {
+                for (g, (cnt, sa)) in cs_accs.iter().enumerate() {
+                    if has_meter {
+                        self.charge_steps(1)?;
+                    }
+                    let mut out_row = Vec::with_capacity(direct_plan.len());
+                    for item in &direct_plan {
+                        match *item {
+                            GbDirect::Col(c) => {
+                                if only_gcol_projected {
+                                    out_row.push(group_keys[g].clone());
+                                } else {
+                                    out_row.push(group_reps[g][c].clone());
+                                }
+                            }
+                            GbDirect::Agg(0, _) => out_row.push(SqlValue::Int(*cnt)),
+                            GbDirect::Agg(_, sk_opt) => {
+                                out_row.push(sa.value_as(sk_opt.expect("sum kind"))?);
+                            }
+                        }
+                    }
+                    if has_meter {
+                        mem.reserve(estimate_row_bytes(&out_row))?;
+                    }
+                    out_rows.push(out_row);
+                }
+            } else {
+                for g in 0..n_groups {
                     if has_meter {
                         self.charge_steps(1)?;
                     }
@@ -3451,7 +3843,13 @@ impl<'a> QueryExec<'a> {
                     let mut out_row = Vec::with_capacity(direct_plan.len());
                     for item in &direct_plan {
                         match *item {
-                            GbDirect::Col(c) => out_row.push(rep[c].clone()),
+                            GbDirect::Col(c) => {
+                                if only_gcol_projected {
+                                    out_row.push(group_keys[g].clone());
+                                } else {
+                                    out_row.push(group_reps[g][c].clone());
+                                }
+                            }
                             GbDirect::Agg(slot, sk_opt) => {
                                 let val = match &accs[slot] {
                                     OnlineAggAcc::CountStar(c)
@@ -3469,17 +3867,25 @@ impl<'a> QueryExec<'a> {
                     }
                     out_rows.push(out_row);
                 }
-                let order_ctx = OrderEvalContext {
-                    from_columns: Vec::new(),
-                    from_using_hidden: Vec::new(),
-                    from_source_ids: Vec::new(),
-                    from_rows: Vec::new(),
-                    precomputed: Vec::new(),
-                    explicit_aliases,
-                };
-                return Ok(Some(StreamedGroupBy::Direct((
-                    out_cols, out_colls, out_rows, order_ctx,
-                ))));
+            }
+            let order_ctx = OrderEvalContext {
+                from_columns: Vec::new(),
+                from_using_hidden: Vec::new(),
+                from_source_ids: Vec::new(),
+                from_rows: Vec::new(),
+                precomputed: Vec::new(),
+                explicit_aliases,
+            };
+            return Ok(Some(StreamedGroupBy::Direct((
+                out_cols, out_colls, out_rows, order_ctx,
+            ))));
+        }
+
+        if let Some((sum_cid, _)) = fast_cs_sum {
+            group_accs.reserve(cs_accs.len() * 2);
+            for (cnt, sa) in cs_accs {
+                group_accs.push(OnlineAggAcc::CountStar(cnt));
+                group_accs.push(OnlineAggAcc::Sum(sum_cid, sa));
             }
         }
 
@@ -3546,12 +3952,22 @@ impl<'a> QueryExec<'a> {
                         let star_hidden = vec![false; columns.len()];
                         let using_hidden = vec![false; columns.len()];
                         let source_ids = vec![0u32; columns.len()];
+                        let rows = if let Some(m) = self.options.meter.as_deref() {
+                            m.charge_steps((cte.rows.len() as u64).max(1))?;
+                            let bytes: u64 = cte.rows.iter().map(|r| estimate_row_bytes(r)).sum();
+                            m.reserve_memory(bytes)?;
+                            let cloned = cte.rows.clone();
+                            m.release_memory(bytes);
+                            cloned
+                        } else {
+                            cte.rows.clone()
+                        };
                         return Ok(Relation {
                             columns,
                             star_hidden,
                             using_hidden,
                             source_ids,
-                            rows: cte.rows.clone(),
+                            rows,
                         });
                     }
                 }
@@ -3741,7 +4157,7 @@ impl<'a> QueryExec<'a> {
                     });
                 }
 
-                // 4. Eponymous 0-arg TVF fallback (e.g. `SELECT * FROM pragma_database_list`)
+                // 4. Eponymous 0-arg TVF fallback (e.g. `SELECT * FROM pragma_database_list`, `FROM json_each`)
                 if let Some(tvf) = self.catalog.call_tvf(
                     schema,
                     &ft.name.name,
@@ -3749,6 +4165,15 @@ impl<'a> QueryExec<'a> {
                     self.options.meter.as_deref(),
                 )? {
                     return Ok(relation_from_tvf(&alias, tvf));
+                }
+                if schema.is_none() {
+                    let lower = ft.name.name.to_ascii_lowercase();
+                    if matches!(lower.as_str(), "json_each" | "json_tree") {
+                        let env = self.make_env();
+                        if let Some(tvf) = call_builtin_tvf(&lower, &[], &env.fn_ctx)? {
+                            return Ok(relation_from_tvf(&alias, tvf));
+                        }
+                    }
                 }
 
                 Err(SqlError::runtime(format!(
@@ -3773,7 +4198,10 @@ impl<'a> QueryExec<'a> {
                     return Ok(relation_from_tvf(&alias, tvf));
                 }
                 let lower = ff.name.name.to_ascii_lowercase();
-                if let Some(tvf) = call_builtin_tvf(&lower, &arg_vals, &env.fn_ctx)? {
+                let row_cap = order_limit_ctx.and_then(|(_, ob, k)| ob.is_none().then_some(k));
+                if let Some(tvf) =
+                    call_builtin_tvf_with_limit(&lower, &arg_vals, &env.fn_ctx, row_cap)?
+                {
                     return Ok(relation_from_tvf(&alias, tvf));
                 }
                 Err(SqlError::runtime(format!(
@@ -5256,7 +5684,15 @@ impl<'a> QueryExec<'a> {
                 collect_aggregates(&t.expr, self.options, &mut agg_calls);
             }
         }
+        let used_win_names = collect_referenced_window_names(
+            expanded,
+            outer_order_by,
+            core.windows.as_deref().unwrap_or(&[]),
+        );
         for wd in core.windows.as_deref().unwrap_or(&[]) {
+            if !used_win_names.contains(&wd.name.name.to_ascii_lowercase()) {
+                continue;
+            }
             for e in wd.window.partition_by.as_deref().unwrap_or(&[]) {
                 collect_aggregates(e, self.options, &mut agg_calls);
             }
@@ -5322,6 +5758,14 @@ impl<'a> QueryExec<'a> {
                     return Err(SqlError::runtime("misuse of window function"));
                 }
                 if let Some((ord, ov_coll)) = integer_ordinal_with_collation(g) {
+                    let mut cw = g;
+                    while let Expr::Collate {
+                        operand, collation, ..
+                    } = cw
+                    {
+                        let _ = env.lookup_collation(&collation.name)?;
+                        cw = operand;
+                    }
                     if ord < 1 || ord > expanded.len() {
                         return Err(SqlError::runtime(format!(
                             "{} GROUP BY term out of range - should be between 1 and {}",
@@ -5357,9 +5801,14 @@ impl<'a> QueryExec<'a> {
             }
         }
 
-        // SQLite rejects referencing an aggregate SELECT alias in GROUP BY with a specific error.
+        // SQLite rejects referencing an aggregate SELECT alias in GROUP BY with a specific error
+        // (including through `COLLATE` wrappers such as `GROUP BY cnt COLLATE NOCASE`).
         for g in &group_exprs {
-            if let Expr::Column(c) = g {
+            let mut inner = g;
+            while let Expr::Collate { operand, .. } = inner {
+                inner = operand;
+            }
+            if let Expr::Column(c) = inner {
                 if c.schema.is_none() && c.table.is_none() {
                     let is_agg_alias = expanded.iter().any(|p| {
                         p.explicit_alias
@@ -5537,6 +5986,8 @@ impl<'a> QueryExec<'a> {
 
                 if let Some(plan) = online_plan {
                     let stride = plan.len();
+                    let acc_bytes_per_group =
+                        (stride as u64).saturating_mul(std::mem::size_of::<OnlineAggAcc>() as u64);
                     let mut small_int_slots: Vec<u32> = Vec::new();
                     let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
                     let mut group_reps: Vec<usize> = Vec::new();
@@ -5561,7 +6012,8 @@ impl<'a> QueryExec<'a> {
                                     if has_meter {
                                         mem.reserve(
                                             estimate_row_bytes(std::slice::from_ref(&row[gcol]))
-                                                + 64,
+                                                .saturating_add(64)
+                                                .saturating_add(acc_bytes_per_group),
                                         )?;
                                     }
                                     let new_gid = group_reps.len();
@@ -5592,7 +6044,9 @@ impl<'a> QueryExec<'a> {
                                                 mem.reserve(
                                                     estimate_row_bytes(std::slice::from_ref(
                                                         &row[gcol],
-                                                    )) + 64,
+                                                    ))
+                                                    .saturating_add(64)
+                                                    .saturating_add(acc_bytes_per_group),
                                                 )?;
                                             }
                                             let new_gid = group_reps.len();
@@ -5608,7 +6062,9 @@ impl<'a> QueryExec<'a> {
                                             mem.reserve(
                                                 estimate_row_bytes(std::slice::from_ref(
                                                     &row[gcol],
-                                                )) + 64,
+                                                ))
+                                                .saturating_add(64)
+                                                .saturating_add(acc_bytes_per_group),
                                             )?;
                                         }
                                         let new_gid = group_reps.len();
@@ -5623,7 +6079,8 @@ impl<'a> QueryExec<'a> {
                                     if has_meter {
                                         mem.reserve(
                                             estimate_row_bytes(std::slice::from_ref(&row[gcol]))
-                                                + 64,
+                                                .saturating_add(64)
+                                                .saturating_add(acc_bytes_per_group),
                                         )?;
                                     }
                                     let new_gid = group_reps.len();
@@ -6959,6 +7416,7 @@ impl<'a> QueryExec<'a> {
                                     && ((new_start == cur_start && new_start < cur_end)
                                         || can_slide));
                             if incremental_ok {
+                                let mut peak_acc_heap = acc.heap_bytes();
                                 if cur_start == cur_end {
                                     for r in new_start..new_end {
                                         self.charge_steps(1)?;
@@ -6970,6 +7428,11 @@ impl<'a> QueryExec<'a> {
                                             part_jmasks[r],
                                         );
                                         acc.step(&part_args[r], &cctx)?;
+                                        let h = acc.heap_bytes();
+                                        if h > peak_acc_heap {
+                                            win_mem.reserve(h - peak_acc_heap)?;
+                                            peak_acc_heap = h;
+                                        }
                                     }
                                 } else {
                                     // Evict leaving rows BEFORE stepping entering rows so
@@ -6999,6 +7462,11 @@ impl<'a> QueryExec<'a> {
                                             part_jmasks[r],
                                         );
                                         acc.step(&part_args[r], &cctx)?;
+                                        let h = acc.heap_bytes();
+                                        if h > peak_acc_heap {
+                                            win_mem.reserve(h - peak_acc_heap)?;
+                                            peak_acc_heap = h;
+                                        }
                                     }
                                 }
                                 cur_start = new_start;
@@ -7009,6 +7477,8 @@ impl<'a> QueryExec<'a> {
                                     wcall.args.len(),
                                     wcall.star,
                                 )?;
+                                let mut acc_mem = self.make_mem_guard();
+                                let mut peak_acc_heap = acc.heap_bytes();
                                 for r in new_start..new_end {
                                     self.charge_steps(1)?;
                                     if !part_filter[r] {
@@ -7018,6 +7488,11 @@ impl<'a> QueryExec<'a> {
                                         .fn_ctx
                                         .with_collation_and_json_mask(agg_coll, part_jmasks[r]);
                                     acc.step(&part_args[r], &cctx)?;
+                                    let h = acc.heap_bytes();
+                                    if h > peak_acc_heap {
+                                        acc_mem.reserve(h - peak_acc_heap)?;
+                                        peak_acc_heap = h;
+                                    }
                                 }
                                 cur_start = new_start;
                                 cur_end = new_end;
@@ -7044,6 +7519,8 @@ impl<'a> QueryExec<'a> {
                                 wcall.args.len(),
                                 wcall.star,
                             )?;
+                            let mut acc_mem = self.make_mem_guard();
+                            let mut peak_acc_heap = acc.heap_bytes();
                             for r in frows {
                                 self.charge_steps(1)?;
                                 if !part_filter[r] {
@@ -7053,6 +7530,11 @@ impl<'a> QueryExec<'a> {
                                     .fn_ctx
                                     .with_collation_and_json_mask(agg_coll, part_jmasks[r]);
                                 acc.step(&part_args[r], &cctx)?;
+                                let h = acc.heap_bytes();
+                                if h > peak_acc_heap {
+                                    acc_mem.reserve(h - peak_acc_heap)?;
+                                    peak_acc_heap = h;
+                                }
                             }
                             let fctx = env.fn_ctx.with_collation_and_json_mask(agg_coll, 0);
                             let v = acc.finalize(&fctx)?;
@@ -7107,6 +7589,7 @@ impl<'a> QueryExec<'a> {
         out_cols: &[ScopeColumn],
         mut rows: Vec<Vec<SqlValue>>,
         order_ctx: Option<&OrderEvalContext>,
+        compound_col_aliases: Option<&[Vec<String>]>,
         order_by: Option<&[OrderingTerm]>,
         order_by_all: Option<&OrderByAll>,
         limit: Option<&LimitClause>,
@@ -7190,6 +7673,40 @@ impl<'a> QueryExec<'a> {
                         let cname = ov_coll.unwrap_or(&out_cols[ord - 1].collation);
                         term_colls.push(env.lookup_collation(cname)?);
                         term_plans.push(OrderTermPlan::OutCol(ord - 1));
+                    } else if let Some(c_aliases) = compound_col_aliases {
+                        // SQLite compound SELECT `ORDER BY`: each non-ordinal term MUST match
+                        // an output column name (from any branch of the compound) with optional
+                        // `COLLATE`; arbitrary expressions like `ORDER BY x + 1` are rejected.
+                        let (col_name, ov_coll) = if let Expr::Column(c) = coll_walk {
+                            let ov = if let Expr::Collate { collation, .. } = &term.expr {
+                                Some(collation.name.as_str())
+                            } else {
+                                None
+                            };
+                            (c.column.name.as_str(), ov)
+                        } else {
+                            return Err(SqlError::runtime(format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                ordinal_label(tidx + 1)
+                            )));
+                        };
+                        let pos = out_cols
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .or_else(|| {
+                                c_aliases.iter().position(|names| {
+                                    names.iter().any(|n| n.eq_ignore_ascii_case(col_name))
+                                })
+                            });
+                        let Some(pos) = pos else {
+                            return Err(SqlError::runtime(format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                ordinal_label(tidx + 1)
+                            )));
+                        };
+                        let cname = ov_coll.unwrap_or(&out_cols[pos].collation);
+                        term_colls.push(env.lookup_collation(cname)?);
+                        term_plans.push(OrderTermPlan::OutCol(pos));
                     } else {
                         let mut cname_opt = None;
                         let mut plan: Option<OrderTermPlan> = None;
@@ -7732,6 +8249,27 @@ impl<'a> QueryExec<'a> {
                 ..
             } => {
                 if let Some(o) = operand {
+                    let has_vec_or_subq =
+                        matches!(o.as_ref(), Expr::Subquery { .. } | Expr::Vector { .. })
+                            || whens.iter().any(|w| {
+                                matches!(w.when, Expr::Subquery { .. } | Expr::Vector { .. })
+                            });
+                    if has_vec_or_subq {
+                        let ow = self.validate_row_value_width(o, scopes, depth)?;
+                        for w in whens {
+                            let ww = self.validate_row_value_width(&w.when, scopes, depth)?;
+                            if let (Some(a), Some(b)) = (ow, ww) {
+                                if a != b {
+                                    return Err(SqlError::runtime("row value misused"));
+                                }
+                            }
+                            self.validate_expr_subqueries_depth(&w.then, scopes, depth)?;
+                        }
+                        if let Some(el) = else_expr {
+                            self.validate_expr_subqueries_depth(el, scopes, depth)?;
+                        }
+                        return Ok(());
+                    }
                     self.validate_expr_subqueries_depth(o, scopes, depth)?;
                 }
                 for w in whens {
@@ -8255,7 +8793,17 @@ impl SubqueryRunner for QueryExec<'_> {
                         }
                     })
                     .collect();
-                return Ok((affs, colls, cte.rows.clone()));
+                let rows = if let Some(m) = self.options.meter.as_deref() {
+                    m.charge_steps((cte.rows.len() as u64).max(1))?;
+                    let bytes: u64 = cte.rows.iter().map(|r| estimate_row_bytes(r)).sum();
+                    m.reserve_memory(bytes)?;
+                    let cloned = cte.rows.clone();
+                    m.release_memory(bytes);
+                    cloned
+                } else {
+                    cte.rows.clone()
+                };
+                return Ok((affs, colls, rows));
             }
         }
         let tmeta = self.catalog.get_table_arc(schema, table)?;
@@ -8544,24 +9092,24 @@ fn relation_from_tvf(alias: &str, tvf: crate::functions::TableValuedResult) -> R
 /// Overflowing integer literals return `Some((usize::MAX, coll))` so the caller emits
 /// SQLite's exact `"Nth ORDER BY/GROUP BY term out of range"` error instead of evaluating a constant!
 fn integer_ordinal_with_collation(expr: &Expr) -> Option<(usize, Option<&str>)> {
-    match expr {
-        Expr::Number(n) if !n.is_float && !n.is_hex => {
-            let ord = n.text.parse::<usize>().unwrap_or(usize::MAX);
-            Some((ord, None))
+    let mut cur = expr;
+    let mut outer_coll: Option<&str> = None;
+    while let Expr::Collate {
+        operand, collation, ..
+    } = cur
+    {
+        if outer_coll.is_none() {
+            outer_coll = Some(collation.name.as_str());
         }
-        Expr::Collate {
-            operand, collation, ..
-        } => {
-            if let Expr::Number(n) = operand.as_ref() {
-                if !n.is_float && !n.is_hex {
-                    let ord = n.text.parse::<usize>().unwrap_or(usize::MAX);
-                    return Some((ord, Some(collation.name.as_str())));
-                }
-            }
-            None
-        }
-        _ => None,
+        cur = operand;
     }
+    if let Expr::Number(n) = cur {
+        if !n.is_float && !n.is_hex {
+            let ord = n.text.parse::<usize>().unwrap_or(usize::MAX);
+            return Some((ord, outer_coll));
+        }
+    }
+    None
 }
 
 fn bare_unqualified_col_and_coll(expr: &Expr) -> Option<(&str, Option<&str>)> {
@@ -9109,6 +9657,141 @@ impl<'a> RowDedup<'a> {
     }
 }
 
+fn record_compound_branch_names(branch_names: &mut Vec<Vec<String>>, cols: &[ScopeColumn]) {
+    if branch_names.len() < cols.len() {
+        branch_names.resize_with(cols.len(), Vec::new);
+    }
+    for (i, c) in cols.iter().enumerate() {
+        if !branch_names[i]
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&c.name))
+        {
+            branch_names[i].push(c.name.clone());
+        }
+    }
+}
+
+fn collect_referenced_window_names(
+    expanded: &[ProjectedItem],
+    outer_order_by: Option<&[OrderingTerm]>,
+    defs: &[WindowDefinition],
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if defs.is_empty() {
+        return names;
+    }
+    let mut win_calls = Vec::new();
+    for p in expanded {
+        if p.direct_col.is_none() {
+            collect_windows(&p.expr, &mut win_calls);
+        }
+    }
+    if let Some(ob) = outer_order_by {
+        for t in ob {
+            collect_windows(&t.expr, &mut win_calls);
+        }
+    }
+    let mut work: Vec<String> = Vec::new();
+    for wc in win_calls {
+        match &wc.over {
+            Some(WindowRef::Name(n)) => work.push(n.name.to_ascii_lowercase()),
+            Some(WindowRef::Spec(ws)) => {
+                if let Some(ref b) = ws.base {
+                    work.push(b.name.to_ascii_lowercase());
+                }
+            }
+            None => {}
+        }
+    }
+    while let Some(wname) = work.pop() {
+        if names.insert(wname.clone()) {
+            if let Some(def) = defs
+                .iter()
+                .find(|d| d.name.name.eq_ignore_ascii_case(&wname))
+            {
+                if let Some(ref b) = def.window.base {
+                    work.push(b.name.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn select_stmt_references_table(stmt: &SelectStmt, name: &str) -> bool {
+    if let Some(ref w) = stmt.with {
+        for cte in &w.ctes {
+            if select_stmt_references_table(&cte.select, name) {
+                return true;
+            }
+            if cte.name.name.eq_ignore_ascii_case(name) {
+                // Inner WITH defines a shadowing CTE with the same name; subsequent CTEs and the
+                // body refer to the inner CTE, not the outer table/CTE.
+                return false;
+            }
+        }
+    }
+    select_body_references_table(&stmt.body, name)
+        || stmt
+            .order_by
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|o| expr_references_table(&o.expr, name))
+        || stmt.limit.as_ref().is_some_and(|l| {
+            expr_references_table(&l.count, name)
+                || l.offset
+                    .as_deref()
+                    .is_some_and(|o| expr_references_table(o, name))
+        })
+}
+
+fn select_body_references_table_in_subquery(body: &SelectBody, name: &str) -> bool {
+    match body {
+        SelectBody::Core(core) => {
+            core.from
+                .as_ref()
+                .is_some_and(|f| from_source_references_table_in_subquery(f, name))
+                || core
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|e| expr_references_table(e, name))
+                || core
+                    .having
+                    .as_ref()
+                    .is_some_and(|e| expr_references_table(e, name))
+                || core.columns.iter().any(|rc| match rc {
+                    ResultColumn::Expr(re) => expr_references_table(&re.expr, name),
+                    ResultColumn::Star(_) => false,
+                })
+        }
+        SelectBody::Values(v) => v
+            .rows
+            .iter()
+            .any(|r| r.items.iter().any(|e| expr_references_table(e, name))),
+        SelectBody::Compound { left, right, .. } => {
+            select_body_references_table_in_subquery(left, name)
+                || select_body_references_table_in_subquery(right, name)
+        }
+    }
+}
+
+fn from_source_references_table_in_subquery(src: &FromSource, name: &str) -> bool {
+    match src {
+        FromSource::Table(_) => false,
+        FromSource::Function(ff) => ff.args.iter().any(|a| expr_references_table(a, name)),
+        FromSource::Subquery(fs) => select_stmt_references_table(&fs.select, name),
+        FromSource::Group(fg) => from_source_references_table_in_subquery(&fg.source, name),
+        FromSource::Join {
+            left, right, on, ..
+        } => {
+            from_source_references_table_in_subquery(left, name)
+                || from_source_references_table_in_subquery(right, name)
+                || on.as_deref().is_some_and(|e| expr_references_table(e, name))
+        }
+    }
+}
+
 fn select_body_references_table(body: &SelectBody, name: &str) -> bool {
     match body {
         SelectBody::Core(core) => {
@@ -9142,7 +9825,7 @@ fn from_source_references_table(src: &FromSource, name: &str) -> bool {
     match src {
         FromSource::Table(ft) => ft.schema.is_none() && ft.name.name.eq_ignore_ascii_case(name),
         FromSource::Function(ff) => ff.args.iter().any(|a| expr_references_table(a, name)),
-        FromSource::Subquery(fs) => select_body_references_table(&fs.select.body, name),
+        FromSource::Subquery(fs) => select_stmt_references_table(&fs.select, name),
         FromSource::Group(fg) => from_source_references_table(&fg.source, name),
         FromSource::Join {
             left, right, on, ..
@@ -9157,11 +9840,10 @@ fn from_source_references_table(src: &FromSource, name: &str) -> bool {
 fn expr_references_table(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Subquery { select, .. } | Expr::Exists { select, .. } => {
-            select_body_references_table(&select.body, name)
+            select_stmt_references_table(select, name)
         }
         Expr::InSelect { operand, select, .. } => {
-            expr_references_table(operand, name)
-                || select_body_references_table(&select.body, name)
+            expr_references_table(operand, name) || select_stmt_references_table(select, name)
         }
         Expr::InTable {
             operand,

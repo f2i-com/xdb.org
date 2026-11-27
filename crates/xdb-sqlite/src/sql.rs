@@ -1575,6 +1575,139 @@ impl<'a> SqliteSqlCatalog<'a> {
                 ]];
                 Ok(Some(TableValuedResult { columns, rows }))
             }
+            "pragma_foreign_key_list" => {
+                let columns = vec![
+                    "id".to_string(),
+                    "seq".to_string(),
+                    "table".to_string(),
+                    "from".to_string(),
+                    "to".to_string(),
+                    "on_update".to_string(),
+                    "on_delete".to_string(),
+                    "match".to_string(),
+                ];
+                let Some(tname) = arg_str(0) else {
+                    return Ok(Some(TableValuedResult {
+                        columns,
+                        rows: Vec::new(),
+                    }));
+                };
+                let Some(table) = self.db.schema().table(&tname) else {
+                    return Ok(Some(TableValuedResult {
+                        columns,
+                        rows: Vec::new(),
+                    }));
+                };
+                let fk_action_str = |act: xdb_parser::ForeignKeyAction| match act {
+                    xdb_parser::ForeignKeyAction::SetNull => "SET NULL",
+                    xdb_parser::ForeignKeyAction::SetDefault => "SET DEFAULT",
+                    xdb_parser::ForeignKeyAction::Cascade => "CASCADE",
+                    xdb_parser::ForeignKeyAction::Restrict => "RESTRICT",
+                    xdb_parser::ForeignKeyAction::NoAction => "NO ACTION",
+                };
+                let mut rows = Vec::new();
+                // SQLite prepends foreign keys onto a linked list, so `id` counts from the
+                // last-declared foreign key (`0`) back to the first.
+                for (fk_id, fk) in table.definition.foreign_keys.iter().rev().enumerate() {
+                    let on_upd = fk_action_str(fk.on_update);
+                    let on_del = fk_action_str(fk.on_delete);
+                    for (seq, &from_cid) in fk.from.iter().enumerate() {
+                        let from_name = table
+                            .columns
+                            .get(from_cid)
+                            .map_or("", |c| c.name.as_str());
+                        let to_val = fk
+                            .to
+                            .as_ref()
+                            .and_then(|v| v.get(seq))
+                            .map_or(SqlValue::Null, |s| SqlValue::text(s.as_str()));
+                        rows.push(vec![
+                            SqlValue::Int(fk_id as i64),
+                            SqlValue::Int(seq as i64),
+                            SqlValue::text(fk.table.as_str()),
+                            SqlValue::text(from_name),
+                            to_val,
+                            SqlValue::text(on_upd),
+                            SqlValue::text(on_del),
+                            SqlValue::text("NONE"),
+                        ]);
+                    }
+                }
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
+            "pragma_table_list" => {
+                let columns = vec![
+                    "schema".to_string(),
+                    "name".to_string(),
+                    "type".to_string(),
+                    "ncol".to_string(),
+                    "wr".to_string(),
+                    "strict".to_string(),
+                ];
+                let filter = arg_str(0);
+                let matches_filter = |n: &str| {
+                    filter
+                        .as_deref()
+                        .is_none_or(|f| n.eq_ignore_ascii_case(f))
+                };
+                let mut rows = Vec::new();
+                if matches_filter("sqlite_schema") || matches_filter("sqlite_master") {
+                    rows.push(vec![
+                        SqlValue::text("main"),
+                        SqlValue::text("sqlite_schema"),
+                        SqlValue::text("table"),
+                        SqlValue::Int(5),
+                        SqlValue::Int(0),
+                        SqlValue::Int(0),
+                    ]);
+                }
+                for t in &self.db.schema().tables {
+                    if t.name.eq_ignore_ascii_case("sqlite_master")
+                        || t.name.eq_ignore_ascii_case("sqlite_schema")
+                    {
+                        continue;
+                    }
+                    if !matches_filter(&t.name) {
+                        continue;
+                    }
+                    rows.push(vec![
+                        SqlValue::text("main"),
+                        SqlValue::text(t.name.as_str()),
+                        SqlValue::text("table"),
+                        SqlValue::Int(t.columns.len() as i64),
+                        SqlValue::Int(i64::from(t.without_rowid)),
+                        SqlValue::Int(i64::from(t.strict)),
+                    ]);
+                }
+                for v in &self.db.schema().views {
+                    if !matches_filter(&v.name) {
+                        continue;
+                    }
+                    let ncol = v.column_names.as_ref().map_or(0, |c| c.len());
+                    rows.push(vec![
+                        SqlValue::text("main"),
+                        SqlValue::text(v.name.as_str()),
+                        SqlValue::text("view"),
+                        SqlValue::Int(ncol as i64),
+                        SqlValue::Int(0),
+                        SqlValue::Int(0),
+                    ]);
+                }
+                for vt in &self.db.schema().virtual_tables {
+                    if !matches_filter(&vt.name) {
+                        continue;
+                    }
+                    rows.push(vec![
+                        SqlValue::text("main"),
+                        SqlValue::text(vt.name.as_str()),
+                        SqlValue::text("virtual"),
+                        SqlValue::Int(0),
+                        SqlValue::Int(0),
+                        SqlValue::Int(0),
+                    ]);
+                }
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
             _ => Ok(None),
         }
     }

@@ -938,6 +938,9 @@ fn scan_shorthand_specs<'a>(
 ) -> SqliteResult<Option<Vec<StreamTableSpec<'a>>>> {
     let bytes = src.as_bytes();
     let metered = !meter.is_noop();
+    if metered {
+        meter.charge_steps((bytes.len() / 64).max(1) as u64)?;
+    }
     let mut pos = skip_json_ws(bytes, 0);
     if pos >= bytes.len() || bytes[pos] != b'{' {
         return Ok(None);
@@ -959,7 +962,7 @@ fn scan_shorthand_specs<'a>(
                 tname,
                 "mode" | "schema" | "tables" | "statements" | "pragmas"
             )
-            || tname.len() >= 7 && tname[..7].eq_ignore_ascii_case("sqlite_")
+            || (tname.len() >= 7 && tname.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
             || specs.iter().any(|s| s.name.eq_ignore_ascii_case(tname))
         {
             return Ok(None);

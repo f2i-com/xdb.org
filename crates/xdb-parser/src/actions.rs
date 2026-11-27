@@ -1996,6 +1996,7 @@ pub(crate) fn run_action(action: ActionId, p: &mut Parser<'_>, b: usize) -> SemV
         }
         ActionId::TermString => {
             p.h[b] = 1;
+            p.f[b] = 0;
             SemVal::Expr(Expr::String(StringLiteral {
                 span: p.rule_span(),
                 value: dequote(text(p, b)),

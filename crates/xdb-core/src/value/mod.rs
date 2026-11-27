@@ -25,8 +25,8 @@ pub use affinity::{
     number_to_text,
 };
 pub use arith::{
-    add, arith, bit_and, bit_not, bit_or, bitwise, divide, multiply, negate, remainder,
-    shift_left, shift_right, subtract, ArithOp, BitOp,
+    add, arith, arith_enc, bit_and, bit_not, bit_not_enc, bit_or, bitwise, bitwise_enc, divide,
+    multiply, negate, negate_enc, remainder, shift_left, shift_right, subtract, ArithOp, BitOp,
 };
 pub use atof::{
     atof, atof_flags, atoi64, dec_or_hex_to_i64, get_int32, is_sql_digit, is_sql_space,
@@ -48,8 +48,9 @@ pub use int64::{
     real_to_i64, real_to_integer_affinity, rem_i64, sub_i64,
 };
 pub use numeric::{
-    apply_numeric_affinity, boolean_value, int_value, integer_literal_value, mem_real_value_rc,
-    must_be_int, numeric_value, numerify, real_literal_value, real_value, text_numeric_value,
+    apply_numeric_affinity, boolean_value, boolean_value_enc, int_value, int_value_enc,
+    integer_literal_value, mem_real_value_rc, must_be_int, numeric_value, numeric_value_enc,
+    numerify, real_literal_value, real_value, real_value_enc, text_numeric_value,
 };
 pub use utf::{sqlite_utf16_to_utf8, utf16_decode_units, utf16_encode_units, TextEncoding};
 

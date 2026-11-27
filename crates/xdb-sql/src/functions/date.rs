@@ -300,7 +300,7 @@ fn parse_yyyy_mm_dd(z: &[u8], p: &mut DateTime) -> bool {
     if get_digits(z, i, b"40f-21a-21d", &mut dig) != 3 {
         return true;
     }
-    let mut y = dig[0];
+    let mut y = if neg { -dig[0] } else { dig[0] };
     let mut m = dig[1];
     let mut d = dig[2];
     i += 10;
@@ -328,7 +328,7 @@ fn parse_yyyy_mm_dd(z: &[u8], p: &mut DateTime) -> bool {
     }
     p.valid_jd = false;
     p.valid_ymd = true;
-    p.y = if neg { -y } else { y };
+    p.y = y;
     p.m = m;
     p.d = d;
     compute_floor(p);
@@ -605,7 +605,7 @@ fn parse_modifier(
                                 wd -= 7;
                             }
                             p.i_jd = p.i_jd.wrapping_add(i64::from(n - wd) * 86_400_000);
-                            if tail.contains(&b'-') {
+                            if tail.trim_ascii_start().starts_with(b"-") {
                                 p.i_jd = p.i_jd.wrapping_sub(7 * 86_400_000);
                             }
                         }

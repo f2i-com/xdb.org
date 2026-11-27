@@ -240,9 +240,14 @@ pub fn call_core_scalar(
             }
             trim_fn(args, false, true, ctx)?
         }
-        "concat" => concat_fn(args, ctx)?,
-        "concat_ws" => {
+        "concat" => {
             if args.is_empty() {
+                return Err(wrong_arity("concat"));
+            }
+            concat_fn(args, ctx)?
+        }
+        "concat_ws" => {
+            if args.len() < 2 {
                 return Err(wrong_arity("concat_ws"));
             }
             concat_ws_fn(args, ctx)?

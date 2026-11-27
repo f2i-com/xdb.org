@@ -37,7 +37,7 @@ use crate::format::BtreePageType;
 use crate::schema::catalog::{GeneratedKind, SchemaCatalog};
 use crate::schema::{ColumnHiddenKind, IndexInfo, SchemaObject, TableInfo};
 use crate::write::btree::{
-    append_index_cell_body, check_integrity, compare_index_values, create_btree, drop_btree,
+    append_index_cell_body, check_integrity_metered, compare_index_values, create_btree, drop_btree,
     index_bulk_load_sorted, index_bulk_load_sorted_flat, index_bulk_load_sorted_two_int,
     index_contains_prefix, index_delete, index_delete_two_int_asc, index_eq_scan_direct,
     index_insert, index_insert_two_int_asc, index_insert_with_values,
@@ -182,7 +182,8 @@ struct CachedScript {
     fast_dml: Option<Arc<CachedFastDml>>,
 }
 
-type SeqCache = (u32, Vec<(String, SqlValue, i64, i64, Option<(usize, u32)>)>);
+type SeqRowEntry = (String, SqlValue, i64, i64, Option<(usize, u32)>, bool);
+type SeqCache = (u32, Vec<SeqRowEntry>);
 
 #[derive(Debug, Clone)]
 enum FastKeySrc {
@@ -314,9 +315,12 @@ pub struct SqliteConnection {
     cached_collations: (TextEncoding, CollationRegistry),
     /// Cached default `FunctionRegistry` to avoid rebuilding on every `query_options()` call.
     cached_functions: FunctionRegistry,
-    /// Cached `sqlite_sequence` `(root_page, [(table_name, rowid, seq)])`,
+    /// Cached `sqlite_sequence` `(root_page, [(table_name, name_val, rowid, seq, loc, dirty)])`,
     /// invalidated on rollback, schema change, or direct DML on `sqlite_sequence`.
     cached_seq: Option<SeqCache>,
+    /// True when one or more `cached_seq` entries have deferred in-tx sequence bumps not yet
+    /// written to `sqlite_sequence` pages (flushed on COMMIT, SAVEPOINT, DDL, or read overlay).
+    seq_dirty: bool,
     /// Cached exact `table_max_rowid` per rowid table `root_page` (invalidated on DELETE,
     /// rowid-changing UPDATE, DDL, or rollback) to avoid redundant B-tree descents on bulk INSERT.
     cached_max_rowid: HashMap<u32, Option<i64>>,
@@ -357,6 +361,24 @@ impl SqliteConnection {
         Ok(Self::from_pager(pager, options.dialect))
     }
 
+    /// Load an owned SQLite `.db` byte image (plus optional `-wal`/`-journal`) into a writable
+    /// in-memory connection without cloning the input buffers.
+    pub fn open_from_owned_bytes(
+        main_bytes: Vec<u8>,
+        wal_bytes: Option<Vec<u8>>,
+        journal_bytes: Option<Vec<u8>>,
+        options: ConnectionOptions,
+    ) -> SqliteResult<Self> {
+        let pager =
+            WritePager::from_owned_bytes(main_bytes, wal_bytes, journal_bytes, options.meter)?;
+        Ok(Self::from_pager(pager, options.dialect))
+    }
+
+    /// Return the current parsed schema catalog (used by hosts such as `xdb-wasm`).
+    pub fn schema(&self) -> SqliteResult<Arc<SchemaCatalog>> {
+        self.schema_arc()
+    }
+
     /// Open (or create) a durable read-write SQLite database over `vfs` at `path`.
     pub fn open(
         vfs: Arc<dyn Vfs>,
@@ -387,6 +409,7 @@ impl SqliteConnection {
             cached_collations: (enc, CollationRegistry::new(enc)),
             cached_functions: FunctionRegistry::new(),
             cached_seq: None,
+            seq_dirty: false,
             cached_max_rowid: HashMap::new(),
             last_append_tail: None,
             last_point_leaf: None,
@@ -444,6 +467,9 @@ impl SqliteConnection {
 
     /// Export the live SQLite 3 binary database image (readable directly by C SQLite).
     pub fn to_bytes(&self) -> Vec<u8> {
+        if let Some(ov) = self.cow_overlay_with_flushed_seq() {
+            return ov.to_bytes();
+        }
         self.pager.to_bytes()
     }
 
@@ -467,6 +493,7 @@ impl SqliteConnection {
         }
         self.cached_dml.1.clear();
         self.cached_seq = None;
+        self.seq_dirty = false;
         self.invalidate_max_rowid_cache();
         self.stmt_cache.clear();
         if let Ok(mut guard) = self.select_cache.lock() {
@@ -493,7 +520,9 @@ impl SqliteConnection {
 
     #[inline]
     fn invalidate_max_rowid_only_for(&mut self, root_page: u32) {
-        self.cached_max_rowid.remove(&root_page);
+        if !self.cached_max_rowid.is_empty() {
+            self.cached_max_rowid.remove(&root_page);
+        }
         if self.last_append_tail.is_some_and(|(r, _, _)| r == root_page) {
             self.last_append_tail = None;
         }
@@ -580,7 +609,7 @@ impl SqliteConnection {
     fn warm_view(&self) -> SqliteResult<Arc<SqliteDatabase>> {
         self.check_open()?;
         let mgen = self.pager.mut_gen();
-        if self.warm_view_populated.load(AtomicOrdering::Acquire) {
+        if !self.seq_dirty && self.warm_view_populated.load(AtomicOrdering::Acquire) {
             if let Ok(guard) = self.cached_view.lock() {
                 if let Some((cg, ref db)) = *guard {
                     if cg == mgen && !db.is_closed() {
@@ -590,9 +619,11 @@ impl SqliteConnection {
             }
         }
         let view = Arc::new(self.live_view()?);
-        if let Ok(mut guard) = self.cached_view.lock() {
-            *guard = Some((mgen, Arc::clone(&view)));
-            self.warm_view_populated.store(true, AtomicOrdering::Release);
+        if !self.seq_dirty {
+            if let Ok(mut guard) = self.cached_view.lock() {
+                *guard = Some((mgen, Arc::clone(&view)));
+                self.warm_view_populated.store(true, AtomicOrdering::Release);
+            }
         }
         Ok(view)
     }
@@ -662,8 +693,13 @@ impl SqliteConnection {
             .ok()
             .and_then(|g| g.as_ref().and_then(|(cg, s)| (*cg == gen).then(|| Arc::clone(s))));
         let hit = cached.is_some();
+        let page_source = if let Some(ov) = self.cow_overlay_with_flushed_seq() {
+            ov.snapshot_page_source()
+        } else {
+            self.pager.snapshot_page_source()
+        };
         let view = open_from_page_source_cached(
-            self.pager.snapshot_page_source(),
+            page_source,
             self.pager.path().to_string(),
             Some(self.pager.meter().clone()),
             cached,
@@ -1732,7 +1768,7 @@ impl SqliteConnection {
     /// Run a parameterized read-only `SELECT` query against the live connection state.
     pub fn query_with_params(&self, sql: &str, params: &QueryParams) -> SqliteResult<QueryResult> {
         self.check_open()?;
-        if sql.len() <= STMT_CACHE_MAX_SQL_LEN {
+        if !self.seq_dirty && sql.len() <= STMT_CACHE_MAX_SQL_LEN {
             let sgen = self.pager.schema_gen();
             let mgen = self.pager.mut_gen();
             let cached = self.select_cache.lock().ok().and_then(|mut cache| {
@@ -1828,6 +1864,11 @@ impl SqliteConnection {
             } else {
                 parse_statement_metered(sql, &parse_opts, self.pager.meter().as_ref())
             };
+            if let Err(ref pe) = parsed {
+                if let Some(rl) = pe.resource_limit {
+                    return Err(SqliteError::ResourceLimit(rl));
+                }
+            }
             if let Ok(Statement::Select(sel)) = parsed {
                 let arc_sel: Arc<SelectStmt> = Arc::from(sel);
                 let fast = Arc::new(
@@ -1985,9 +2026,13 @@ impl SqliteConnection {
         let mut parser = Parser::new(sql, &parse_opts, parser_meter.as_deref());
 
         while offset < sql.len() {
-            let parsed = parser
-                .parse_at(offset)
-                .map_err(|e| SqliteError::Sql(e.to_string()))?;
+            let parsed = parser.parse_at(offset).map_err(|e| {
+                if let Some(rl) = e.resource_limit {
+                    SqliteError::ResourceLimit(rl)
+                } else {
+                    SqliteError::Sql(e.to_string())
+                }
+            })?;
             let stmt_end = parsed.end;
             if let Some(stmt) = parsed.statement {
                 let slice = &sql[offset..stmt_end];
@@ -3155,6 +3200,7 @@ impl SqliteConnection {
     ) -> SqliteResult<ExecResult> {
         match stmt {
             Statement::Select(sel) => {
+                self.flush_seq_cache()?;
                 let view = self.warm_view()?;
                 let opts = self.query_options(dialect);
                 let res = self.eval_select_stmt(&view, sel, params, &opts)?;
@@ -3170,6 +3216,7 @@ impl SqliteConnection {
                 Ok(self.empty_exec_result())
             }
             Statement::Commit { .. } => {
+                self.flush_seq_cache()?;
                 self.invalidate_warm_view();
                 self.pager.commit()?;
                 Ok(self.empty_exec_result())
@@ -3177,6 +3224,7 @@ impl SqliteConnection {
             Statement::Rollback { savepoint, .. } => {
                 self.invalidate_warm_view();
                 self.cached_seq = None;
+                self.seq_dirty = false;
                 self.invalidate_max_rowid_cache();
                 if let Some(sp) = savepoint {
                     self.pager.rollback_to_savepoint(&sp.name)?;
@@ -3186,34 +3234,44 @@ impl SqliteConnection {
                 Ok(self.empty_exec_result())
             }
             Statement::Savepoint { name, .. } => {
+                self.flush_seq_cache()?;
                 self.pager.push_savepoint(Some(name.name.clone()));
                 Ok(self.empty_exec_result())
             }
             Statement::Release { name, .. } => {
+                self.flush_seq_cache()?;
                 self.invalidate_warm_view();
                 self.pager.release_savepoint(&name.name)?;
                 Ok(self.empty_exec_result())
             }
             Statement::Pragma(p) => {
+                self.flush_seq_cache()?;
                 self.invalidate_warm_view();
                 self.exec_pragma(p)
             }
             Statement::CreateTable(ct) => self.run_mutating_stmt(|conn| {
+                conn.flush_seq_cache()?;
                 conn.exec_create_table(ct, full_sql, raw_sql, params, dialect)
             }),
-            Statement::CreateIndex(ci) => {
-                self.run_mutating_stmt(|conn| conn.exec_create_index(ci, raw_sql))
-            }
-            Statement::CreateView(cv) => {
-                self.run_mutating_stmt(|conn| conn.exec_create_view(cv, raw_sql))
-            }
+            Statement::CreateIndex(ci) => self.run_mutating_stmt(|conn| {
+                conn.flush_seq_cache()?;
+                conn.exec_create_index(ci, raw_sql)
+            }),
+            Statement::CreateView(cv) => self.run_mutating_stmt(|conn| {
+                conn.flush_seq_cache()?;
+                conn.exec_create_view(cv, raw_sql)
+            }),
             Statement::Drop(dr) => self.run_mutating_stmt(|conn| {
+                conn.flush_seq_cache()?;
                 conn.cached_seq = None;
+                conn.seq_dirty = false;
                 conn.invalidate_max_rowid_cache();
                 conn.exec_drop(dr)
             }),
             Statement::AlterTable(al) => self.run_mutating_stmt(|conn| {
+                conn.flush_seq_cache()?;
                 conn.cached_seq = None;
+                conn.seq_dirty = false;
                 conn.invalidate_max_rowid_cache();
                 conn.exec_alter_table(al, full_sql)
             }),
@@ -3255,9 +3313,7 @@ impl SqliteConnection {
                         "VACUUM INTO is not yet supported".to_string(),
                     ));
                 }
-                self.invalidate_warm_view();
-                self.pager.autocommit_flush()?;
-                Ok(self.empty_exec_result())
+                self.exec_vacuum()
             }
             Statement::Analyze { .. } | Statement::Reindex { .. } => {
                 Ok(self.empty_exec_result())
@@ -3442,11 +3498,15 @@ impl SqliteConnection {
             Ok(res) => Ok(res),
             Err(e) => {
                 self.invalidate_max_rowid_cache();
-                self.cached_seq = None;
                 if self.pending_error_conflict.take() == Some(ConflictAction::Rollback)
                     && self.pager.in_transaction()
                 {
+                    self.cached_seq = None;
+                    self.seq_dirty = false;
                     let _ = self.pager.rollback();
+                } else {
+                    let _ = self.flush_seq_cache();
+                    self.cached_seq = None;
                 }
                 Err(e)
             }
@@ -3468,6 +3528,7 @@ impl SqliteConnection {
     where
         F: FnOnce(&mut Self) -> SqliteResult<ExecResult>,
     {
+        self.flush_seq_cache()?;
         self.invalidate_warm_view();
         self.pending_error_conflict = None;
         let prev_changes = self.changes;
@@ -3479,6 +3540,7 @@ impl SqliteConnection {
                 if let Err(e) = self.pager.commit_statement_and_autocommit() {
                     self.invalidate_warm_view();
                     self.cached_seq = None;
+                    self.seq_dirty = false;
                     self.invalidate_max_rowid_cache();
                     self.changes = prev_changes;
                     self.total_changes = prev_total_changes;
@@ -3490,6 +3552,7 @@ impl SqliteConnection {
             Err(e) => {
                 self.invalidate_warm_view();
                 self.cached_seq = None;
+                self.seq_dirty = false;
                 self.invalidate_max_rowid_cache();
                 let eff = self.pending_error_conflict.take();
                 match eff {
@@ -3570,6 +3633,87 @@ impl SqliteConnection {
         Ok(())
     }
 
+    fn flush_seq_cache(&mut self) -> SqliteResult<()> {
+        if !self.seq_dirty {
+            return Ok(());
+        }
+        let Some((seq_root, mut list)) = self.cached_seq.take() else {
+            self.seq_dirty = false;
+            return Ok(());
+        };
+        let enc = self.pager.encoding();
+        let fmt = self.pager.schema_format();
+        let flush_res: SqliteResult<()> = (|| {
+            for idx in 0..list.len() {
+                if !list[idx].5 {
+                    continue;
+                }
+                let rid = list[idx].2;
+                let clamped = list[idx].3;
+                let mut loc = list[idx].4;
+                let (outcome, repacked) = table_update_int_field_cached(
+                    &mut self.pager,
+                    seq_root,
+                    rid,
+                    1,
+                    clamped,
+                    &mut loc,
+                    &mut self.record_scratch,
+                )?;
+                if matches!(outcome, FastFieldUpdateOutcome::Updated) {
+                    if repacked {
+                        for entry in &mut list {
+                            entry.4 = None;
+                        }
+                    }
+                    list[idx].4 = loc;
+                    list[idx].5 = false;
+                } else {
+                    let seq_val = SqlValue::Int(clamped);
+                    let refs = [&list[idx].1, &seq_val];
+                    encode_record_refs_into(&refs, enc, fmt, &mut self.record_scratch);
+                    table_insert(&mut self.pager, seq_root, rid, &self.record_scratch, true)?;
+                    for entry in &mut list {
+                        entry.4 = None;
+                    }
+                    list[idx].5 = false;
+                }
+            }
+            Ok(())
+        })();
+        self.seq_dirty = list.iter().any(|e| e.5);
+        self.cached_seq = Some((seq_root, list));
+        flush_res
+    }
+
+    fn cow_overlay_with_flushed_seq(&self) -> Option<WritePager> {
+        if !self.seq_dirty {
+            return None;
+        }
+        let (seq_root, ref list) = *self.cached_seq.as_ref()?;
+        let mut ov = self.pager.clone_cow_overlay();
+        let enc = ov.encoding();
+        let fmt = ov.schema_format();
+        let mut scratch = Vec::with_capacity(64);
+        for (_, name_val, rid, clamped, loc_init, dirty) in list {
+            if !*dirty {
+                continue;
+            }
+            let mut loc = *loc_init;
+            let ok = matches!(
+                table_update_int_field_cached(&mut ov, seq_root, *rid, 1, *clamped, &mut loc, &mut scratch),
+                Ok((FastFieldUpdateOutcome::Updated, _))
+            );
+            if !ok {
+                let seq_val = SqlValue::Int(*clamped);
+                let refs = [name_val, &seq_val];
+                encode_record_refs_into(&refs, enc, fmt, &mut scratch);
+                let _ = table_insert(&mut ov, seq_root, *rid, &scratch, true);
+            }
+        }
+        Some(ov)
+    }
+
     fn ensure_sqlite_sequence_cache(&mut self) -> SqliteResult<Option<u32>> {
         if let Some((root, _)) = self.cached_seq {
             return Ok(Some(root));
@@ -3586,15 +3730,14 @@ impl SqliteConnection {
             rowid: false,
         };
         let mut cur = reader.cursor(Some(&opts))?;
-        type SeqRowEntry = (String, SqlValue, i64, i64, Option<(usize, u32)>);
         let mut list: Vec<SeqRowEntry> = Vec::new();
         while cur.next()? {
             let rid = cur.rowid()?;
             let r = cur.row()?;
             if let Some(name) = r.first().and_then(SqlValue::as_str) {
-                if !list.iter().any(|(n, _, _, _, _)| n.eq_ignore_ascii_case(name)) {
+                if !list.iter().any(|(n, _, _, _, _, _)| n.eq_ignore_ascii_case(name)) {
                     let seq = r.get(1).map_or(0, int_value);
-                    list.push((name.to_string(), SqlValue::text(name), rid, seq, None));
+                    list.push((name.to_string(), SqlValue::text(name), rid, seq, None, false));
                 }
             }
         }
@@ -3627,8 +3770,8 @@ impl SqliteConnection {
         }
         Ok(self.cached_seq.as_ref().and_then(|(_, list)| {
             list.iter()
-                .find(|(n, _, _, _, _)| n.eq_ignore_ascii_case(table_name))
-                .map(|(_, _, rid, seq, _)| (*rid, *seq))
+                .find(|(n, _, _, _, _, _)| n.eq_ignore_ascii_case(table_name))
+                .map(|(_, _, rid, seq, _, _)| (*rid, *seq))
         }))
     }
 
@@ -3642,8 +3785,8 @@ impl SqliteConnection {
         Ok(self.cached_seq.as_ref().and_then(|(_, list)| {
             list.iter()
                 .enumerate()
-                .find(|(_, (n, _, _, _, _))| n.eq_ignore_ascii_case(table_name))
-                .map(|(idx, (_, _, _, seq, _))| (idx, *seq))
+                .find(|(_, (n, _, _, _, _, _))| n.eq_ignore_ascii_case(table_name))
+                .map(|(idx, (_, _, _, seq, _, _))| (idx, *seq))
         }))
     }
 
@@ -3657,7 +3800,7 @@ impl SqliteConnection {
         let Some((seq_root, rid, old_seq, mut loc)) =
             self.cached_seq.as_ref().and_then(|(root, list)| {
                 list.get(idx)
-                    .map(|(_, _, rid, seq, loc)| (*root, *rid, *seq, *loc))
+                    .map(|(_, _, rid, seq, loc, _)| (*root, *rid, *seq, *loc))
             })
         else {
             return self.update_sqlite_sequence(table_name, new_seq);
@@ -3665,7 +3808,17 @@ impl SqliteConnection {
         if clamped <= old_seq {
             return Ok(());
         }
-        self.invalidate_max_rowid_for(seq_root);
+        // Inside an explicit transaction with no nested savepoints and noop meter, defer
+        // physical `sqlite_sequence` page writes until COMMIT / SAVEPOINT / DDL / read overlay.
+        if self.pager.in_transaction() && !self.pager.has_savepoints() && self.pager.is_noop_meter()
+        {
+            if let Some((_, ref mut list)) = self.cached_seq {
+                list[idx].3 = clamped;
+                list[idx].5 = true;
+            }
+            self.seq_dirty = true;
+            return Ok(());
+        }
         let (outcome, repacked) = table_update_int_field_cached(
             &mut self.pager,
             seq_root,
@@ -3684,9 +3837,11 @@ impl SqliteConnection {
                 }
                 list[idx].3 = clamped;
                 list[idx].4 = loc;
+                list[idx].5 = false;
             }
             return Ok(());
         }
+        self.invalidate_max_rowid_for(seq_root);
         let enc = self.pager.encoding();
         let fmt = self.pager.schema_format();
         let seq_val = SqlValue::Int(clamped);
@@ -3700,6 +3855,7 @@ impl SqliteConnection {
                 entry.4 = None;
             }
             list[idx].3 = clamped;
+            list[idx].5 = false;
         }
         Ok(())
     }
@@ -3712,12 +3868,22 @@ impl SqliteConnection {
         let existing = self.cached_seq.as_ref().and_then(|(_, list)| {
             list.iter()
                 .enumerate()
-                .find(|(_, (n, _, _, _, _))| n.eq_ignore_ascii_case(table_name))
-                .map(|(idx, (_, _, rid, seq, loc))| (idx, *rid, *seq, *loc))
+                .find(|(_, (n, _, _, _, _, _))| n.eq_ignore_ascii_case(table_name))
+                .map(|(idx, (_, _, rid, seq, loc, _))| (idx, *rid, *seq, *loc))
         });
         if let Some((idx, rid, old_seq, mut loc)) = existing {
             if clamped > old_seq {
-                self.invalidate_max_rowid_for(seq_root);
+                if self.pager.in_transaction()
+                    && !self.pager.has_savepoints()
+                    && self.pager.is_noop_meter()
+                {
+                    if let Some((_, ref mut list)) = self.cached_seq {
+                        list[idx].3 = clamped;
+                        list[idx].5 = true;
+                    }
+                    self.seq_dirty = true;
+                    return Ok(());
+                }
                 let (outcome, repacked) = table_update_int_field_cached(
                     &mut self.pager,
                     seq_root,
@@ -3736,9 +3902,11 @@ impl SqliteConnection {
                         }
                         list[idx].3 = clamped;
                         list[idx].4 = loc;
+                        list[idx].5 = false;
                     }
                     return Ok(());
                 }
+                self.invalidate_max_rowid_for(seq_root);
                 let seq_val = SqlValue::Int(clamped);
                 if let Some((_, ref list)) = self.cached_seq {
                     let refs = [&list[idx].1, &seq_val];
@@ -3750,6 +3918,7 @@ impl SqliteConnection {
                         entry.4 = None;
                     }
                     list[idx].3 = clamped;
+                    list[idx].5 = false;
                 }
             }
         } else {
@@ -3767,10 +3936,225 @@ impl SqliteConnection {
                 for entry in list.iter_mut() {
                     entry.4 = None;
                 }
-                list.push((table_name.to_string(), name_val, rid, clamped, None));
+                list.push((table_name.to_string(), name_val, rid, clamped, None, false));
             }
         }
         Ok(())
+    }
+
+    // ───────────────────────────── VACUUM ─────────────────────────────
+
+    fn exec_vacuum(&mut self) -> SqliteResult<ExecResult> {
+        self.flush_seq_cache()?;
+        if self.pager.page_count() == 0 {
+            if let Some(ps) = self.pager.pending_page_size() {
+                self.pager.set_page_size(ps)?;
+            }
+            return Ok(self.empty_exec_result());
+        }
+
+        let target_ps = self
+            .pager
+            .pending_page_size()
+            .unwrap_or_else(|| self.pager.page_size());
+        let enc = self.pager.encoding();
+        let sf = self.pager.schema_format();
+
+        let mut tmp = SqliteConnection::open_in_memory(ConnectionOptions {
+            page_size: target_ps,
+            dialect: self.dialect,
+            meter: Some(Arc::clone(self.pager.meter())),
+        })?;
+        tmp.pager.set_encoding(enc);
+        tmp.pager.set_schema_format(sf);
+        tmp.cached_collations = self.cached_collations.clone();
+        tmp.cached_functions = self.cached_functions.clone();
+        tmp.foreign_keys = false;
+        tmp.pager.ensure_initialized()?;
+
+        let view = self.live_view()?;
+        let mut table_ddls: Vec<String> = Vec::new();
+        let mut index_ddls: Vec<String> = Vec::new();
+        let mut view_ddls: Vec<String> = Vec::new();
+        let mut trigger_rows: Vec<(String, String, String)> = Vec::new();
+
+        for entry in &view.schema().entries {
+            let Some(ref otype) = entry.obj_type else {
+                continue;
+            };
+            let Some(ref sql) = entry.sql else {
+                continue;
+            };
+            let name = entry.name.as_deref().unwrap_or("");
+            let tbl_name = entry.table_name.as_deref().unwrap_or(name);
+            match otype.as_str() {
+                "table" => {
+                    if !name.eq_ignore_ascii_case("sqlite_sequence")
+                        && !name.eq_ignore_ascii_case("sqlite_master")
+                        && !name.eq_ignore_ascii_case("sqlite_schema")
+                    {
+                        table_ddls.push(sql.clone());
+                    }
+                }
+                "index" => index_ddls.push(sql.clone()),
+                "view" => view_ddls.push(sql.clone()),
+                "trigger" => {
+                    trigger_rows.push((name.to_string(), tbl_name.to_string(), sql.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        // 1. Recreate all user tables cleanly (creating fresh root pages & autoindexes).
+        for ddl in &table_ddls {
+            tmp.execute(ddl)?;
+        }
+
+        // 2. Copy all user table rows compactly into `tmp`, preserving exact rowids & WITHOUT ROWID PKs.
+        let qopts = tmp.query_options(self.dialect);
+        for src_tbl in &view.schema().tables {
+            if src_tbl.system || src_tbl.name.eq_ignore_ascii_case("sqlite_sequence") {
+                continue;
+            }
+            let mut rows_mem = ConnMemGuard::new(&self.pager);
+            let rows = self.read_all_table_rows(&view, src_tbl, &mut rows_mem)?;
+            let dst_tbl = {
+                let tv = tmp.live_view()?;
+                tv.schema()
+                    .table(&src_tbl.name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SqliteError::Sql(format!("VACUUM missing recreated table {}", src_tbl.name))
+                    })?
+            };
+            if !dst_tbl.without_rowid {
+                let mut hint_leaf: Option<u32> = None;
+                let mut rec_vals: Vec<SqlValue> =
+                    Vec::with_capacity(dst_tbl.definition.record_columns.len());
+                for (rid_opt, full_row) in &rows {
+                    let rid = rid_opt.ok_or_else(|| {
+                        SqliteError::corrupt(format!("table {} row missing rowid", dst_tbl.name))
+                    })?;
+                    rec_vals.clear();
+                    for &cid in &dst_tbl.definition.record_columns {
+                        if Some(cid) == dst_tbl.ipk_column {
+                            rec_vals.push(SqlValue::Null);
+                        } else {
+                            rec_vals.push(full_row[cid].clone());
+                        }
+                    }
+                    encode_record_with_format_into(&rec_vals, enc, sf, &mut tmp.record_scratch);
+                    table_append_monotonic(
+                        &mut tmp.pager,
+                        dst_tbl.root_page,
+                        &mut hint_leaf,
+                        rid,
+                        &tmp.record_scratch,
+                    )?;
+                }
+            } else {
+                let pk_idx = dst_tbl
+                    .indexes
+                    .iter()
+                    .find(|ix| ix.without_rowid_primary_key)
+                    .ok_or_else(|| {
+                        SqliteError::corrupt(format!(
+                            "WITHOUT ROWID table {} missing primary key index",
+                            dst_tbl.name
+                        ))
+                    })?;
+                let ki = key_info_for_index(pk_idx, enc, Some(&tmp.cached_collations.1))?;
+                let mut wr_entries: Vec<Vec<SqlValue>> = Vec::with_capacity(rows.len());
+                for (_, full_row) in &rows {
+                    let mut rec = Vec::with_capacity(pk_idx.columns.len());
+                    for ic in &pk_idx.columns {
+                        rec.push(full_row[ic.cid as usize].clone());
+                    }
+                    wr_entries.push(rec);
+                }
+                wr_entries.sort_by(|a, b| compare_index_values(a, b, &ki));
+                let payloads: Vec<Vec<u8>> = wr_entries
+                    .iter()
+                    .map(|e| encode_record_with_format(e, enc, sf))
+                    .collect();
+                index_bulk_load_sorted(&mut tmp.pager, dst_tbl.root_page, &payloads)?;
+            }
+
+            // Populate any `sqlite_autoindex_*` B-trees created alongside the table.
+            let expr_scope_cols = build_plain_scope_columns(&dst_tbl);
+            let where_scope_cols = build_table_scope_columns(&dst_tbl, &dst_tbl.name);
+            for ix in &dst_tbl.indexes {
+                if ix.without_rowid_primary_key {
+                    continue;
+                }
+                let ki = key_info_for_index(ix, enc, Some(&tmp.cached_collations.1))?;
+                let mut idx_entries: Vec<Vec<SqlValue>> = Vec::with_capacity(rows.len());
+                for (rid_opt, full_row) in &rows {
+                    if let Some(entry_vals) = build_index_entry_values_fast(
+                        &dst_tbl,
+                        ix,
+                        *rid_opt,
+                        full_row,
+                        &qopts,
+                        &expr_scope_cols,
+                        &where_scope_cols,
+                    )? {
+                        idx_entries.push(entry_vals);
+                    }
+                }
+                idx_entries.sort_by(|a, b| compare_index_values(a, b, &ki));
+                let payloads: Vec<Vec<u8>> = idx_entries
+                    .iter()
+                    .map(|e| encode_record_with_format(e, enc, sf))
+                    .collect();
+                index_bulk_load_sorted(&mut tmp.pager, ix.root_page, &payloads)?;
+            }
+        }
+
+        // 3. Preserve `sqlite_sequence` rows if present.
+        if let Some(src_seq) = view.schema().table("sqlite_sequence") {
+            let seq_root = tmp.ensure_sqlite_sequence()?;
+            let mut seq_mem = ConnMemGuard::new(&self.pager);
+            let seq_rows = self.read_all_table_rows(&view, src_seq, &mut seq_mem)?;
+            let mut hint_leaf: Option<u32> = None;
+            for (rid_opt, full_row) in &seq_rows {
+                let rid = rid_opt.unwrap_or(1);
+                encode_record_with_format_into(full_row, enc, sf, &mut tmp.record_scratch);
+                table_append_monotonic(
+                    &mut tmp.pager,
+                    seq_root,
+                    &mut hint_leaf,
+                    rid,
+                    &tmp.record_scratch,
+                )?;
+            }
+        }
+
+        // 4. Rebuild explicit indexes, views, and preserve trigger definitions.
+        for ddl in &index_ddls {
+            tmp.execute(ddl)?;
+        }
+        for ddl in &view_ddls {
+            tmp.execute(ddl)?;
+        }
+        for (tname, tbl_name, tsql) in &trigger_rows {
+            tmp.insert_schema_row("trigger", tname, tbl_name, 0, Some(tsql))?;
+        }
+
+        drop(view);
+        self.pager.replace_from_vacuum(tmp.pager)?;
+        self.invalidate_warm_view();
+        if let Ok(mut guard) = self.cached_schema.lock() {
+            *guard = None;
+        }
+        self.cached_dml.1.clear();
+        self.cached_seq = None;
+        self.seq_dirty = false;
+        self.invalidate_max_rowid_cache();
+        if let Ok(mut guard) = self.select_cache.lock() {
+            guard.clear();
+        }
+        Ok(self.empty_exec_result())
     }
 
     // ───────────────────────────── DDL ─────────────────────────────
@@ -3922,7 +4306,24 @@ impl SqliteConnection {
         let table_name_canon: String;
         {
             let view = self.live_view()?;
-            if view.schema().index(iname).is_some() || view.schema().object(iname).is_some() {
+            if let Some(existing) = view.schema().object(iname) {
+                let kind = match existing {
+                    SchemaObject::Table(_) | SchemaObject::VirtualTable(_) => Some("table"),
+                    SchemaObject::View(_) => Some("view"),
+                    SchemaObject::Trigger(_) => Some("trigger"),
+                    SchemaObject::Index(_) => None,
+                };
+                if let Some(k) = kind {
+                    return Err(SqliteError::Sql(format!(
+                        "there is already a {k} named {iname}"
+                    )));
+                }
+                if stmt.if_not_exists {
+                    return Ok(self.empty_exec_result());
+                }
+                return Err(SqliteError::Sql(format!("index {iname} already exists")));
+            }
+            if view.schema().index(iname).is_some() {
                 if stmt.if_not_exists {
                     return Ok(self.empty_exec_result());
                 }
@@ -5036,6 +5437,7 @@ impl SqliteConnection {
             )));
         }
         if table.name.eq_ignore_ascii_case("sqlite_sequence") {
+            self.flush_seq_cache()?;
             self.cached_seq = None;
         }
 
@@ -6689,6 +7091,7 @@ impl SqliteConnection {
             )));
         }
         if table.name.eq_ignore_ascii_case("sqlite_sequence") {
+            self.flush_seq_cache()?;
             self.cached_seq = None;
         }
         validate_set_targets(table, &stmt.set)?;
@@ -6984,6 +7387,7 @@ impl SqliteConnection {
             };
 
             // Snapshot all rows to update first (SQLite Halloween problem protection!).
+            let mut updates_mem = ConnMemGuard::new(&self.pager);
             let base_scope_cols = build_table_scope_columns(table, target_alias);
             let catalog = crate::sql::live_catalog_for(&view, &qopts);
             let sub_runner =
@@ -7003,24 +7407,27 @@ impl SqliteConnection {
                 } else {
                     None
                 };
-                let hash_buckets: Option<HashMap<Vec<u8>, Vec<usize>>> =
-                    hash_plan.and_then(|(_, ek, aff)| {
-                        if aff == Affinity::Text
+                let mut hash_mem = ConnMemGuard::new(&self.pager);
+                let hash_buckets: Option<HashMap<Vec<u8>, Vec<usize>>> = match hash_plan {
+                    Some((_, ek, aff))
+                        if !(aff == Affinity::Text
                             && extra_rows
                                 .iter()
-                                .any(|r| matches!(r[ek], SqlValue::Int(_) | SqlValue::Real(_)))
-                        {
-                            return None;
-                        }
+                                .any(|r| matches!(r[ek], SqlValue::Int(_) | SqlValue::Real(_)))) =>
+                    {
+                        hash_mem.reserve((extra_rows.len() as u64).saturating_mul(64))?;
                         let mut m: HashMap<Vec<u8>, Vec<usize>> =
                             HashMap::with_capacity(extra_rows.len());
                         for (eidx, erow) in extra_rows.iter().enumerate() {
                             if let Some(k) = update_join_hash_key(&erow[ek], aff) {
+                                hash_mem.reserve((k.len() as u64).saturating_add(16))?;
                                 m.entry(k).or_default().push(eidx);
                             }
                         }
                         Some(m)
-                    });
+                    }
+                    _ => None,
+                };
 
                 for (old_rowid, old_row) in existing_rows {
                     let mut full_vals = old_row.clone();
@@ -7061,6 +7468,11 @@ impl SqliteConnection {
                                         &scope,
                                         &eval_env,
                                     )?;
+                                    updates_mem.reserve(
+                                        estimate_sql_row_bytes(&old_row)
+                                            .saturating_add(estimate_sql_row_bytes(&new_row))
+                                            .saturating_add(32),
+                                    )?;
                                     updates.push((old_rowid, old_row.clone(), new_rid, new_row));
                                     break;
                                 }
@@ -7084,6 +7496,11 @@ impl SqliteConnection {
                                 &stmt.set,
                                 &scope,
                                 &eval_env,
+                            )?;
+                            updates_mem.reserve(
+                                estimate_sql_row_bytes(&old_row)
+                                    .saturating_add(estimate_sql_row_bytes(&new_row))
+                                    .saturating_add(32),
                             )?;
                             updates.push((old_rowid, old_row.clone(), new_rid, new_row));
                             break; // SQLite UPDATE FROM updates each target row at most once
@@ -7113,6 +7530,11 @@ impl SqliteConnection {
                         &stmt.set,
                         &scope,
                         &eval_env,
+                    )?;
+                    updates_mem.reserve(
+                        estimate_sql_row_bytes(&old_row)
+                            .saturating_add(estimate_sql_row_bytes(&new_row))
+                            .saturating_add(32),
                     )?;
                     updates.push((old_rowid, old_row, new_rid, new_row));
                 }
@@ -7321,6 +7743,7 @@ impl SqliteConnection {
             )));
         }
         if table.name.eq_ignore_ascii_case("sqlite_sequence") {
+            self.flush_seq_cache()?;
             self.cached_seq = None;
         }
 
@@ -9059,8 +9482,11 @@ impl SqliteConnection {
             }
             "foreign_keys" => {
                 if let Some(v) = val_text {
-                    self.foreign_keys =
-                        matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+                    // SQLite treats `PRAGMA foreign_keys = ON/OFF` as a no-op inside an active transaction.
+                    if !self.pager.in_transaction() {
+                        self.foreign_keys =
+                            matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+                    }
                     return Ok(self.empty_exec_result());
                 }
                 Ok(single_row(
@@ -9068,7 +9494,13 @@ impl SqliteConnection {
                     SqlValue::Int(i64::from(self.foreign_keys)),
                 ))
             }
+            "data_version" => Ok(single_row("data_version", SqlValue::Int(1))),
             "integrity_check" | "quick_check" => {
+                let max_errors = val_text
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(100);
                 let view = self.live_view()?;
                 let mut roots = vec![1u32];
                 for t in view.tables() {
@@ -9081,7 +9513,7 @@ impl SqliteConnection {
                         roots.push(ix.root_page);
                     }
                 }
-                let msgs = check_integrity(&self.pager, &roots);
+                let msgs = check_integrity_metered(&self.pager, &roots, max_errors)?;
                 Ok(ExecResult {
                     columns: vec![name],
                     rows: msgs.into_iter().map(|m| vec![SqlValue::text(m)]).collect(),
@@ -9090,7 +9522,7 @@ impl SqliteConnection {
                 })
             }
             "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
-            | "database_list" => {
+            | "database_list" | "foreign_key_list" | "table_list" => {
                 let view = self.live_view()?;
                 let sql = match val_text {
                     Some(arg) => {

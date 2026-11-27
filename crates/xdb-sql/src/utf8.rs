@@ -62,7 +62,7 @@ pub fn utf8_read(b: &[u8], mut i: usize) -> (u32, usize) {
             c = (c << 6).wrapping_add(u32::from(b[i] & 0x3f));
             i += 1;
         }
-        if c < 0x80 || (c & 0xffff_f800) == 0xd800 {
+        if c < 0x80 || (c & 0xffff_f800) == 0xd800 || (c & 0xffff_fffe) == 0xfffe {
             c = 0xfffd;
         }
     }

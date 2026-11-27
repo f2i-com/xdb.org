@@ -3182,3 +3182,328 @@ fn pass9_audit_seq_tail_atomicity_freelist_corrupt_metering_and_fastpaths_verifi
         Some("SELECT (SELECT count(*) FROM p9) AS p9c, (SELECT count(*) FROM stream_items) AS sc, (SELECT sum(val) FROM p9) AS sv"),
     );
 }
+
+#[test]
+fn pass10_audit_seed_utf8_vacuum_pragmas_deferred_seq_metering_and_c_sqlite_parity() {
+    // 1. `seed_json` multi-byte UTF-8 table key never panics, and shorthand scan honors step meter!
+    let mut c_seed = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
+    let rep = c_seed
+        .seed_json(r#"{"ééééééé":[{"id":1,"v":"ok"},{"id":2,"v":"done"}]}"#)
+        .unwrap();
+    assert_eq!(rep.rows_inserted, 2);
+    assert_eq!(
+        c_seed
+            .query("SELECT v FROM \"ééééééé\" WHERE id = 2")
+            .unwrap()
+            .rows[0][0]
+            .as_str(),
+        Some("done")
+    );
+
+    let tiny_seed_meter = Arc::new(BudgetMeter::new(ResourceLimits {
+        max_steps: Some(10),
+        max_memory_bytes: Some(256 * 1024),
+        max_page_reads: None,
+    }));
+    let mut c_seed_m = SqliteConnection::open_in_memory(ConnectionOptions {
+        meter: Some(tiny_seed_meter),
+        ..ConnectionOptions::default()
+    })
+    .unwrap();
+    let big_seed = format!(r#"{{"items":[{{"id":1,"s":"{}"}}]}}"#, "a".repeat(50_000));
+    let seed_err = c_seed_m.seed_json(&big_seed).unwrap_err();
+    assert!(matches!(seed_err, SqliteError::ResourceLimit(_)));
+
+    // 2. `CREATE INDEX IF NOT EXISTS tbl ON tbl(x)` fails when a table already has that name!
+    let mut c_idx = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
+    c_idx.execute("CREATE TABLE same_name (x INT)").unwrap();
+    let idx_err = c_idx
+        .execute("CREATE INDEX IF NOT EXISTS same_name ON same_name(x)")
+        .unwrap_err();
+    assert!(idx_err
+        .to_string()
+        .contains("there is already a table named same_name"));
+
+    // 3. `PRAGMA integrity_check(N)` caps errors & propagates `ResourceLimit` cleanly.
+    let ic_meter = Arc::new(BudgetMeter::new(ResourceLimits {
+        max_steps: Some(50_000),
+        max_memory_bytes: Some(256 * 1024),
+        max_page_reads: None,
+    }));
+    let mut c_ic = SqliteConnection::open_in_memory(ConnectionOptions {
+        meter: Some(ic_meter.clone()),
+        ..ConnectionOptions::default()
+    })
+    .unwrap();
+    c_ic.execute("CREATE TABLE ic_t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    c_ic.execute("INSERT INTO ic_t VALUES (1, 10), (2, 20)").unwrap();
+    let ic_ok = c_ic.execute("PRAGMA integrity_check(5)").unwrap();
+    assert_eq!(ic_ok.rows[0][0].as_str(), Some("ok"));
+
+    // 4. Parse `ResourceLimit` preserved in `query_with_params` & `execute` (not downgraded to Sql)!
+    let parse_m = Arc::new(BudgetMeter::new(ResourceLimits {
+        max_steps: Some(5),
+        max_memory_bytes: Some(64 * 1024),
+        max_page_reads: None,
+    }));
+    let mut c_pm = SqliteConnection::open_in_memory(ConnectionOptions {
+        meter: Some(parse_m),
+        ..ConnectionOptions::default()
+    })
+    .unwrap();
+    let long_q = format!("SELECT {} 1", " ".repeat(2000));
+    assert!(matches!(
+        c_pm.query_with_params(&long_q, &QueryParams::empty()).unwrap_err(),
+        SqliteError::ResourceLimit(_)
+    ));
+    assert!(matches!(
+        c_pm.execute(&long_q).unwrap_err(),
+        SqliteError::ResourceLimit(_)
+    ));
+
+    // 5. `PRAGMA foreign_key_list`, `PRAGMA table_list`, `PRAGMA data_version`, tx-guarded
+    //    `PRAGMA foreign_keys`, and invalid `PRAGMA page_size` silently ignored!
+    let mut c_p = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
+    c_p.execute(
+        "CREATE TABLE parent_a (id INTEGER PRIMARY KEY);
+         CREATE TABLE parent_b (k TEXT PRIMARY KEY);
+         CREATE TABLE child (
+             id INTEGER PRIMARY KEY,
+             a_id INT REFERENCES parent_a(id) ON DELETE CASCADE,
+             b_k TEXT REFERENCES parent_b(k) ON UPDATE SET NULL
+         );
+         CREATE TABLE wr_strict (k INT PRIMARY KEY, v TEXT) WITHOUT ROWID, STRICT;",
+    )
+    .unwrap();
+    // Invalid page_size silently ignored (matches SQLite)!
+    c_p.execute("PRAGMA page_size = 123").unwrap();
+    assert!(c_p.execute("PRAGMA page_size").unwrap().rows[0][0].exact_eq(&SqlValue::Int(4096)));
+
+    // `PRAGMA foreign_key_list(child)` + TVF `pragma_foreign_key_list('child')`:
+    // reverse declaration order (`parent_b` = id 0, `parent_a` = id 1)!
+    let fkl = c_p.execute("PRAGMA foreign_key_list(child)").unwrap();
+    assert_eq!(
+        fkl.columns,
+        vec!["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"]
+    );
+    assert_eq!(fkl.rows.len(), 2);
+    assert!(fkl.rows[0][0].exact_eq(&SqlValue::Int(0)));
+    assert_eq!(fkl.rows[0][2].as_str(), Some("parent_b"));
+    assert_eq!(fkl.rows[0][3].as_str(), Some("b_k"));
+    assert_eq!(fkl.rows[0][4].as_str(), Some("k"));
+    assert_eq!(fkl.rows[0][5].as_str(), Some("SET NULL"));
+    assert_eq!(fkl.rows[0][7].as_str(), Some("NONE"));
+    assert!(fkl.rows[1][0].exact_eq(&SqlValue::Int(1)));
+    assert_eq!(fkl.rows[1][2].as_str(), Some("parent_a"));
+    assert_eq!(fkl.rows[1][6].as_str(), Some("CASCADE"));
+    let fkl_tvf = c_p.query("SELECT * FROM pragma_foreign_key_list('child')").unwrap();
+    assert_eq!(fkl_tvf.rows.len(), 2);
+
+    // `PRAGMA table_list('wr_strict')` + TVF `pragma_table_list('wr_strict')`!
+    let tl_one = c_p.execute("PRAGMA table_list('wr_strict')").unwrap();
+    assert_eq!(tl_one.columns, vec!["schema", "name", "type", "ncol", "wr", "strict"]);
+    assert_eq!(tl_one.rows.len(), 1);
+    assert_eq!(tl_one.rows[0][0].as_str(), Some("main"));
+    assert_eq!(tl_one.rows[0][1].as_str(), Some("wr_strict"));
+    assert_eq!(tl_one.rows[0][2].as_str(), Some("table"));
+    assert!(tl_one.rows[0][3].exact_eq(&SqlValue::Int(2)));
+    assert!(tl_one.rows[0][4].exact_eq(&SqlValue::Int(1)));
+    assert!(tl_one.rows[0][5].exact_eq(&SqlValue::Int(1)));
+    let tl_tvf = c_p.query("SELECT name, wr, strict FROM pragma_table_list('wr_strict')").unwrap();
+    assert_eq!(tl_tvf.rows.len(), 1);
+
+    // `PRAGMA data_version`!
+    assert!(c_p.execute("PRAGMA data_version").unwrap().rows[0][0].exact_eq(&SqlValue::Int(1)));
+
+    // `PRAGMA foreign_keys = OFF` is a no-op inside an active transaction!
+    c_p.execute("PRAGMA foreign_keys = ON").unwrap();
+    assert!(c_p.execute("PRAGMA foreign_keys").unwrap().rows[0][0].exact_eq(&SqlValue::Int(1)));
+    c_p.execute("BEGIN").unwrap();
+    c_p.execute("PRAGMA foreign_keys = OFF").unwrap();
+    assert!(
+        c_p.execute("PRAGMA foreign_keys").unwrap().rows[0][0].exact_eq(&SqlValue::Int(1)),
+        "PRAGMA foreign_keys must be ignored inside a transaction"
+    );
+    c_p.execute("COMMIT").unwrap();
+    c_p.execute("PRAGMA foreign_keys = OFF").unwrap();
+    assert!(c_p.execute("PRAGMA foreign_keys").unwrap().rows[0][0].exact_eq(&SqlValue::Int(0)));
+
+    // 6. Deferred `sqlite_sequence` observability (`query`, `to_bytes`, constraint error, savepoint, rollback)!
+    let mut c_dseq = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
+    c_dseq
+        .execute("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, v INT UNIQUE)")
+        .unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (100)").unwrap();
+    c_dseq.execute("BEGIN").unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (200)").unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (300)").unwrap();
+    // `&self` query and `to_bytes()` must both observe the deferred uncommitted sequence = 3!
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(3))
+    );
+    let mid_bytes = c_dseq.to_bytes();
+    let mid_ro = open_database_from_bytes(&mid_bytes, None, None, OpenOptions::default()).unwrap();
+    assert!(
+        mid_ro
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(3))
+    );
+    // Constraint violation inside tx must keep earlier deferred bumps intact (seq stays 3)!
+    assert!(c_dseq.execute("INSERT INTO ai(v) VALUES (200)").is_err());
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(3))
+    );
+    // Savepoint + rollback-to restores exact sequence!
+    c_dseq.execute("SAVEPOINT sp_seq").unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (400)").unwrap();
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(4))
+    );
+    c_dseq.execute("ROLLBACK TO sp_seq").unwrap();
+    c_dseq.execute("RELEASE sp_seq").unwrap();
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(3))
+    );
+    // Full rollback reverts sequence back to 1!
+    c_dseq.execute("ROLLBACK").unwrap();
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(1))
+    );
+    // Commit flushes deferred sequence cleanly!
+    c_dseq.execute("BEGIN").unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (200)").unwrap();
+    c_dseq.execute("INSERT INTO ai(v) VALUES (300)").unwrap();
+    c_dseq.execute("COMMIT").unwrap();
+    assert!(
+        c_dseq
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'ai'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(3))
+    );
+    assert_integrity_ok(&mut c_dseq);
+
+    // 7. Real crash-safe `VACUUM` + staged `PRAGMA page_size = 8192` on a VFS-backed database
+    //    with rowid gaps, `AUTOINCREMENT`, `WITHOUT ROWID`, indexes, views, triggers, `user_version`,
+    //    and `application_id` — verified end-to-end by live C SQLite!
+    let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::new(MemoryVfsOptions::default()));
+    let mut c_vac =
+        SqliteConnection::open(vfs.clone(), "vac.db", ConnectionOptions::default()).unwrap();
+    c_vac
+        .execute(
+            "PRAGMA user_version = 77;
+             PRAGMA application_id = 305419896;
+             CREATE TABLE main_t (id INTEGER PRIMARY KEY AUTOINCREMENT, grp INT NOT NULL, pad TEXT NOT NULL);
+             CREATE INDEX ix_main_grp ON main_t(grp DESC);
+             CREATE TABLE wr_t (k1 INT, k2 TEXT, v INT, PRIMARY KEY(k1, k2)) WITHOUT ROWID;
+             CREATE INDEX ix_wr_v ON wr_t(v);
+             CREATE VIEW v_cnt AS SELECT count(*) AS n FROM main_t;",
+        )
+        .unwrap();
+    c_vac.execute("BEGIN").unwrap();
+    let pad = "V".repeat(300);
+    for i in 1..=200i64 {
+        c_vac
+            .execute_with_params(
+                "INSERT INTO main_t(grp, pad) VALUES (?1, ?2)",
+                &QueryParams::positional(vec![SqlValue::Int(i % 10), SqlValue::text(pad.as_str())]),
+            )
+            .unwrap();
+    }
+    for i in 1..=30i64 {
+        c_vac
+            .execute_with_params(
+                "INSERT INTO wr_t VALUES (?1, ?2, ?3)",
+                &QueryParams::positional(vec![
+                    SqlValue::Int(i),
+                    SqlValue::text(format!("k_{i:02}")),
+                    SqlValue::Int(i * 10),
+                ]),
+            )
+            .unwrap();
+    }
+    c_vac.execute("COMMIT").unwrap();
+    // Delete most rows to create plenty of freelist pages and non-contiguous rowids!
+    c_vac.execute("DELETE FROM main_t WHERE id <= 185").unwrap();
+    let before_pages = c_vac.page_count();
+    let before_free = c_vac.execute("PRAGMA freelist_count").unwrap().rows[0][0].clone();
+    assert!(matches!(before_free, SqlValue::Int(f) if f > 0));
+
+    // Reject VACUUM inside active transaction!
+    c_vac.execute("BEGIN").unwrap();
+    assert!(c_vac.execute("VACUUM").is_err());
+    c_vac.execute("ROLLBACK").unwrap();
+
+    // Stage page_size change from 4096 -> 8192 and run real VACUUM!
+    c_vac.execute("PRAGMA page_size = 8192").unwrap();
+    assert_eq!(c_vac.page_size(), 4096); // staged until VACUUM
+    c_vac.execute("VACUUM").unwrap();
+    assert_eq!(c_vac.page_size(), 8192);
+    assert!(
+        c_vac.page_count() < before_pages,
+        "VACUUM must shrink page_count ({} -> {})",
+        before_pages,
+        c_vac.page_count()
+    );
+    assert!(c_vac.execute("PRAGMA freelist_count").unwrap().rows[0][0].exact_eq(&SqlValue::Int(0)));
+    assert!(c_vac.execute("PRAGMA user_version").unwrap().rows[0][0].exact_eq(&SqlValue::Int(77)));
+    assert!(
+        c_vac.execute("PRAGMA application_id").unwrap().rows[0][0]
+            .exact_eq(&SqlValue::Int(305_419_896))
+    );
+    assert!(c_vac.query("SELECT n FROM v_cnt").unwrap().rows[0][0].exact_eq(&SqlValue::Int(15)));
+    assert!(
+        c_vac
+            .query("SELECT min(id), max(id) FROM main_t")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(186))
+    );
+    assert!(
+        c_vac
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 'main_t'")
+            .unwrap()
+            .rows[0][0]
+            .exact_eq(&SqlValue::Int(200))
+    );
+    assert!(
+        c_vac.query("SELECT count(*) FROM wr_t").unwrap().rows[0][0].exact_eq(&SqlValue::Int(30))
+    );
+    assert_integrity_ok(&mut c_vac);
+    drop(c_vac);
+
+    // Reopen from VFS after VACUUM + page_size swap and verify against live C SQLite!
+    let mut c_reopen =
+        SqliteConnection::open(vfs, "vac.db", ConnectionOptions::default()).unwrap();
+    assert_eq!(c_reopen.page_size(), 8192);
+    assert!(c_reopen.query("SELECT n FROM v_cnt").unwrap().rows[0][0].exact_eq(&SqlValue::Int(15)));
+    assert_integrity_ok(&mut c_reopen);
+    verify_with_real_sqlite(
+        "pass10_vacuum_page_size_8192",
+        &c_reopen.to_bytes(),
+        None,
+        Some("SELECT (SELECT count(*) FROM main_t) AS mc, (SELECT min(id) FROM main_t) AS mn, (SELECT count(*) FROM wr_t) AS wc, (SELECT seq FROM sqlite_sequence WHERE name='main_t') AS sq"),
+    );
+}

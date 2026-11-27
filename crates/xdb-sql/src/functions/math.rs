@@ -22,6 +22,36 @@ fn math_real_arg(v: &SqlValue) -> Option<f64> {
     }
 }
 
+fn unary_int_preserving_math(
+    args: &[SqlValue],
+    name: &str,
+    f: impl FnOnce(f64) -> f64,
+) -> SqlResult<SqlValue> {
+    if args.len() != 1 {
+        return Err(SqlError::runtime(format!(
+            "wrong number of arguments to function {name}()"
+        )));
+    }
+    match &args[0] {
+        SqlValue::Null | SqlValue::Blob(_) => Ok(SqlValue::Null),
+        SqlValue::Int(i) => Ok(SqlValue::Int(*i)),
+        SqlValue::Real(r) => Ok(SqlValue::real(f(*r))),
+        SqlValue::Text(b) => {
+            let r = xdb_core::value::atof(b);
+            if r.rc <= 0 {
+                return Ok(SqlValue::Null);
+            }
+            if (r.rc & xdb_core::value::atof_flags::REAL) == 0 {
+                let ai = xdb_core::value::atoi64(b);
+                if ai.rc == 0 {
+                    return Ok(SqlValue::Int(ai.value));
+                }
+            }
+            Ok(SqlValue::real(f(r.value)))
+        }
+    }
+}
+
 fn unary_math(args: &[SqlValue], name: &str, f: impl FnOnce(f64) -> f64) -> SqlResult<SqlValue> {
     if args.len() != 1 {
         return Err(SqlError::runtime(format!(
@@ -61,12 +91,12 @@ pub fn call_math(lower_name: &str, args: &[SqlValue]) -> SqlResult<Option<SqlVal
         "atan" => unary_math(args, "atan", f64::atan)?,
         "atan2" => binary_math(args, "atan2", f64::atan2)?,
         "atanh" => unary_math(args, "atanh", f64::atanh)?,
-        "ceil" | "ceiling" => unary_math(args, lower_name, f64::ceil)?,
+        "ceil" | "ceiling" => unary_int_preserving_math(args, lower_name, f64::ceil)?,
         "cos" => unary_math(args, "cos", f64::cos)?,
         "cosh" => unary_math(args, "cosh", f64::cosh)?,
         "degrees" => unary_math(args, "degrees", |x| x * (180.0 / std::f64::consts::PI))?,
         "exp" => unary_math(args, "exp", f64::exp)?,
-        "floor" => unary_math(args, "floor", f64::floor)?,
+        "floor" => unary_int_preserving_math(args, "floor", f64::floor)?,
         "ln" => unary_math(args, "ln", |x| if x <= 0.0 { f64::NAN } else { x.ln() })?,
         "log10" => unary_math(args, "log10", |x| {
             if x <= 0.0 {
@@ -107,7 +137,7 @@ pub fn call_math(lower_name: &str, args: &[SqlValue]) -> SqlResult<Option<SqlVal
         "sqrt" => unary_math(args, "sqrt", |x| if x < 0.0 { f64::NAN } else { x.sqrt() })?,
         "tan" => unary_math(args, "tan", f64::tan)?,
         "tanh" => unary_math(args, "tanh", f64::tanh)?,
-        "trunc" => unary_math(args, "trunc", f64::trunc)?,
+        "trunc" => unary_int_preserving_math(args, "trunc", f64::trunc)?,
         "sign" => {
             if args.len() != 1 {
                 return Err(SqlError::runtime(

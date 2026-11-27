@@ -174,11 +174,36 @@ where
                     )));
                 }
                 let offset = if args.len() >= 2 {
-                    if args[1].is_null() {
-                        *slot = args.get(2).cloned().unwrap_or(SqlValue::Null);
-                        continue;
+                    match &args[1] {
+                        SqlValue::Null => {
+                            *slot = args.get(2).cloned().unwrap_or(SqlValue::Null);
+                            continue;
+                        }
+                        SqlValue::Int(v) => *v,
+                        SqlValue::Real(r) => {
+                            let Some(v) = xdb_core::value::real_to_exact_i64(*r) else {
+                                *slot = args.get(2).cloned().unwrap_or(SqlValue::Null);
+                                continue;
+                            };
+                            v
+                        }
+                        SqlValue::Text(b) => {
+                            let a = xdb_core::value::atof(b);
+                            if a.rc <= 0 {
+                                0
+                            } else if let Some(v) = xdb_core::value::real_to_exact_i64(a.value) {
+                                if a.rc == 1 {
+                                    int_value(&args[1])
+                                } else {
+                                    v
+                                }
+                            } else {
+                                *slot = args.get(2).cloned().unwrap_or(SqlValue::Null);
+                                continue;
+                            }
+                        }
+                        SqlValue::Blob(_) => int_value(&args[1]),
                     }
-                    int_value(&args[1])
                 } else {
                     1
                 };
@@ -613,6 +638,23 @@ fn range_bound(
             // thresholds via floor/ceil in i128. Below 2^52 (e.g. (2^52 + 1) - 1.5 = 2^52 - 0.5),
             // fractional f64 boundaries are exact and must not be rounded!
             if iv.unsigned_abs() > (1u64 << 52) && *rv < 18446744073709551616.0 {
+                let rv_trunc = rv.trunc() as i128;
+                let rv_fract = rv.fract();
+                let int_part = if sub {
+                    i128::from(*iv) - rv_trunc
+                } else {
+                    i128::from(*iv) + rv_trunc
+                };
+                if int_part.unsigned_abs() <= (1u128 << 52) {
+                    let f = if sub {
+                        (int_part as f64) - rv_fract
+                    } else {
+                        (int_part as f64) + rv_fract
+                    };
+                    if f.abs() < ((1u64 << 52) as f64) {
+                        return SqlValue::real(f);
+                    }
+                }
                 // `need_lower`: true when comparing `x >= bound`, false when comparing `x <= bound`.
                 let need_lower = (dir == SortOrder::Asc) == is_start;
                 let step_i128 = if (sub && need_lower) || (!sub && !need_lower) {

@@ -171,12 +171,30 @@ impl WasmDatabase {
             .db
             .table(table)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let stored: Vec<ColumnSpec> = tbl
+        let stored_count = tbl
             .columns()
             .iter()
             .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
-            .map(|c| ColumnSpec::Cid(c.cid))
-            .collect();
+            .count();
+        self.meter
+            .charge_steps((stored_count as u64).saturating_add(1))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let _spec_guard = MemGuard::reserve(
+            &self.meter,
+            (stored_count as u64).saturating_mul(std::mem::size_of::<ColumnSpec>() as u64),
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
+        let mut stored: Vec<ColumnSpec> = Vec::new();
+        stored
+            .try_reserve_exact(stored_count)
+            .map_err(|_| JsValue::from_str("column spec allocation failed"))?;
+        for c in tbl
+            .columns()
+            .iter()
+            .filter(|c| c.hidden != ColumnHiddenKind::Virtual)
+        {
+            stored.push(ColumnSpec::Cid(c.cid));
+        }
         let opts = ScanOptions {
             columns: Some(stored),
             rowid: false,
@@ -459,18 +477,12 @@ impl WasmConnection {
             meter: Some(meter.clone()),
         };
         let conn = match initial_bytes {
-            Some(ref b) if !b.is_empty() => SqliteConnection::open_from_bytes(
-                b,
-                wal_bytes.as_deref(),
-                journal_bytes.as_deref(),
-                opts,
-            ),
+            Some(b) if !b.is_empty() => {
+                SqliteConnection::open_from_owned_bytes(b, wal_bytes, journal_bytes, opts)
+            }
             _ => SqliteConnection::open_in_memory(opts),
         }
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        drop(initial_bytes);
-        drop(wal_bytes);
-        drop(journal_bytes);
         drop(input_guard);
         Ok(WasmConnection { conn, meter })
     }
@@ -567,6 +579,34 @@ impl WasmConnection {
 
     pub fn page_count(&self) -> u32 {
         self.conn.page_count()
+    }
+
+    /// Database text encoding (`"UTF-8"`, `"UTF-16le"`, or `"UTF-16be"`).
+    pub fn encoding(&self) -> String {
+        match self.conn.encoding() {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf16Le => "UTF-16le",
+            TextEncoding::Utf16Be => "UTF-16be",
+        }
+        .to_string()
+    }
+
+    /// Return parsed schema metadata (tables with columns, indexes, views, triggers) as JSON.
+    pub fn catalog_json(&self) -> Result<String, JsValue> {
+        let schema = self
+            .conn
+            .schema()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        format_catalog_json_metered(&schema, &self.meter).map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Return `sqlite_schema` entries as JSON.
+    pub fn schema_json(&self) -> Result<String, JsValue> {
+        let schema = self
+            .conn
+            .schema()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        format_schema_json_metered(&schema, &self.meter).map_err(|e| JsValue::from_str(&e))
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -1962,6 +2002,47 @@ mod tests {
         let scanned = db.scan_table_json("t", 10).unwrap();
         assert!(scanned.contains(&long_col));
         assert!(scanned.contains("\"ok\""));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn pass10_wasm_conn_owned_open_metadata_parity_and_get_row_metering() {
+        let mut src = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
+        src.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE INDEX ix_items_name ON items(name);
+             CREATE VIEW v_items AS SELECT id, name FROM items;
+             INSERT INTO items VALUES (1, 'alpha'), (2, 'beta');",
+        )
+        .unwrap();
+        let bytes = src.to_bytes();
+
+        // 1. `WasmConnection::open` takes owned `Vec<u8>` and exposes `encoding`, `catalog_json`, `schema_json`!
+        let mut wconn = WasmConnection::open(
+            Some(bytes.clone()),
+            None,
+            None,
+            0,
+            100_000,
+            256 * 1024,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(wconn.encoding(), "UTF-8");
+        let cat = wconn.catalog_json().unwrap();
+        assert!(cat.contains("\"items\""));
+        assert!(cat.contains("\"ix_items_name\""));
+        assert!(cat.contains("\"v_items\""));
+        let sch = wconn.schema_json().unwrap();
+        assert!(sch.contains("CREATE TABLE items"));
+        wconn.close().unwrap();
+
+        // 2. `WasmDatabase::get_row_json` meters memory & steps cleanly without leaking reservations!
+        let db = WasmDatabase::open(bytes, None, None, 100_000, 256 * 1024, 1000).unwrap();
+        let row2 = db.get_row_json("items", 2).unwrap();
+        assert!(row2.contains("\"beta\""));
+        let miss = db.get_row_json("items", 999).unwrap();
+        assert_eq!(miss, "null");
         db.close().unwrap();
     }
 }

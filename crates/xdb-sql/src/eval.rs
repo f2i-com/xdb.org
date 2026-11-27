@@ -7,10 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use xdb_core::value::{
-    affinity_of_decl_type, apply_affinity, apply_comparison_affinity, arith, bit_not, bitwise,
-    boolean_value, cast_to_type, compare_op, comparison_affinity, comparison_collation_name,
-    in_affinity, integer_literal_value, mem_compare, negate, real_literal_value, real_to_exact_i64,
-    ArithOp, BitOp, BuiltinCollation, Collation, CompareOp, OperandCollation,
+    affinity_of_decl_type, apply_affinity, apply_comparison_affinity, arith_enc, bit_not_enc,
+    bitwise_enc, boolean_value_enc, cast_to_type, compare_op, comparison_affinity,
+    comparison_collation_name, in_affinity, integer_literal_value, mem_compare, negate_enc,
+    real_literal_value, real_to_exact_i64, ArithOp, BitOp, BuiltinCollation, Collation, CompareOp,
+    OperandCollation,
 };
 use xdb_core::{Affinity, SqlValue, TextEncoding};
 use xdb_parser::{
@@ -978,15 +979,16 @@ pub fn eval_expr_tagged(
                 }
             }
             let (v, _) = eval_expr_tagged(operand, scopes, env)?;
+            let enc = env.options.collations.encoding();
             let out = match op {
                 UnaryOp::Pos => v,
-                UnaryOp::Neg => negate(&v),
-                UnaryOp::BitNot => bit_not(&v),
+                UnaryOp::Neg => negate_enc(&v, enc),
+                UnaryOp::BitNot => bit_not_enc(&v, enc),
                 UnaryOp::Not => {
                     if v.is_null() {
                         SqlValue::Null
                     } else {
-                        SqlValue::Int(i64::from(!boolean_value(&v, false)))
+                        SqlValue::Int(i64::from(!boolean_value_enc(&v, false, enc)))
                     }
                 }
             };
@@ -1068,7 +1070,11 @@ pub fn eval_expr_tagged(
                 match matched {
                     SqlValue::Null => SqlValue::Null,
                     SqlValue::Int(i) => SqlValue::Int(i64::from(i == 0)),
-                    other => SqlValue::Int(i64::from(!boolean_value(&other, false))),
+                    other => SqlValue::Int(i64::from(!boolean_value_enc(
+                        &other,
+                        false,
+                        env.options.collations.encoding(),
+                    ))),
                 }
             } else {
                 matched
@@ -1263,28 +1269,67 @@ pub fn eval_expr_tagged(
             ..
         } => {
             if let Some(base_expr) = operand {
-                let (base_val, base_aff, base_coll) =
-                    eval_compare_operand(base_expr, scopes, env)?;
-                for w in whens {
-                    let (wv, w_aff, w_coll) = eval_compare_operand(&w.when, scopes, env)?;
-                    if !base_val.is_null() && !wv.is_null() {
-                        let aff = comparison_affinity(base_aff, w_aff);
-                        let cname = comparison_collation_name(
-                            base_coll.as_operand(),
-                            w_coll.as_operand(),
-                        );
-                        let coll = env.lookup_opt_collation(cname)?;
-                        if compare_op(CompareOp::Eq, base_val.clone(), wv, Some(aff), coll)
-                            == Some(true)
+                let is_vector_case = is_row_value_expr(base_expr)
+                    || matches!(base_expr.as_ref(), Expr::Subquery { .. })
+                    || whens.iter().any(|w| {
+                        is_row_value_expr(&w.when) || matches!(w.when, Expr::Subquery { .. })
+                    });
+                if is_vector_case {
+                    let (lvals, laffs, mut lcolls) = eval_row_vector(base_expr, scopes, env)?;
+                    if lvals.len() == 1 && matches!(base_expr.as_ref(), Expr::Subquery { .. }) {
+                        lcolls[0] = ExprCollation::none();
+                    }
+                    for w in whens {
+                        let (rvals, raffs, mut rcolls) = eval_row_vector(&w.when, scopes, env)?;
+                        if lvals.len() != rvals.len() {
+                            return Err(SqlError::runtime(format!(
+                                "row value misused: {} vs {} columns",
+                                lvals.len(),
+                                rvals.len()
+                            )));
+                        }
+                        if rvals.len() == 1 && matches!(w.when, Expr::Subquery { .. }) {
+                            rcolls[0] = ExprCollation::none();
+                        }
+                        if compare_row_tuples(
+                            CompareOp::Eq,
+                            &lvals,
+                            &laffs,
+                            &lcolls,
+                            &rvals,
+                            &raffs,
+                            &rcolls,
+                            env,
+                        )? == Some(true)
                         {
                             return eval_expr_tagged(&w.then, scopes, env);
                         }
                     }
+                } else {
+                    let (base_val, base_aff, base_coll) =
+                        eval_compare_operand(base_expr, scopes, env)?;
+                    for w in whens {
+                        let (wv, w_aff, w_coll) = eval_compare_operand(&w.when, scopes, env)?;
+                        if !base_val.is_null() && !wv.is_null() {
+                            let aff = comparison_affinity(base_aff, w_aff);
+                            let cname = comparison_collation_name(
+                                base_coll.as_operand(),
+                                w_coll.as_operand(),
+                            );
+                            let coll = env.lookup_opt_collation(cname)?;
+                            if compare_op(CompareOp::Eq, base_val.clone(), wv, Some(aff), coll)
+                                == Some(true)
+                            {
+                                return eval_expr_tagged(&w.then, scopes, env);
+                            }
+                        }
+                    }
                 }
             } else {
+                let enc = env.options.collations.encoding();
                 for w in whens {
                     let (cond, _) = eval_expr_tagged(&w.when, scopes, env)?;
-                    if boolean_value(&cond, false) {
+                    if boolean_value_enc(&cond, false, enc) {
                         return eval_expr_tagged(&w.then, scopes, env);
                     }
                 }
@@ -1394,10 +1439,11 @@ pub fn eval_expr_tagged(
                         f.name.name
                     )));
                 }
+                let enc = env.options.collations.encoding();
                 let mut idx = 0;
                 while idx + 1 < f.args.len() {
                     let (cond, _) = eval_expr_tagged(&f.args[idx], scopes, env)?;
-                    if boolean_value(&cond, false) {
+                    if boolean_value_enc(&cond, false, enc) {
                         return eval_expr_tagged(&f.args[idx + 1], scopes, env);
                     }
                     idx += 2;
@@ -1474,14 +1520,15 @@ fn eval_binary(
     env: &EvalEnv<'_>,
 ) -> SqlResult<(SqlValue, bool)> {
     // SQL 3-valued logic with short-circuiting for AND/OR
+    let enc = env.options.collations.encoding();
     match op {
         BinaryOp::And => {
             let (lv, _) = eval_expr_tagged(left, scopes, env)?;
-            if !lv.is_null() && !boolean_value(&lv, false) {
+            if !lv.is_null() && !boolean_value_enc(&lv, false, enc) {
                 return Ok((SqlValue::Int(0), false));
             }
             let (rv, _) = eval_expr_tagged(right, scopes, env)?;
-            if !rv.is_null() && !boolean_value(&rv, false) {
+            if !rv.is_null() && !boolean_value_enc(&rv, false, enc) {
                 return Ok((SqlValue::Int(0), false));
             }
             if lv.is_null() || rv.is_null() {
@@ -1491,11 +1538,11 @@ fn eval_binary(
         }
         BinaryOp::Or => {
             let (lv, _) = eval_expr_tagged(left, scopes, env)?;
-            if !lv.is_null() && boolean_value(&lv, false) {
+            if !lv.is_null() && boolean_value_enc(&lv, false, enc) {
                 return Ok((SqlValue::Int(1), false));
             }
             let (rv, _) = eval_expr_tagged(right, scopes, env)?;
-            if !rv.is_null() && boolean_value(&rv, false) {
+            if !rv.is_null() && boolean_value_enc(&rv, false, enc) {
                 return Ok((SqlValue::Int(1), false));
             }
             if lv.is_null() || rv.is_null() {
@@ -1573,15 +1620,15 @@ fn eval_binary(
     let (rv, _) = eval_expr_tagged(right, scopes, env)?;
 
     let out = match op {
-        BinaryOp::Add => arith(ArithOp::Add, &lv, &rv),
-        BinaryOp::Sub => arith(ArithOp::Subtract, &lv, &rv),
-        BinaryOp::Mul => arith(ArithOp::Multiply, &lv, &rv),
-        BinaryOp::Div => arith(ArithOp::Divide, &lv, &rv),
-        BinaryOp::Rem => arith(ArithOp::Remainder, &lv, &rv),
-        BinaryOp::BitAnd => bitwise(BitOp::And, &lv, &rv),
-        BinaryOp::BitOr => bitwise(BitOp::Or, &lv, &rv),
-        BinaryOp::LShift => bitwise(BitOp::ShiftLeft, &lv, &rv),
-        BinaryOp::RShift => bitwise(BitOp::ShiftRight, &lv, &rv),
+        BinaryOp::Add => arith_enc(ArithOp::Add, &lv, &rv, enc),
+        BinaryOp::Sub => arith_enc(ArithOp::Subtract, &lv, &rv, enc),
+        BinaryOp::Mul => arith_enc(ArithOp::Multiply, &lv, &rv, enc),
+        BinaryOp::Div => arith_enc(ArithOp::Divide, &lv, &rv, enc),
+        BinaryOp::Rem => arith_enc(ArithOp::Remainder, &lv, &rv, enc),
+        BinaryOp::BitAnd => bitwise_enc(BitOp::And, &lv, &rv, enc),
+        BinaryOp::BitOr => bitwise_enc(BitOp::Or, &lv, &rv, enc),
+        BinaryOp::LShift => bitwise_enc(BitOp::ShiftLeft, &lv, &rv, enc),
+        BinaryOp::RShift => bitwise_enc(BitOp::ShiftRight, &lv, &rv, enc),
         BinaryOp::Concat => {
             let (Some(lb), Some(rb)) = (text_bytes_of(&lv), text_bytes_of(&rv)) else {
                 return Ok((SqlValue::Null, false));
@@ -1886,7 +1933,7 @@ fn eval_in_list(
         }
         let mut saw_null = false;
         for item in items {
-            let (rvals, _raffs, rcolls) = eval_row_vector(item, scopes, env)?;
+            let (rvals, raffs, rcolls) = eval_row_vector(item, scopes, env)?;
             if rvals.len() != width {
                 return Err(SqlError::runtime(format!(
                     "row value misused: {} vs {} columns",
@@ -1897,7 +1944,11 @@ fn eval_in_list(
             let mut row_null = false;
             let mut row_match = true;
             for i in 0..width {
-                let eff_aff = in_affinity(laffs[i], None);
+                let eff_aff = if items.len() == 1 {
+                    comparison_affinity(laffs[i], raffs[i])
+                } else {
+                    in_affinity(laffs[i], None)
+                };
                 let (lv, rv) =
                     apply_comparison_affinity(lvals[i].clone(), rvals[i].clone(), Some(eff_aff));
                 if lv.is_null() || rv.is_null() {
@@ -2748,6 +2799,97 @@ pub fn expr_contains_aggregate(expr: &Expr, options: &QueryOptions) -> bool {
     }
 }
 
+/// Helper to check whether `expr` contains a direct (non-window-internal) aggregate function.
+/// Used by SQLite's `HAVING` check, where `sum(a) OVER (ORDER BY count(*))` does NOT satisfy
+/// `HAVING` without `GROUP BY`.
+pub fn expr_contains_non_window_aggregate(expr: &Expr, options: &QueryOptions) -> bool {
+    match expr {
+        Expr::Function(f) => {
+            if f.over.is_some() {
+                return false;
+            }
+            options
+                .functions
+                .is_aggregate(&f.name.name, f.args.len(), f.star)
+                || f.args
+                    .iter()
+                    .any(|a| expr_contains_non_window_aggregate(a, options))
+                || f.filter
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_non_window_aggregate(e, options))
+        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => expr_contains_non_window_aggregate(operand, options),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_non_window_aggregate(left, options)
+                || expr_contains_non_window_aggregate(right, options)
+        }
+        Expr::Like {
+            left,
+            right,
+            escape,
+            ..
+        } => {
+            expr_contains_non_window_aggregate(left, options)
+                || expr_contains_non_window_aggregate(right, options)
+                || escape
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_non_window_aggregate(e, options))
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            expr_contains_non_window_aggregate(operand, options)
+                || expr_contains_non_window_aggregate(low, options)
+                || expr_contains_non_window_aggregate(high, options)
+        }
+        Expr::InList { operand, items, .. } => {
+            expr_contains_non_window_aggregate(operand, options)
+                || items
+                    .iter()
+                    .any(|i| expr_contains_non_window_aggregate(i, options))
+        }
+        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+            expr_contains_non_window_aggregate(operand, options)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| expr_contains_non_window_aggregate(e, options))
+                || whens.iter().any(|w| {
+                    expr_contains_non_window_aggregate(&w.when, options)
+                        || expr_contains_non_window_aggregate(&w.then, options)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_non_window_aggregate(e, options))
+        }
+        Expr::Vector { items, .. } => items
+            .iter()
+            .any(|i| expr_contains_non_window_aggregate(i, options)),
+        Expr::Raise { message, .. } => message
+            .as_ref()
+            .is_some_and(|m| expr_contains_non_window_aggregate(m, options)),
+        Expr::Subquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::Null { .. }
+        | Expr::Boolean { .. }
+        | Expr::CurrentTime { .. }
+        | Expr::Variable(_)
+        | Expr::Column(_) => false,
+    }
+}
+
 /// Helper to check whether `expr` contains any window function (`OVER ...`).
 pub fn expr_contains_window(expr: &Expr) -> bool {
     match expr {
@@ -3030,7 +3172,7 @@ enum CompiledRowPredKind<'ast, 'env> {
     ColInSelect {
         col: usize,
         not: bool,
-        state: InSelectPredState<'ast, 'env>,
+        state: Box<InSelectPredState<'ast, 'env>>,
     },
 }
 
@@ -3183,6 +3325,20 @@ impl<'ast, 'env> CompiledRowPred<'ast, 'env> {
     pub(crate) fn eval_row(&mut self, values: &[SqlValue], env: &EvalEnv<'env>) -> SqlResult<bool> {
         self.0.eval_row(values, env)
     }
+
+    #[inline]
+    pub(crate) fn as_single_int_cmp(&self) -> Option<(usize, CompareOp, i64)> {
+        match self.0 {
+            CompiledRowPredKind::ColCmpInt {
+                col,
+                aff,
+                op,
+                rhs,
+                ..
+            } if aff != Affinity::Text && aff != Affinity::Real => Some((col, op, rhs)),
+            _ => None,
+        }
+    }
 }
 
 impl<'ast, 'env> CompiledRowPredKind<'ast, 'env> {
@@ -3313,11 +3469,11 @@ impl<'ast, 'env> CompiledRowPredKind<'ast, 'env> {
                 Ok(Some(CompiledRowPredKind::ColInSelect {
                     col,
                     not: *not,
-                    state: InSelectPredState::Pending {
+                    state: Box::new(InSelectPredState::Pending {
                         select: select.as_ref(),
                         col_aff,
                         col_coll,
-                    },
+                    }),
                 }))
             }
             _ => Ok(None),
@@ -3402,7 +3558,7 @@ impl<'ast, 'env> CompiledRowPredKind<'ast, 'env> {
                     env.fn_ctx.charge_steps(1)?;
                 }
                 loop {
-                    match state {
+                    match state.as_mut() {
                         InSelectPredState::ReadyIntBitset {
                             min,
                             max,
@@ -3493,7 +3649,7 @@ impl<'ast, 'env> CompiledRowPredKind<'ast, 'env> {
                             if let Some((rhs_aff, rhs_coll, vals)) =
                                 env.subqueries.try_scan_1col_in_select(select)?
                             {
-                                *state = if vals.is_empty() {
+                                **state = if vals.is_empty() {
                                     InSelectPredState::Empty
                                 } else {
                                     let eff_aff = in_affinity(Some(col_aff), Some(rhs_aff));
@@ -3561,7 +3717,7 @@ impl<'ast, 'env> CompiledRowPredKind<'ast, 'env> {
                                     cached.affs.len()
                                 )));
                             }
-                            *state = if cached.rows.is_empty() {
+                            **state = if cached.rows.is_empty() {
                                 InSelectPredState::Empty
                             } else {
                                 let eff_aff = in_affinity(

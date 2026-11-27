@@ -1022,3 +1022,68 @@ fn pass9_flat_values_1005_upsert_order_metered_pass1_gen_chain_and_string_double
         }
     }
 }
+
+#[test]
+fn pass10_illegal_syntax_error_metering_tail_scan_gen_fold_and_doubled_quote_flag() {
+    use xdb_core::{BudgetMeter, ResourceLimits};
+    use xdb_parser::{build_table, parse_statement_metered, BuildOptions, SelectBody};
+
+    // 1. Huge `syntax_error_at` offending token & `tk::ILLEGAL` are memory-metered before cloning!
+    let huge_ident = "z".repeat(120_000);
+    let bad_syntax = format!("SELECT 1 {huge_ident}");
+    let m1 = BudgetMeter::new(ResourceLimits {
+        max_steps: Some(1_000_000),
+        max_memory_bytes: Some(4096),
+        max_page_reads: None,
+    });
+    let e1 = parse_statement_metered(&bad_syntax, &opts(), &m1).unwrap_err();
+    assert_eq!(e1.kind, SqlParseErrorKind::ResourceLimit);
+    assert_eq!(m1.usage().memory_bytes, 0);
+
+    let bad_illegal = format!("SELECT '{}", "q".repeat(120_000));
+    let m2 = BudgetMeter::new(ResourceLimits {
+        max_steps: Some(1_000_000),
+        max_memory_bytes: Some(4096),
+        max_page_reads: None,
+    });
+    let e2 = parse_statement_metered(&bad_illegal, &opts(), &m2).unwrap_err();
+    assert_eq!(e2.kind, SqlParseErrorKind::ResourceLimit);
+    assert_eq!(m2.usage().memory_bytes, 0);
+
+    // 2. Embedded NUL with huge trailing payload clamps spans cleanly without scanning past NUL.
+    let nul_huge = format!("SELECT 1; SELECT 2\0{}", "x".repeat(64_000));
+    let e_nul = parse_statement(&nul_huge, &opts()).unwrap_err();
+    assert!(e_nul.end.unwrap_or(0) <= 18);
+
+    // 3. Folded-away generated-column branches (`0 AND b`, `b IN ()`) do not trigger false loops,
+    //    while real cycles (`1 AND b`) still fail with `generated column loop`.
+    for ok_ddl in [
+        "CREATE TABLE gf1 (id INT, a INT GENERATED ALWAYS AS (0 AND b), b INT GENERATED ALWAYS AS (0 AND a))",
+        "CREATE TABLE gf2 (id INT, a INT GENERATED ALWAYS AS (b IN ()), b INT GENERATED ALWAYS AS (a IN ()))",
+    ] {
+        let Statement::CreateTable(ct) = parse_statement(ok_ddl, &opts()).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert!(
+            build_table(&ct, ok_ddl, &BuildOptions::default()).is_ok(),
+            "folded-away branch should not report cycle: {ok_ddl}"
+        );
+    }
+    let real_cyc =
+        "CREATE TABLE gf3 (id INT, a INT GENERATED ALWAYS AS (1 AND b), b INT GENERATED ALWAYS AS (1 AND a))";
+    let Statement::CreateTable(ct_cyc) = parse_statement(real_cyc, &opts()).unwrap() else {
+        panic!("expected CreateTable");
+    };
+    let e_cyc = build_table(&ct_cyc, real_cyc, &BuildOptions::default()).unwrap_err();
+    assert!(e_cyc.message.contains("generated column loop"));
+
+    // 4. Isolated `has_doubled_quote` bit (0x80) never collides with `HAS_FUNC` inside function calls!
+    let fq = "SELECT upper('it''s'), 'a''b' || lower('C''D')";
+    let Statement::Select(sel) = parse_statement(fq, &opts()).unwrap() else {
+        panic!("expected Select");
+    };
+    let SelectBody::Core(core) = sel.body else {
+        panic!("expected Core");
+    };
+    assert_eq!(core.columns.len(), 2);
+}

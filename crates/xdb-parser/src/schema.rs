@@ -1659,6 +1659,8 @@ pub fn build_table(
             let mut dep_lists: Vec<Vec<usize>> = vec![Vec::new(); n_cols];
             let mut seen_gen = vec![0u32; n_cols];
             let mut expr_stack: Vec<&Expr> = Vec::new();
+            let mut fold_memo: std::collections::HashMap<usize, Folded> =
+                std::collections::HashMap::new();
             for (cid, col) in st.cols.iter().enumerate() {
                 let Some(ref root_expr) = col.generated else {
                     continue;
@@ -1667,14 +1669,37 @@ pub fn build_table(
                 expr_stack.clear();
                 expr_stack.push(root_expr);
                 while let Some(e) = expr_stack.pop() {
-                    if let Expr::Column(c) = e {
-                        if let Some(&dep) = col_map.get(&c.column.name.to_ascii_lowercase()) {
-                            if st.cols[dep].generated.is_some() && seen_gen[dep] != stamp {
-                                seen_gen[dep] = stamp;
-                                dep_lists[cid].push(dep);
+                    match e {
+                        Expr::Column(c) => {
+                            if let Some(&dep) = col_map.get(&c.column.name.to_ascii_lowercase()) {
+                                if st.cols[dep].generated.is_some() && seen_gen[dep] != stamp {
+                                    seen_gen[dep] = stamp;
+                                    dep_lists[cid].push(dep);
+                                }
+                            }
+                            continue;
+                        }
+                        // Match `resolve_self_ref_memo` & SQLite constant-folding short circuits so
+                        // `0 AND a` / `a IN ()` do not trigger false-positive cycle errors.
+                        Expr::InList { operand, items, .. }
+                            if items.is_empty()
+                                && !fold_expr_memo(operand, false, &mut fold_memo).has_func =>
+                        {
+                            continue;
+                        }
+                        Expr::Binary {
+                            op: BinaryOp::And,
+                            left,
+                            right,
+                            ..
+                        } => {
+                            let l = fold_expr_memo(left, false, &mut fold_memo);
+                            let r = fold_expr_memo(right, false, &mut fold_memo);
+                            if (l.is_false || r.is_false) && !l.has_func && !r.has_func {
+                                continue;
                             }
                         }
-                        continue;
+                        _ => {}
                     }
                     let _: Result<(), ()> = try_for_each_child(e, &mut |ch| {
                         expr_stack.push(ch);

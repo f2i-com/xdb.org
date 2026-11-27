@@ -99,7 +99,7 @@ fn parse_statement_inner(
                 "more than one statement",
                 SqlParseErrorKind::Unsupported,
                 Some(i),
-                Some(sql_end(sql)),
+                Some(s.end),
             ));
         }
         i = s.end;

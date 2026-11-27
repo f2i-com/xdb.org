@@ -1,7 +1,9 @@
 //! Numeric views of [`SqlValue`], ported from SQLite 3.54.1 `vdbemem.c` / `vdbe.c`.
 
 use super::atof::{atof, atoi64, dec_or_hex_to_i64, AtoFResult};
+use super::cast::blob_to_text;
 use super::int64::{real_same_as_int, real_to_i64, real_to_integer_affinity};
+use super::utf::TextEncoding;
 use super::SqlValue;
 
 /// `sqlite3MemRealValueRC` (`vdbemem.c:735`) for a `TEXT`/`BLOB` byte slice.
@@ -13,22 +15,50 @@ pub fn mem_real_value_rc(bytes: &[u8]) -> AtoFResult {
 /// `sqlite3VdbeRealValue` (`vdbemem.c:770`): `CAST(v AS REAL)`'s double for non-NULL `v`.
 #[inline]
 pub fn real_value(v: &SqlValue) -> f64 {
+    real_value_enc(v, TextEncoding::Utf8)
+}
+
+/// Encoding-aware `sqlite3VdbeRealValue`: decodes `BLOB` via `enc` when `enc != Utf8`.
+#[inline]
+pub fn real_value_enc(v: &SqlValue, enc: TextEncoding) -> f64 {
     match v {
         SqlValue::Null => 0.0,
         SqlValue::Int(i) => *i as f64,
         SqlValue::Real(r) => *r,
-        SqlValue::Text(b) | SqlValue::Blob(b) => atof(b).value,
+        SqlValue::Text(b) => atof(b).value,
+        SqlValue::Blob(b) => {
+            if enc == TextEncoding::Utf8 {
+                atof(b).value
+            } else {
+                let decoded = blob_to_text(b, enc);
+                atof(&decoded).value
+            }
+        }
     }
 }
 
 /// `sqlite3VdbeIntValue` (`vdbemem.c:641`): `CAST(v AS INTEGER)`'s `i64` for non-NULL `v`.
 #[inline]
 pub fn int_value(v: &SqlValue) -> i64 {
+    int_value_enc(v, TextEncoding::Utf8)
+}
+
+/// Encoding-aware `sqlite3VdbeIntValue`: decodes `BLOB` via `enc` when `enc != Utf8`.
+#[inline]
+pub fn int_value_enc(v: &SqlValue, enc: TextEncoding) -> i64 {
     match v {
         SqlValue::Null => 0,
         SqlValue::Int(i) => *i,
         SqlValue::Real(r) => real_to_i64(*r),
-        SqlValue::Text(b) | SqlValue::Blob(b) => atoi64(b).value,
+        SqlValue::Text(b) => atoi64(b).value,
+        SqlValue::Blob(b) => {
+            if enc == TextEncoding::Utf8 {
+                atoi64(b).value
+            } else {
+                let decoded = blob_to_text(b, enc);
+                atoi64(&decoded).value
+            }
+        }
     }
 }
 
@@ -36,6 +66,12 @@ pub fn int_value(v: &SqlValue) -> i64 {
 /// anything else `real_value(v) != 0.0`.
 #[inline]
 pub fn boolean_value(v: &SqlValue, if_null: bool) -> bool {
+    boolean_value_enc(v, if_null, TextEncoding::Utf8)
+}
+
+/// Encoding-aware `sqlite3VdbeBooleanValue`: decodes `BLOB` via `enc` when `enc != Utf8`.
+#[inline]
+pub fn boolean_value_enc(v: &SqlValue, if_null: bool, enc: TextEncoding) -> bool {
     match v {
         SqlValue::Null => if_null,
         SqlValue::Int(i) => *i != 0,
@@ -46,7 +82,15 @@ pub fn boolean_value(v: &SqlValue, if_null: bool) -> bool {
                 *r != 0.0
             }
         }
-        SqlValue::Text(b) | SqlValue::Blob(b) => atof(b).value != 0.0,
+        SqlValue::Text(b) => atof(b).value != 0.0,
+        SqlValue::Blob(b) => {
+            if enc == TextEncoding::Utf8 {
+                atof(b).value != 0.0
+            } else {
+                let decoded = blob_to_text(b, enc);
+                atof(&decoded).value != 0.0
+            }
+        }
     }
 }
 
@@ -66,11 +110,24 @@ pub fn text_numeric_value(bytes: &[u8]) -> SqlValue {
 /// `numericType()` (`vdbe.c:500`): `NULL`, `INTEGER`, and `REAL` unchanged;
 /// `TEXT`/`BLOB` go through [`text_numeric_value`].
 pub fn numeric_value(v: &SqlValue) -> SqlValue {
+    numeric_value_enc(v, TextEncoding::Utf8)
+}
+
+/// Encoding-aware `numericType()`: decodes `BLOB` via `enc` when `enc != Utf8`.
+pub fn numeric_value_enc(v: &SqlValue, enc: TextEncoding) -> SqlValue {
     match v {
         SqlValue::Null => SqlValue::Null,
         SqlValue::Int(i) => SqlValue::Int(*i),
         SqlValue::Real(r) => SqlValue::real(*r),
-        SqlValue::Text(b) | SqlValue::Blob(b) => text_numeric_value(b),
+        SqlValue::Text(b) => text_numeric_value(b),
+        SqlValue::Blob(b) => {
+            if enc == TextEncoding::Utf8 {
+                text_numeric_value(b)
+            } else {
+                let decoded = blob_to_text(b, enc);
+                text_numeric_value(&decoded)
+            }
+        }
     }
 }
 

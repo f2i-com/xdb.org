@@ -235,6 +235,8 @@ pub struct WritePager {
     disk_needs_journal_recovery: bool,
     /// Tracked bytes reserved in `meter`.
     tracked_bytes: u64,
+    /// Staged `PRAGMA page_size = N` requested after initialization; applied on next `VACUUM`.
+    pending_page_size: Option<u32>,
 }
 
 impl Drop for WritePager {
@@ -298,6 +300,7 @@ impl WritePager {
             journal_nonce: 0x1a2b_3c4d,
             disk_needs_journal_recovery: false,
             tracked_bytes: 0,
+            pending_page_size: None,
         })
     }
 
@@ -308,14 +311,29 @@ impl WritePager {
         journal_bytes: Option<&[u8]>,
         meter: Option<Arc<dyn Meter>>,
     ) -> SqliteResult<Self> {
+        Self::from_owned_bytes(
+            main_bytes.to_vec(),
+            wal_bytes.map(|b| b.to_vec()),
+            journal_bytes.map(|b| b.to_vec()),
+            meter,
+        )
+    }
+
+    /// Load an existing SQLite database image from owned buffers without cloning them.
+    pub fn from_owned_bytes(
+        main_bytes: Vec<u8>,
+        wal_bytes: Option<Vec<u8>>,
+        journal_bytes: Option<Vec<u8>>,
+        meter: Option<Arc<dyn Meter>>,
+    ) -> SqliteResult<Self> {
         let meter = meter.unwrap_or_else(|| Arc::new(NoopMeter));
         if main_bytes.is_empty() {
             return Self::new_in_memory(4096, Some(meter));
         }
         let snap = open_snapshot_from_bytes(
-            main_bytes.to_vec(),
-            wal_bytes.map(|b| b.to_vec()),
-            journal_bytes.map(|b| b.to_vec()),
+            main_bytes,
+            wal_bytes,
+            journal_bytes,
             SnapshotOptions::default(),
         )?;
         Self::from_snapshot(snap, None, meter)
@@ -342,48 +360,70 @@ impl WritePager {
             return Ok(pager);
         }
 
-        // Open existing database (applying any hot journal or WAL overlay into our initial state!)
-        let snap = open_snapshot(vfs.as_ref(), path, SnapshotOptions::default())?;
-        let snap_mode = snap.mode;
-        let journal_needs_cleanup = snap.journal.as_ref().is_some_and(|j| {
-            matches!(
-                j.status,
-                JournalStatus::HotApplied | JournalStatus::NotHotEmptyDatabase
-            )
-        });
-        let wal_applied = snap
-            .wal
-            .as_ref()
-            .is_some_and(|w| w.status == WalStatus::Applied);
-        let had_wal_version = snap
-            .header
-            .is_some_and(|h| h.write_version == 2 || h.read_version == 2);
-        let mut pager = Self::from_snapshot(
-            snap,
-            Some(VfsBacking {
-                vfs: vfs.clone(),
-                path: path.to_string(),
-            }),
-            meter,
-        )?;
-        if pager.page_count == 0 && is_valid_page_size(page_size) {
-            pager.page_size = page_size;
-            pager.limits = payload_limits(pager.usable_size());
-        }
-        // Materialize any recovered hot-journal (including rollback-to-empty `db_size == 0`
-        // and stale journal left alongside an empty 0-byte main file!) or WAL state onto the
-        // main DB file under Exclusive lock before allowing further writes.
-        if snap_mode == SnapshotMode::HotJournalOverlay
-            || journal_needs_cleanup
-            || wal_applied
-            || (had_wal_version && pager.page_count > 0)
-        {
-            pager.materialize_recovered_state_to_vfs(
-                snap_mode == SnapshotMode::HotJournalOverlay || journal_needs_cleanup,
-                wal_applied || had_wal_version,
+        // Open existing database (applying any hot journal or WAL overlay into our initial state!).
+        // Loop up to 4 times so if another writer recovers or commits between releasing the
+        // snapshot Shared lock and acquiring the Exclusive recovery lock, we re-snapshot cleanly
+        // instead of overwriting newer on-disk state.
+        for attempt in 0..4 {
+            let pre_disk_header = read_disk_header_fingerprint(vfs.as_ref(), path)?;
+            let snap = open_snapshot(vfs.as_ref(), path, SnapshotOptions::default())?;
+            let snap_mode = snap.mode;
+            let journal_needs_cleanup = snap.journal.as_ref().is_some_and(|j| {
+                matches!(
+                    j.status,
+                    JournalStatus::HotApplied | JournalStatus::NotHotEmptyDatabase
+                )
+            });
+            let wal_applied = snap
+                .wal
+                .as_ref()
+                .is_some_and(|w| w.status == WalStatus::Applied);
+            let had_wal_version = snap
+                .header
+                .is_some_and(|h| h.write_version == 2 || h.read_version == 2);
+            let mut pager = Self::from_snapshot(
+                snap,
+                Some(VfsBacking {
+                    vfs: vfs.clone(),
+                    path: path.to_string(),
+                }),
+                meter.clone(),
             )?;
+            if pager.page_count == 0 && is_valid_page_size(page_size) {
+                pager.page_size = page_size;
+                pager.limits = payload_limits(pager.usable_size());
+            }
+            // Materialize any recovered hot-journal (including rollback-to-empty `db_size == 0`
+            // and stale journal left alongside an empty 0-byte main file!) or WAL state onto the
+            // main DB file under Exclusive lock before allowing further writes.
+            if snap_mode == SnapshotMode::HotJournalOverlay
+                || journal_needs_cleanup
+                || wal_applied
+                || (had_wal_version && pager.page_count > 0)
+            {
+                let clear_j = snap_mode == SnapshotMode::HotJournalOverlay || journal_needs_cleanup;
+                let clear_w = wal_applied || had_wal_version;
+                let committed = pager.materialize_recovered_state_to_vfs(
+                    clear_j,
+                    clear_w,
+                    wal_applied,
+                    &pre_disk_header,
+                )?;
+                if !committed {
+                    if attempt + 1 < 4 {
+                        continue;
+                    }
+                    return Err(IoError::with_path(
+                        IoErrorCode::Busy,
+                        format!("database file changed concurrently during recovery: {path}"),
+                        path,
+                    )
+                    .into());
+                }
+            }
+            return Ok(pager);
         }
-        Ok(pager)
+        unreachable!()
     }
 
     fn from_snapshot(
@@ -517,18 +557,23 @@ impl WritePager {
             journal_nonce: change_counter.wrapping_add(0x55aa_1234),
             disk_needs_journal_recovery: false,
             tracked_bytes: tracked,
+            pending_page_size: None,
         })
     }
 
     /// Persist recovered hot-journal or WAL pages back to the main DB file on disk under
     /// Exclusive lock and clean up the stale `-journal` / `-wal` / `-shm` companion files.
+    /// Returns `Ok(false)` if another process modified or already recovered the files before
+    /// our Exclusive lock was acquired, signalling `open_vfs` to re-snapshot safely.
     fn materialize_recovered_state_to_vfs(
         &mut self,
         clear_hot_journal: bool,
         clear_wal: bool,
-    ) -> SqliteResult<()> {
+        require_wal_present: bool,
+        expected_disk: &(u64, [u8; 100]),
+    ) -> SqliteResult<bool> {
         let Some(ref backing) = self.backing else {
-            return Ok(());
+            return Ok(true);
         };
         let vfs = backing.vfs.clone();
         let main_path = backing.path.clone();
@@ -540,7 +585,24 @@ impl WritePager {
             return Err(e);
         }
 
-        let write_res: SqliteResult<()> = (|| {
+        let write_res: SqliteResult<bool> = (|| {
+            // Re-verify on-disk main DB fingerprint & companion files under Exclusive lock so
+            // we never overwrite commits or recovery performed concurrently before our lock.
+            let cur_size = main_file.size()?;
+            let mut cur_hdr = [0u8; 100];
+            if cur_size >= 100 {
+                main_file.read(&mut cur_hdr, 0)?;
+            }
+            if (cur_size, cur_hdr) != *expected_disk {
+                return Ok(false);
+            }
+            if clear_hot_journal && !vfs.exists(&format!("{main_path}-journal"))? {
+                return Ok(false);
+            }
+            if require_wal_present && !vfs.exists(&format!("{main_path}-wal"))? {
+                return Ok(false);
+            }
+
             let lbp = lock_byte_page(ps);
             // Write and sync data pages 2..=page_count BEFORE updating page 1 to rollback
             // mode (`1/1`) and removing `-wal`/`-journal`, so a mid-recovery crash leaves
@@ -596,14 +658,16 @@ impl WritePager {
                     }
                 }
             }
-            Ok(())
+            Ok(true)
         })();
 
         let _ = main_file.unlock(LockLevel::None);
         let _ = main_file.close();
-        write_res?;
-        self.commit_orig_page_count = self.page_count;
-        Ok(())
+        let committed = write_res?;
+        if committed {
+            self.commit_orig_page_count = self.page_count;
+        }
+        Ok(committed)
     }
 
     #[inline]
@@ -630,16 +694,28 @@ impl WritePager {
     }
 
     pub fn set_page_size(&mut self, new_size: u32) -> SqliteResult<()> {
-        if self.page_count > 0 {
-            return Ok(()); // SQLite ignores PRAGMA page_size after DB is initialized
-        }
         if !is_valid_page_size(new_size) {
-            return Err(SqliteError::misuse(format!("invalid page_size {new_size}")));
+            return Ok(()); // SQLite silently ignores invalid PRAGMA page_size
+        }
+        if self.page_count > 0 {
+            self.pending_page_size = Some(new_size);
+            return Ok(());
         }
         self.page_size = new_size;
         self.limits = payload_limits(self.usable_size());
+        self.pending_page_size = None;
         self.mut_gen = self.mut_gen.wrapping_add(1);
         Ok(())
+    }
+
+    pub fn pending_page_size(&self) -> Option<u32> {
+        self.pending_page_size
+    }
+
+    pub fn set_schema_format(&mut self, fmt: u32) {
+        if (1..=MAX_SCHEMA_FORMAT).contains(&fmt) {
+            self.schema_format = fmt;
+        }
     }
 
     #[inline]
@@ -866,7 +942,13 @@ impl WritePager {
         self.meter.charge_steps(2)?;
 
         // 1. Pop from freelist if available (`btree.c allocateBtreePage`).
-        if self.freelist_trunk != 0 {
+        if (self.freelist_trunk == 0) != (self.freelist_count == 0) {
+            return Err(SqliteError::corrupt(format!(
+                "corrupt freelist header: trunk={}, count={}",
+                self.freelist_trunk, self.freelist_count
+            )));
+        }
+        if self.freelist_trunk != 0 && self.freelist_count > 0 {
             let trunk_pgno = self.freelist_trunk;
             let lbp = lock_byte_page(self.page_size);
             if trunk_pgno < 2 || trunk_pgno > self.page_count || trunk_pgno == lbp {
@@ -946,6 +1028,50 @@ impl WritePager {
         self.page_count = next;
         self.sync_page1_header()?;
         Ok(next)
+    }
+
+    /// Allocate `count` fresh zeroed pages, syncing page 1's header only once at the end
+    /// when extending the database (used by bulk index loading).
+    pub fn allocate_pages_batch(&mut self, count: usize) -> SqliteResult<Vec<u32>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure_initialized()?;
+        if (self.freelist_trunk == 0) != (self.freelist_count == 0) {
+            return Err(SqliteError::corrupt(format!(
+                "corrupt freelist header: trunk={}, count={}",
+                self.freelist_trunk, self.freelist_count
+            )));
+        }
+        let mut out = Vec::with_capacity(count);
+        if self.freelist_trunk != 0 && self.freelist_count > 0 {
+            for _ in 0..count {
+                out.push(self.allocate_page()?);
+            }
+            return Ok(out);
+        }
+        if !self.noop_meter {
+            self.meter.charge_steps((count as u64).saturating_mul(2))?;
+        }
+        let ps = self.page_size as usize;
+        let lbp = lock_byte_page(self.page_size);
+        let mut cur = self.page_count;
+        for _ in 0..count {
+            let mut next = cur
+                .checked_add(1)
+                .ok_or_else(|| SqliteError::Sql("database or disk is full".to_string()))?;
+            if next == lbp {
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| SqliteError::Sql("database or disk is full".to_string()))?;
+            }
+            self.put_page(next, vec![0u8; ps])?;
+            cur = next;
+            out.push(next);
+        }
+        self.page_count = cur;
+        self.sync_page1_header()?;
+        Ok(out)
     }
 
     /// Return `pgno` (> 1) to the SQLite freelist (`fileformat2 §1.5`).
@@ -1592,6 +1718,165 @@ impl WritePager {
         Ok(())
     }
 
+    /// Atomically replace the entire database image with a compacted `VACUUM` pager.
+    /// When VFS-backed, journals all pre-VACUUM pages using the original page size before
+    /// writing the compacted pages and truncating the main file (crash-safe even across
+    /// `PRAGMA page_size` changes!).
+    pub fn replace_from_vacuum(&mut self, mut compacted: WritePager) -> SqliteResult<()> {
+        if self.in_transaction() {
+            return Err(SqliteError::Sql(
+                "cannot VACUUM from within a transaction".to_string(),
+            ));
+        }
+        compacted.schema_cookie = self.schema_cookie.wrapping_add(1);
+        compacted.change_counter = self.change_counter.wrapping_add(1);
+        compacted.user_version = self.user_version;
+        compacted.application_id = self.application_id;
+        compacted.schema_format = self.schema_format;
+        compacted.freelist_trunk = 0;
+        compacted.freelist_count = 0;
+        if compacted.page_count > 0 {
+            compacted.sync_page1_header()?;
+        }
+
+        if let Some(ref backing) = self.backing {
+            let vfs = backing.vfs.clone();
+            let main_path = backing.path.clone();
+            let journal_path = format!("{main_path}-journal");
+            let old_ps = self.page_size;
+            let new_ps = compacted.page_size;
+            let orig_pc = self.commit_orig_page_count;
+
+            let mut main_file = vfs.open(&main_path, OpenFlags::create(FileKind::MainDb))?;
+            if let Err(e) = acquire_exclusive_lock(main_file.as_mut(), &main_path) {
+                let _ = main_file.close();
+                return Err(e);
+            }
+
+            let mut journal_synced = false;
+            let commit_res: SqliteResult<()> = (|| {
+                if self.disk_needs_journal_recovery {
+                    Self::playback_hot_journal_locked(
+                        &vfs,
+                        &main_path,
+                        main_file.as_mut(),
+                        old_ps,
+                    )?;
+                    self.disk_needs_journal_recovery = false;
+                }
+
+                // Step 1: Journal every original on-disk page under `old_ps` so a mid-VACUUM
+                // crash restores the pre-VACUUM database verbatim (including original page size).
+                let old_lbp = lock_byte_page(old_ps);
+                let mut journal_pages: Vec<(u32, Arc<[u8]>)> = Vec::new();
+                for pgno in 1..=orig_pc {
+                    if pgno == old_lbp {
+                        continue;
+                    }
+                    if let Some(bytes) = self.pages.get(pgno) {
+                        journal_pages.push((pgno, Arc::clone(bytes)));
+                    }
+                }
+                self.journal_nonce = self
+                    .journal_nonce
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
+                let nonce = self.journal_nonce;
+                let sector = JOURNAL_SECTOR_SIZE as usize;
+
+                let mut jbuf = vec![0u8; sector];
+                jbuf[0..8].copy_from_slice(JOURNAL_MAGIC);
+                jbuf[8..12].copy_from_slice(&(journal_pages.len() as u32).to_be_bytes());
+                jbuf[12..16].copy_from_slice(&nonce.to_be_bytes());
+                jbuf[16..20].copy_from_slice(&orig_pc.to_be_bytes());
+                jbuf[20..24].copy_from_slice(&JOURNAL_SECTOR_SIZE.to_be_bytes());
+                jbuf[24..28].copy_from_slice(&old_ps.to_be_bytes());
+
+                let mut jfile = vfs.open(&journal_path, OpenFlags::create(FileKind::MainJournal))?;
+                let jres: SqliteResult<()> = (|| {
+                    jfile.truncate(0)?;
+                    let mut joff = 0u64;
+                    jfile.write(&jbuf, joff)?;
+                    joff += sector as u64;
+                    let mut rec = Vec::with_capacity(4 + old_ps as usize + 4);
+                    for (pgno, orig_bytes) in &journal_pages {
+                        rec.clear();
+                        rec.extend_from_slice(&pgno.to_be_bytes());
+                        rec.extend_from_slice(orig_bytes);
+                        let cksum = journal_checksum(nonce, orig_bytes, 0, old_ps as usize);
+                        rec.extend_from_slice(&cksum.to_be_bytes());
+                        jfile.write(&rec, joff)?;
+                        joff += rec.len() as u64;
+                    }
+                    jfile.sync(false)?;
+                    Ok(())
+                })();
+                let close_res = jfile.close();
+                jres?;
+                close_res?;
+                journal_synced = true;
+
+                // Step 2: Write all compacted pages under `new_ps` and truncate excess pages.
+                let new_lbp = lock_byte_page(new_ps);
+                for pgno in 1..=compacted.page_count {
+                    if pgno == new_lbp {
+                        continue;
+                    }
+                    if let Some(bytes) = compacted.pages.get(pgno) {
+                        let off = u64::from(pgno - 1) * u64::from(new_ps);
+                        main_file.write(bytes, off)?;
+                    }
+                }
+                let target_size = u64::from(compacted.page_count) * u64::from(new_ps);
+                if main_file.size()? != target_size {
+                    main_file.truncate(target_size)?;
+                }
+                main_file.sync(false)?;
+
+                // Step 3: Commit complete — delete rollback journal!
+                vfs.delete(&journal_path, true)?;
+                Ok(())
+            })();
+
+            let _ = main_file.unlock(LockLevel::None);
+            let _ = main_file.close();
+            if let Err(e) = commit_res {
+                if journal_synced {
+                    self.disk_needs_journal_recovery = true;
+                }
+                return Err(e);
+            }
+        }
+
+        // Swap in-memory state and reconcile metered memory accounting cleanly.
+        if self.tracked_bytes > 0 {
+            self.meter.release_memory(self.tracked_bytes);
+        }
+        self.tracked_bytes = compacted.tracked_bytes;
+        compacted.tracked_bytes = 0;
+
+        self.page_size = compacted.page_size;
+        self.reserved_bytes = compacted.reserved_bytes;
+        self.limits = compacted.limits;
+        self.encoding = compacted.encoding;
+        self.page_count = compacted.page_count;
+        self.freelist_trunk = 0;
+        self.freelist_count = 0;
+        self.schema_cookie = compacted.schema_cookie;
+        self.schema_format = compacted.schema_format;
+        self.change_counter = compacted.change_counter;
+        self.user_version = compacted.user_version;
+        self.application_id = compacted.application_id;
+        self.pages = Arc::clone(&compacted.pages);
+        self.dirty_originals.clear();
+        self.dirty_in_memory = false;
+        self.commit_orig_page_count = self.page_count;
+        self.pending_page_size = None;
+        self.schema_gen = self.schema_gen.wrapping_add(1);
+        self.mut_gen = self.mut_gen.wrapping_add(1);
+        Ok(())
+    }
+
     /// Export the complete live SQLite 3 database as a contiguous byte vector.
     /// Always produces a valid SQLite 3 `.db` file image readable by C SQLite & `xdb-sqlite`.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1621,6 +1906,70 @@ impl WritePager {
             pages: Arc::clone(&self.pages),
         })
     }
+
+    /// True if one or more nested savepoints are active beyond the outer explicit transaction.
+    #[inline]
+    pub fn has_savepoints(&self) -> bool {
+        self.undo_stack.len() > usize::from(self.in_explicit_tx)
+    }
+
+    /// Build an O(1) copy-on-write in-memory overlay pager sharing `self.pages` via `Arc`.
+    pub(crate) fn clone_cow_overlay(&self) -> Self {
+        Self {
+            backing: None,
+            meter: Arc::new(NoopMeter),
+            noop_meter: true,
+            page_size: self.page_size,
+            reserved_bytes: self.reserved_bytes,
+            limits: self.limits,
+            encoding: self.encoding,
+            page_count: self.page_count,
+            freelist_trunk: self.freelist_trunk,
+            freelist_count: self.freelist_count,
+            schema_cookie: self.schema_cookie,
+            schema_format: self.schema_format,
+            change_counter: self.change_counter,
+            user_version: self.user_version,
+            application_id: self.application_id,
+            pages: Arc::clone(&self.pages),
+            schema_gen: self.schema_gen,
+            mut_gen: self.mut_gen,
+            dirty_originals: HashMap::new(),
+            dirty_in_memory: false,
+            commit_orig_page_count: self.page_count,
+            undo_stack: Vec::new(),
+            in_explicit_tx: false,
+            journal_nonce: self.journal_nonce,
+            disk_needs_journal_recovery: false,
+            tracked_bytes: 0,
+            pending_page_size: None,
+        }
+    }
+}
+
+/// Read the current on-disk `(file_size, header[0..100])` fingerprint under Shared lock so
+/// recovery can verify no concurrent writer committed or recovered before our Exclusive lock.
+fn read_disk_header_fingerprint(vfs: &dyn Vfs, path: &str) -> SqliteResult<(u64, [u8; 100])> {
+    let mut f = vfs.open(path, OpenFlags::readonly(FileKind::MainDb))?;
+    let res = (|| {
+        if !f.lock(LockLevel::Shared)? {
+            return Err(IoError::with_path(
+                IoErrorCode::Busy,
+                format!("database is locked: {path}"),
+                path,
+            )
+            .into());
+        }
+        let sz = f.size()?;
+        let mut hdr = [0u8; 100];
+        if sz >= 100 {
+            f.read(&mut hdr, 0)?;
+        }
+        Ok((sz, hdr))
+    })();
+    let _ = f.unlock(LockLevel::None);
+    let _ = f.close();
+    res
 }
 
 /// Acquire SQLite's Shared -> Reserved -> Exclusive lock progression, returning `Busy` on contention.

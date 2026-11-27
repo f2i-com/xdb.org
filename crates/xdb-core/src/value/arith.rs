@@ -2,7 +2,8 @@
 //! (`vdbe.c:1952`, `2091`, `2744`).
 
 use super::int64::{add_i64, div_i64, mul_i64, rem_i64, sub_i64};
-use super::numeric::{int_value, real_value, text_numeric_value};
+use super::numeric::{int_value_enc, numeric_value_enc, real_value_enc};
+use super::utf::TextEncoding;
 use super::SqlValue;
 
 /// Arithmetic operators sharing `OP_Add`'s body.
@@ -48,18 +49,18 @@ fn int_math(op: ArithOp, left: i64, right: i64) -> Option<SqlValue> {
     }
 }
 
-/// `fp_math` block: re-reads original operands via `real_value` / `int_value`.
-fn fp_math(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
+/// `fp_math` block: re-reads original operands via `real_value_enc` / `int_value_enc`.
+fn fp_math(op: ArithOp, left: &SqlValue, right: &SqlValue, enc: TextEncoding) -> SqlValue {
     let r = if op == ArithOp::Remainder {
-        let a = int_value(right);
+        let a = int_value_enc(right, enc);
         if a == 0 {
             return SqlValue::Null;
         }
-        let m = rem_i64(int_value(left), a).unwrap_or(0);
+        let m = rem_i64(int_value_enc(left, enc), a).unwrap_or(0);
         m as f64
     } else {
-        let r_a = real_value(right);
-        let r_b = real_value(left);
+        let r_a = real_value_enc(right, enc);
+        let r_b = real_value_enc(left, enc);
         match op {
             ArithOp::Add => r_b + r_a,
             ArithOp::Subtract => r_b - r_a,
@@ -79,12 +80,18 @@ fn fp_math(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
 /// `OP_Add` / `OP_Subtract` / `OP_Multiply` / `OP_Divide` / `OP_Remainder`.
 #[inline]
 pub fn arith(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
+    arith_enc(op, left, right, TextEncoding::Utf8)
+}
+
+/// Encoding-aware arithmetic (`BLOB` operands decoded using `enc` when `enc != Utf8`).
+#[inline]
+pub fn arith_enc(op: ArithOp, left: &SqlValue, right: &SqlValue, enc: TextEncoding) -> SqlValue {
     match (left, right) {
         (SqlValue::Int(l), SqlValue::Int(r)) => {
             if let Some(res) = int_math(op, *l, *r) {
                 return res;
             }
-            return fp_math(op, left, right);
+            return fp_math(op, left, right, enc);
         }
         (SqlValue::Null, _) | (_, SqlValue::Null) => return SqlValue::Null,
         (SqlValue::Real(l), SqlValue::Real(r)) if op != ArithOp::Remainder => {
@@ -147,24 +154,18 @@ pub fn arith(op: ArithOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
             if r.is_nan() {
                 return SqlValue::Null;
             }
-            return fp_math(op, left, right);
+            return fp_math(op, left, right, enc);
         }
         _ => {}
     }
-    let nl = match left {
-        SqlValue::Text(b) | SqlValue::Blob(b) => text_numeric_value(b),
-        other => other.clone(),
-    };
-    let nr = match right {
-        SqlValue::Text(b) | SqlValue::Blob(b) => text_numeric_value(b),
-        other => other.clone(),
-    };
+    let nl = numeric_value_enc(left, enc);
+    let nr = numeric_value_enc(right, enc);
     if let (SqlValue::Int(l), SqlValue::Int(r)) = (&nl, &nr) {
         if let Some(res) = int_math(op, *l, *r) {
             return res;
         }
     }
-    fp_math(op, left, right)
+    fp_math(op, left, right, enc)
 }
 
 #[inline]
@@ -198,13 +199,24 @@ pub fn negate(v: &SqlValue) -> SqlValue {
     subtract(&SqlValue::Int(0), v)
 }
 
+/// Encoding-aware unary minus: `0 - v` decoding `BLOB` via `enc`.
+#[inline]
+pub fn negate_enc(v: &SqlValue, enc: TextEncoding) -> SqlValue {
+    arith_enc(ArithOp::Subtract, &SqlValue::Int(0), v, enc)
+}
+
 /// `OP_BitAnd` / `OP_BitOr` / `OP_ShiftLeft` / `OP_ShiftRight` (`vdbe.c:2091`).
 pub fn bitwise(op: BitOp, left: &SqlValue, right: &SqlValue) -> SqlValue {
+    bitwise_enc(op, left, right, TextEncoding::Utf8)
+}
+
+/// Encoding-aware bitwise operation (`BLOB` operands decoded using `enc`).
+pub fn bitwise_enc(op: BitOp, left: &SqlValue, right: &SqlValue, enc: TextEncoding) -> SqlValue {
     if left.is_null() || right.is_null() {
         return SqlValue::Null;
     }
-    let a = int_value(left);
-    let b = int_value(right);
+    let a = int_value_enc(left, enc);
+    let b = int_value_enc(right, enc);
     match op {
         BitOp::And => SqlValue::Int(a & b),
         BitOp::Or => SqlValue::Int(a | b),
@@ -260,9 +272,15 @@ pub fn shift_right(left: &SqlValue, right: &SqlValue) -> SqlValue {
 /// `~v` (`OP_BitNot`): `NULL` stays `NULL`, else ones' complement of `int_value(v)`.
 #[inline]
 pub fn bit_not(v: &SqlValue) -> SqlValue {
+    bit_not_enc(v, TextEncoding::Utf8)
+}
+
+/// Encoding-aware `~v` (`BLOB` decoded using `enc`).
+#[inline]
+pub fn bit_not_enc(v: &SqlValue, enc: TextEncoding) -> SqlValue {
     if v.is_null() {
         SqlValue::Null
     } else {
-        SqlValue::Int(!int_value(v))
+        SqlValue::Int(!int_value_enc(v, enc))
     }
 }

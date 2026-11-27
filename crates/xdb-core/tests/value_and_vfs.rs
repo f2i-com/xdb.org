@@ -917,3 +917,59 @@ fn pass9_swar_nocase_branchless_atof_atoi64_and_integral_real_buf() {
         }
     }
 }
+
+#[test]
+fn pass10_utf16_blob_numeric_arith_bitwise_and_boolean() {
+    use xdb_core::value::{
+        arith_enc, bit_not_enc, bitwise_enc, boolean_value_enc, int_value_enc, negate_enc,
+        numeric_value_enc, real_value_enc, ArithOp, BitOp,
+    };
+
+    let b42_le = SqlValue::blob(vec![b'4', 0, b'2', 0]);
+    let b42_be = SqlValue::blob(vec![0, b'4', 0, b'2']);
+    let b35_le = SqlValue::blob(vec![b'3', 0, b'.', 0, b'5', 0]);
+    let b35_be = SqlValue::blob(vec![0, b'3', 0, b'.', 0, b'5']);
+    let b0_le = SqlValue::blob(vec![b'0', 0]);
+    let b1_be = SqlValue::blob(vec![0, b'1']);
+
+    // UTF-8 stops at NUL: "4\02\0" -> 4, "\04\02" -> 0.
+    assert_eq!(int_value_enc(&b42_le, TextEncoding::Utf8), 4);
+    assert_eq!(int_value_enc(&b42_be, TextEncoding::Utf8), 0);
+    assert!(!boolean_value_enc(&b1_be, false, TextEncoding::Utf8));
+
+    // UTF-16LE decodes UTF-16LE BLOBs as numbers!
+    assert_eq!(int_value_enc(&b42_le, TextEncoding::Utf16Le), 42);
+    assert_eq!(real_value_enc(&b35_le, TextEncoding::Utf16Le), 3.5);
+    assert!(numeric_value_enc(&b42_le, TextEncoding::Utf16Le).exact_eq(&SqlValue::Int(42)));
+    assert!(numeric_value_enc(&b35_le, TextEncoding::Utf16Le).exact_eq(&SqlValue::Real(3.5)));
+    assert!(boolean_value_enc(&b42_le, false, TextEncoding::Utf16Le));
+    assert!(!boolean_value_enc(&b0_le, false, TextEncoding::Utf16Le));
+    assert!(
+        arith_enc(ArithOp::Add, &b42_le, &SqlValue::Int(8), TextEncoding::Utf16Le)
+            .exact_eq(&SqlValue::Int(50))
+    );
+    assert!(
+        arith_enc(ArithOp::Multiply, &b35_le, &SqlValue::Int(2), TextEncoding::Utf16Le)
+            .exact_eq(&SqlValue::Real(7.0))
+    );
+    assert!(negate_enc(&b42_le, TextEncoding::Utf16Le).exact_eq(&SqlValue::Int(-42)));
+    assert!(
+        bitwise_enc(BitOp::And, &b42_le, &SqlValue::Int(0x0F), TextEncoding::Utf16Le)
+            .exact_eq(&SqlValue::Int(42 & 0x0F))
+    );
+    assert!(bit_not_enc(&b42_le, TextEncoding::Utf16Le).exact_eq(&SqlValue::Int(!42i64)));
+
+    // UTF-16BE decodes UTF-16BE BLOBs as numbers!
+    assert_eq!(int_value_enc(&b42_be, TextEncoding::Utf16Be), 42);
+    assert_eq!(real_value_enc(&b35_be, TextEncoding::Utf16Be), 3.5);
+    assert!(boolean_value_enc(&b1_be, false, TextEncoding::Utf16Be));
+    assert!(
+        arith_enc(ArithOp::Subtract, &b42_be, &SqlValue::Int(2), TextEncoding::Utf16Be)
+            .exact_eq(&SqlValue::Int(40))
+    );
+    assert!(negate_enc(&b35_be, TextEncoding::Utf16Be).exact_eq(&SqlValue::Real(-3.5)));
+    assert!(
+        bitwise_enc(BitOp::ShiftLeft, &b1_be, &SqlValue::Int(3), TextEncoding::Utf16Be)
+            .exact_eq(&SqlValue::Int(8))
+    );
+}

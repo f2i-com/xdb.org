@@ -10,7 +10,7 @@ use crate::ast::{Expr, Name, SelectStmt, Span, Statement};
 use crate::errors::{ParseResult, SqlParseError, SqlParseErrorKind};
 use crate::lalr_tables::{ActionId, LalrTables, SQLITE_GRAMMAR, XDB_GRAMMAR};
 use crate::tokenizer::{
-    classify_context_keyword_metered, classify_ilike_metered, is_ilike, sql_end, Dialect, Scanner,
+    classify_context_keyword_metered, classify_ilike_metered, is_ilike, Dialect, Scanner,
 };
 use crate::tokens::tk;
 
@@ -293,6 +293,11 @@ impl<'a> Parser<'a> {
                 SqlParseErrorKind::Syntax,
             );
         } else {
+            if self.meter.is_some()
+                && (!self.charge_ast_mem(e.saturating_sub(s) as u64) || !self.flush_meters())
+            {
+                return;
+            }
             let tok = &self.sql[s..e];
             self.error(
                 format!("near \"{tok}\": syntax error"),
@@ -417,7 +422,11 @@ impl<'a> Parser<'a> {
                 kind = classify_ilike_metered(&mut self.probe, end, self.meter)
                     .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
-                if !self.flush_steps() {
+                let tok_len = end.saturating_sub(i);
+                if !self.charge_steps_for_len(tok_len)
+                    || (self.meter.is_some() && !self.charge_ast_mem(tok_len as u64))
+                    || !self.flush_meters()
+                {
                     return Err(self.err.take().expect("limit error"));
                 }
                 return Err(SqlParseError::new(
@@ -508,7 +517,11 @@ impl<'a> Parser<'a> {
                 kind = classify_ilike_metered(&mut self.probe, end, self.meter)
                     .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
-                if !self.flush_steps() {
+                let tok_len = end.saturating_sub(i);
+                if !self.charge_steps_for_len(tok_len)
+                    || (self.meter.is_some() && !self.charge_ast_mem(tok_len as u64))
+                    || !self.flush_meters()
+                {
                     return Err(self.err.take().expect("limit error"));
                 }
                 return Err(SqlParseError::new(
@@ -538,7 +551,7 @@ impl<'a> Parser<'a> {
                     "not an expression",
                     SqlParseErrorKind::Syntax,
                     Some(i),
-                    Some(sql_end(self.sql)),
+                    Some(i),
                 ));
             }
             if let Some(Statement::Select(sel)) = self.result.take() {
@@ -812,8 +825,10 @@ impl<'a> Parser<'a> {
         self.st[k] = ts as isize;
         self.en[k] = te as isize;
         self.h[k] = 0;
+        // Dedicated bit 0x80 (distinct from `expr_flag::HAS_FUNC = 1` / `IS_FALSE = 2`)
+        // records whether a string token contained doubled quotes `''`.
         self.f[k] = if major == tk::STRING && self.scanner.has_doubled_quote {
-            1
+            0x80
         } else {
             0
         };
@@ -935,7 +950,10 @@ impl<'a> Parser<'a> {
                 ActionId::TermString => {
                     let s = rs.max(0) as usize;
                     let e = re.max(0) as usize;
-                    let value = if e >= s + 2 && self.f[b] == 0 && self.sql.as_bytes()[s] == b'\'' {
+                    let value = if e >= s + 2
+                        && (self.f[b] & 0x80) == 0
+                        && self.sql.as_bytes()[s] == b'\''
+                    {
                         self.sql[s + 1..e - 1].to_string()
                     } else {
                         crate::text::dequote(&self.sql[s..e])

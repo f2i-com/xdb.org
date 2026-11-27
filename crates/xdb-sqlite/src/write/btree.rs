@@ -1652,27 +1652,15 @@ pub fn table_append_monotonic(
     payload: &[u8],
 ) -> SqliteResult<()> {
     let limits = pager.payload_limits();
-    if payload.len() <= 480 && payload.len() <= limits.max_leaf as usize {
+    if payload.len() <= limits.max_leaf as usize {
         if let Some(leaf_pgno) = *hint_leaf {
             let usable = pager.usable_size() as usize;
             let hdr = if leaf_pgno == 1 { HEADER_SIZE } else { 0 };
             let ptr_off = hdr + 8;
-            let mut small_buf = [0u8; 128];
-            let mut large_buf = [0u8; 512];
-            let cell: &[u8] = if payload.len() <= 108 {
-                let n1 = put_varint_slice(payload.len() as u64, &mut small_buf);
-                let n2 = put_varint_slice(rowid as u64, &mut small_buf[n1..]);
-                let clen = n1 + n2 + payload.len();
-                small_buf[n1 + n2..clen].copy_from_slice(payload);
-                &small_buf[..clen]
-            } else {
-                let n1 = put_varint_slice(payload.len() as u64, &mut large_buf);
-                let n2 = put_varint_slice(rowid as u64, &mut large_buf[n1..]);
-                let clen = n1 + n2 + payload.len();
-                large_buf[n1 + n2..clen].copy_from_slice(payload);
-                &large_buf[..clen]
-            };
-            let alloc = cell_storage_len(cell);
+            let n1 = crate::write::record::varint_size(payload.len() as u64);
+            let n2 = crate::write::record::varint_size(rowid as u64);
+            let clen = n1 + n2 + payload.len();
+            let alloc = clen.max(4);
             let can_append = {
                 let data = pager.read_page(leaf_pgno)?;
                 let bound = usable.min(data.len());
@@ -1691,12 +1679,12 @@ pub fn table_append_monotonic(
                         } else {
                             let pc = usize::from(read_u16_be(data, ptr_off + 2 * (n_cell - 1)));
                             if pc < bound {
-                                let (_, n1) = if data[pc] < 0x80 {
+                                let (_, pn1) = if data[pc] < 0x80 {
                                     (u32::from(data[pc]), 1usize)
                                 } else {
                                     get_payload_size_varint(data, pc)
                                 };
-                                let (last_rid, _) = get_varint(data, pc + n1);
+                                let (last_rid, _) = get_varint(data, pc + pn1);
                                 last_rid < rowid
                             } else {
                                 false
@@ -1710,6 +1698,7 @@ pub fn table_append_monotonic(
                 }
             };
             if can_append {
+                // Encode varints + payload directly into the page buffer (zero staging copy!).
                 let buf = pager.write_page_mut(leaf_pgno)?;
                 let n_cell = usize::from(read_u16_be(buf, hdr + 3));
                 let content_raw = read_u16_be(buf, hdr + 5);
@@ -1719,9 +1708,11 @@ pub fn table_append_monotonic(
                     usize::from(content_raw)
                 };
                 let new_pos = content_start - alloc;
-                buf[new_pos..new_pos + cell.len()].copy_from_slice(cell);
-                if cell.len() < alloc {
-                    buf[new_pos + cell.len()..new_pos + alloc].fill(0);
+                let w1 = put_varint_slice(payload.len() as u64, &mut buf[new_pos..]);
+                let w2 = put_varint_slice(rowid as u64, &mut buf[new_pos + w1..]);
+                buf[new_pos + w1 + w2..new_pos + clen].copy_from_slice(payload);
+                if clen < alloc {
+                    buf[new_pos + clen..new_pos + alloc].fill(0);
                 }
                 buf[ptr_off + 2 * n_cell..ptr_off + 2 * n_cell + 2]
                     .copy_from_slice(&(new_pos as u16).to_be_bytes());
@@ -3071,7 +3062,9 @@ pub fn table_scan_single_stored_col_direct(
     let mut ints: Vec<(i64, i64)> = Vec::new();
     let mut mixed: Option<Vec<(SqlValue, i64)>> = None;
     let mut visited_count = 0u32;
-    let mut visited = std::collections::HashSet::<u32>::new();
+    let bit_words = ((page_count.min(65_536) as usize) >> 6) + 1;
+    let mut visited_bits: Vec<u64> = vec![0u64; bit_words];
+    let mut visited_hi: Option<std::collections::HashSet<u32>> = None;
     let mut stack: Vec<(u32, usize)> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
     stack.push((root_pgno, 0));
 
@@ -3096,7 +3089,22 @@ pub fn table_scan_single_stored_col_direct(
 
     while let Some((pgno, depth)) = stack.pop() {
         visited_count = visited_count.saturating_add(1);
-        if visited_count > page_count || !visited.insert(pgno) {
+        let fresh = if pgno <= 65_536 {
+            let w = (pgno as usize) >> 6;
+            let bit = 1u64 << (pgno & 63);
+            if w < visited_bits.len() {
+                let was = (visited_bits[w] & bit) != 0;
+                visited_bits[w] |= bit;
+                !was
+            } else {
+                false
+            }
+        } else {
+            visited_hi
+                .get_or_insert_with(std::collections::HashSet::new)
+                .insert(pgno)
+        };
+        if visited_count > page_count || !fresh {
             return Err(SqliteError::corrupt(format!(
                 "table B-tree {root_pgno} contains a cycle"
             )));
@@ -4862,7 +4870,7 @@ fn index_split_leaf(
     // Must have >= 3 cells to have non-empty left & right + promoted mid; with 2 cells,
     // left gets 1, mid gets 1, right gets 0 —Wait: SQLite forbids 0-cell non-root leaf!
     // With SQLite's max_local <= ~25% of usable_size, a page overflowing ALWAYS has >= 3 cells!
-    let mid = choose_index_split_mid(&raw_cells);
+    let mid = choose_index_split_mid(&raw_cells)?;
     let left_raw = &raw_cells[..mid];
     let mid_body = raw_cells[mid].clone();
     let right_raw = &raw_cells[mid + 1..];
@@ -4947,7 +4955,7 @@ fn index_split_interior(
     raw_cells: Vec<Vec<u8>>,
     right_child: u32,
 ) -> SqliteResult<()> {
-    let mid = choose_index_split_mid(&raw_cells);
+    let mid = choose_index_split_mid(&raw_cells)?;
     let left_raw = &raw_cells[..mid];
     let left_right_child = read_u32_be(&raw_cells[mid], 0);
     let promoted_body = raw_cells[mid][4..].to_vec();
@@ -5376,12 +5384,22 @@ pub fn index_bulk_load_sorted_two_int(
     }
     let usable = pager.usable_size() as usize;
     let hdr_root = if root_pgno == 1 { HEADER_SIZE } else { 0 } + 8;
-    let total_root_bytes: usize = sorted_entries
-        .iter()
-        .map(|&(k0, k1)| 2 + two_int_cell_storage_len(k0, k1, schema_format))
-        .sum();
-    if hdr_root + total_root_bytes <= usable {
-        return pack_two_int_index_leaf(pager, root_pgno, sorted_entries, schema_format);
+    let root_cap = usable.saturating_sub(hdr_root);
+    // Early-exit single-page root check: stops immediately once cells exceed 1 page
+    // instead of scanning all 5,000+ entries twice!
+    if sorted_entries.len() * 6 <= root_cap {
+        let mut total_root_bytes = 0usize;
+        let mut fits_in_root = true;
+        for &(k0, k1) in sorted_entries {
+            total_root_bytes += 2 + two_int_cell_storage_len(k0, k1, schema_format);
+            if total_root_bytes > root_cap {
+                fits_in_root = false;
+                break;
+            }
+        }
+        if fits_in_root {
+            return pack_two_int_index_leaf(pager, root_pgno, sorted_entries, schema_format);
+        }
     }
 
     let hdr_leaf = 8usize;
@@ -5441,11 +5459,9 @@ pub fn index_bulk_load_sorted_two_int(
         leaf_ranges.push((cur_start, total));
     }
 
-    let mut child_pgs: Vec<u32> = Vec::with_capacity(leaf_ranges.len());
-    for (s, e) in leaf_ranges {
-        let pg = pager.allocate_page()?;
+    let mut child_pgs = pager.allocate_pages_batch(leaf_ranges.len())?;
+    for (&pg, (s, e)) in child_pgs.iter().zip(leaf_ranges) {
         pack_two_int_index_leaf(pager, pg, &sorted_entries[s..e], schema_format)?;
-        child_pgs.push(pg);
     }
     let mut rec_buf = [0u8; 20];
     let mut dividers: Vec<Vec<u8>> = div_indices
@@ -6040,7 +6056,7 @@ fn index_rebalance_zero_cell_interior(
         }
 
         // Redistribute across `empty_pg` (left) and `sib_pg` (right).
-        let mid = choose_index_split_mid(&merged_raw);
+        let mid = choose_index_split_mid(&merged_raw)?;
         let left_rc = read_u32_be(&merged_raw[mid], 0);
         let mut promoted = Vec::with_capacity(merged_raw[mid].len());
         promoted.extend_from_slice(&empty_pg.to_be_bytes());
@@ -6113,7 +6129,7 @@ fn index_rebalance_zero_cell_interior(
         }
 
         // Redistribute across `sib_pg` (left) and `empty_pg` (right).
-        let mid = choose_index_split_mid(&merged_raw);
+        let mid = choose_index_split_mid(&merged_raw)?;
         let left_rc = read_u32_be(&merged_raw[mid], 0);
         let mut promoted = Vec::with_capacity(merged_raw[mid].len());
         promoted.extend_from_slice(&sib_pg.to_be_bytes());
@@ -6268,34 +6284,61 @@ fn partition_table_leaf_cells(
 
 /// Choose a balanced split middle index `1..len-1` for IndexLeaf / IndexInterior
 /// (where `cells[mid]` is promoted to parent, leaving non-empty `..mid` and `mid+1..`).
-fn choose_index_split_mid(cells: &[Vec<u8>]) -> usize {
-    debug_assert!(cells.len() >= 3);
+fn choose_index_split_mid(cells: &[Vec<u8>]) -> SqliteResult<usize> {
+    if cells.len() < 3 {
+        return Err(SqliteError::corrupt(format!(
+            "cannot split index page with fewer than 3 cells (got {})",
+            cells.len()
+        )));
+    }
     let total: usize = cells.iter().map(|c| cell_storage_len(c) + 2).sum();
     let half = total / 2;
     let mut acc = 0usize;
     for (i, c) in cells.iter().enumerate() {
         acc += cell_storage_len(c) + 2;
         if acc >= half && i >= 1 && i + 1 < cells.len() {
-            return i;
+            return Ok(i);
         }
     }
-    (cells.len() / 2).clamp(1, cells.len() - 2)
+    Ok((cells.len() / 2).clamp(1, cells.len() - 2))
 }
 
 // ───────────────────────────── PRAGMA integrity_check ─────────────────────────────
 
 /// Verify complete structural integrity of all B-trees, overflow chains, and freelist.
-/// Returns `vec!["ok"]` if everything is clean, or a list of diagnostic error strings.
+/// Returns `vec!["ok"]` if everything is clean, or up to 100 diagnostic error strings.
 pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
+    check_integrity_metered(pager, root_pages, 100).unwrap_or_else(|e| vec![e.to_string()])
+}
+
+/// Metered structural integrity verification with configurable `max_errors` cap.
+/// Propagates [`SqliteError::ResourceLimit`] immediately instead of swallowing it.
+pub fn check_integrity_metered(
+    pager: &WritePager,
+    root_pages: &[u32],
+    max_errors: usize,
+) -> SqliteResult<Vec<String>> {
     if pager.page_count() == 0 {
-        return vec!["ok".to_string()];
+        return Ok(vec!["ok".to_string()]);
     }
+    let err_cap = max_errors.max(1);
     let mut errors = Vec::new();
     let page_count = pager.page_count();
     let usable = pager.usable_size();
     let limits = payload_limits(usable);
     let lbp = lock_byte_page(pager.page_size());
     let mut visited: HashSet<u32> = HashSet::new();
+    let meter = pager.meter();
+    let metered = !pager.is_noop_meter();
+
+    macro_rules! record_err {
+        ($msg:expr) => {{
+            errors.push($msg);
+            if errors.len() >= err_cap {
+                return Ok(errors);
+            }
+        }};
+    }
 
     // 1. Walk all B-trees
     let usable_len = usable as usize;
@@ -6308,40 +6351,47 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
         // Stack entries: (pgno, is_root, depth)
         let mut stack = vec![(root, true, 0usize)];
         while let Some((pgno, is_root, depth)) = stack.pop() {
+            if metered {
+                meter.charge_steps(1)?;
+            }
             if pgno < 1 || pgno > page_count {
-                errors.push(format!("page {pgno} out of range 1..={page_count}"));
+                record_err!(format!("page {pgno} out of range 1..={page_count}"));
                 continue;
             }
             if !visited.insert(pgno) {
-                errors.push(format!("page {pgno} is referenced more than once"));
+                record_err!(format!("page {pgno} is referenced more than once"));
                 continue;
             }
-            let Ok(data) = pager.read_page(pgno) else {
-                errors.push(format!("cannot read page {pgno}"));
-                continue;
+            let data = match pager.read_page(pgno) {
+                Ok(d) => d,
+                Err(SqliteError::ResourceLimit(rl)) => return Err(SqliteError::ResourceLimit(rl)),
+                Err(_) => {
+                    record_err!(format!("cannot read page {pgno}"));
+                    continue;
+                }
             };
             let bound = usable_len.min(data.len());
             let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
             if hdr + 8 > bound {
-                errors.push(format!("page {pgno}: truncated header"));
+                record_err!(format!("page {pgno}: truncated header"));
                 continue;
             }
             let Some(ptype) = BtreePageType::from_byte(data[hdr]) else {
-                errors.push(format!("page {pgno}: invalid type 0x{:02x}", data[hdr]));
+                record_err!(format!("page {pgno}: invalid type 0x{:02x}", data[hdr]));
                 continue;
             };
             let n_cell = usize::from(read_u16_be(data, hdr + 3));
             let is_leaf = ptype.is_leaf();
             if !is_root && n_cell == 0 {
-                errors.push(format!("page {pgno}: non-root page has 0 cells"));
+                record_err!(format!("page {pgno}: non-root page has 0 cells"));
             }
             if is_root && !is_leaf && n_cell == 0 && pgno != 1 {
-                errors.push(format!("page {pgno}: non-page-1 interior root has 0 cells"));
+                record_err!(format!("page {pgno}: non-page-1 interior root has 0 cells"));
             }
             let is_table = ptype.is_table();
             if let Some(exp_tbl) = expected_is_table {
                 if exp_tbl != is_table {
-                    errors.push(format!(
+                    record_err!(format!(
                         "page {pgno}: mismatched B-tree page kind in tree rooted at {root}"
                     ));
                 }
@@ -6351,7 +6401,7 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
             if is_leaf {
                 if let Some(exp_d) = expected_leaf_depth {
                     if exp_d != depth {
-                        errors.push(format!(
+                        record_err!(format!(
                             "page {pgno}: child page depth differs ({depth} != {exp_d})"
                         ));
                     }
@@ -6362,7 +6412,7 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
             let ptr_off = hdr + if is_leaf { 8 } else { 12 };
             let ptr_end = ptr_off + 2 * n_cell;
             if ptr_end > bound {
-                errors.push(format!("page {pgno}: cell pointer array overflows page"));
+                record_err!(format!("page {pgno}: cell pointer array overflows page"));
                 continue;
             }
             let content_raw = read_u16_be(data, hdr + 5);
@@ -6372,13 +6422,13 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 usize::from(content_raw)
             };
             if content_start < ptr_end || content_start > bound {
-                errors.push(format!(
+                record_err!(format!(
                     "page {pgno}: content_start {content_start} outside {ptr_end}..={bound}"
                 ));
             }
             let frag = data[hdr + 7];
             if frag > 60 {
-                errors.push(format!("page {pgno}: fragmented_bytes {frag} > 60"));
+                record_err!(format!("page {pgno}: fragmented_bytes {frag} > 60"));
             }
             // Validate freeblock chain (strictly ascending offsets inside content_start..bound).
             let mut fb = usize::from(read_u16_be(data, hdr + 1));
@@ -6386,16 +6436,19 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
             let mut fb_hops = 0usize;
             while fb != 0 {
                 fb_hops += 1;
+                if metered && (fb_hops & 15) == 0 {
+                    meter.charge_steps(1)?;
+                }
                 if fb_hops > bound / 4 + 1 {
-                    errors.push(format!("page {pgno}: freeblock cycle"));
+                    record_err!(format!("page {pgno}: freeblock cycle"));
                     break;
                 }
                 if fb < content_start || fb + 4 > bound {
-                    errors.push(format!("page {pgno}: freeblock {fb} out of bounds"));
+                    record_err!(format!("page {pgno}: freeblock {fb} out of bounds"));
                     break;
                 }
                 if prev_fb_end > 0 && fb <= prev_fb_end {
-                    errors.push(format!(
+                    record_err!(format!(
                         "page {pgno}: freeblocks out of order or adjacent ({fb} <= {prev_fb_end})"
                     ));
                     break;
@@ -6403,7 +6456,7 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 let next_fb = usize::from(read_u16_be(data, fb));
                 let fb_size = usize::from(read_u16_be(data, fb + 2));
                 if fb_size < 4 || fb + fb_size > bound {
-                    errors.push(format!(
+                    record_err!(format!(
                         "page {pgno}: freeblock at {fb} has invalid size {fb_size}"
                     ));
                     break;
@@ -6422,9 +6475,12 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
             };
             let mut prev_rowid: Option<i64> = None;
             for i in 0..n_cell {
+                if metered && (i & 15) == 0 {
+                    meter.charge_steps(1)?;
+                }
                 let pc = usize::from(read_u16_be(data, ptr_off + 2 * i));
                 if pc < content_start || pc >= bound {
-                    errors.push(format!(
+                    record_err!(format!(
                         "page {pgno}: cell {i} pointer {pc} outside {content_start}..{bound}"
                     ));
                     continue;
@@ -6432,7 +6488,7 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 let mut pos = pc;
                 if !is_leaf {
                     if pos + 4 > bound {
-                        errors.push(format!("page {pgno}: cell {i} runs past page end"));
+                        record_err!(format!("page {pgno}: cell {i} runs past page end"));
                         continue;
                     }
                     stack.push((read_u32_be(data, pos), false, depth + 1));
@@ -6441,12 +6497,12 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 if is_table && !is_leaf {
                     let (rk, klen) = get_varint(data, pos);
                     if pos + klen > bound {
-                        errors.push(format!("page {pgno}: cell {i} key runs past page end"));
+                        record_err!(format!("page {pgno}: cell {i} key runs past page end"));
                         continue;
                     }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
-                            errors.push(format!("page {pgno}: unsorted table interior keys"));
+                            record_err!(format!("page {pgno}: unsorted table interior keys"));
                         }
                     }
                     prev_rowid = Some(rk);
@@ -6457,12 +6513,12 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 if is_table {
                     let (rk, n2) = get_varint(data, pos);
                     if pos + n2 > bound {
-                        errors.push(format!("page {pgno}: cell {i} rowid runs past page end"));
+                        record_err!(format!("page {pgno}: cell {i} rowid runs past page end"));
                         continue;
                     }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
-                            errors.push(format!("page {pgno}: unsorted table leaf rowids"));
+                            record_err!(format!("page {pgno}: unsorted table leaf rowids"));
                         }
                     }
                     prev_rowid = Some(rk);
@@ -6471,7 +6527,7 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                 let local = local_payload_size(psize_u32, max_l, min_l, usable);
                 let expected_end = pos + local + if psize_u32 > local as u32 { 4 } else { 0 };
                 if expected_end > bound {
-                    errors.push(format!("page {pgno}: cell {i} payload runs past page end"));
+                    record_err!(format!("page {pgno}: cell {i} payload runs past page end"));
                     continue;
                 }
                 if psize_u32 > local as u32 {
@@ -6479,19 +6535,31 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
                     let mut actual_ovfl = 0u32;
                     let mut ovfl = read_u32_be(data, pos + local);
                     while ovfl != 0 {
+                        if metered {
+                            meter.charge_steps(1)?;
+                        }
                         if ovfl < 2 || ovfl > page_count || ovfl == lbp {
-                            errors.push(format!("page {pgno}: bad overflow page {ovfl}"));
+                            record_err!(format!("page {pgno}: bad overflow page {ovfl}"));
                             break;
                         }
                         if !visited.insert(ovfl) {
-                            errors.push(format!("overflow page {ovfl} referenced more than once"));
+                            record_err!(format!("overflow page {ovfl} referenced more than once"));
                             break;
                         }
                         actual_ovfl += 1;
-                        ovfl = pager.read_page(ovfl).map(|p| read_u32_be(p, 0)).unwrap_or(0);
+                        ovfl = match pager.read_page(ovfl) {
+                            Ok(p) => read_u32_be(p, 0),
+                            Err(SqliteError::ResourceLimit(rl)) => {
+                                return Err(SqliteError::ResourceLimit(rl));
+                            }
+                            Err(_) => {
+                                record_err!(format!("cannot read overflow page {ovfl}"));
+                                break;
+                            }
+                        };
                     }
                     if actual_ovfl != expected_ovfl {
-                        errors.push(format!(
+                        record_err!(format!(
                             "page {pgno}: cell {i} overflow chain length {actual_ovfl} != expected {expected_ovfl}"
                         ));
                     }
@@ -6505,47 +6573,57 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
     let mut trunk = pager.freelist_trunk();
     let mut free_seen = 0u32;
     while trunk != 0 {
+        if metered {
+            meter.charge_steps(1)?;
+        }
         if trunk < 2 || trunk > page_count || trunk == lbp {
-            errors.push(format!("freelist trunk {trunk} out of range"));
+            record_err!(format!("freelist trunk {trunk} out of range"));
             break;
         }
         if !visited.insert(trunk) {
-            errors.push(format!("freelist trunk {trunk} referenced more than once"));
+            record_err!(format!("freelist trunk {trunk} referenced more than once"));
             break;
         }
         free_seen += 1;
-        let Ok(tpage) = pager.read_page(trunk) else {
-            errors.push(format!("cannot read freelist trunk {trunk}"));
-            break;
+        let tpage = match pager.read_page(trunk) {
+            Ok(p) => p,
+            Err(SqliteError::ResourceLimit(rl)) => return Err(SqliteError::ResourceLimit(rl)),
+            Err(_) => {
+                record_err!(format!("cannot read freelist trunk {trunk}"));
+                break;
+            }
         };
         if tpage.len() < 8 {
-            errors.push(format!("freelist trunk {trunk} truncated"));
+            record_err!(format!("freelist trunk {trunk} truncated"));
             break;
         }
         let next_trunk = read_u32_be(tpage, 0);
         let cnt = read_u32_be(tpage, 4) as usize;
         if cnt > max_leaves {
-            errors.push(format!(
+            record_err!(format!(
                 "freelist trunk {trunk}: leaf count {cnt} exceeds max {max_leaves}"
             ));
             break;
         }
         for i in 0..cnt {
+            if metered && (i & 31) == 0 {
+                meter.charge_steps(1)?;
+            }
             let off = 8 + i * 4;
             let leaf = read_u32_be(tpage, off);
             if leaf < 2 || leaf > page_count || leaf == lbp {
-                errors.push(format!("freelist leaf {leaf} out of range"));
+                record_err!(format!("freelist leaf {leaf} out of range"));
                 continue;
             }
             if !visited.insert(leaf) {
-                errors.push(format!("freelist leaf {leaf} referenced more than once"));
+                record_err!(format!("freelist leaf {leaf} referenced more than once"));
             }
             free_seen += 1;
         }
         trunk = next_trunk;
     }
     if free_seen != pager.freelist_count() {
-        errors.push(format!(
+        record_err!(format!(
             "freelist count mismatch: header={}, actual={free_seen}",
             pager.freelist_count()
         ));
@@ -6553,18 +6631,21 @@ pub fn check_integrity(pager: &WritePager, root_pages: &[u32]) -> Vec<String> {
 
     // 3. Check for leaked / unreferenced pages
     for pgno in 1..=page_count {
+        if metered && (pgno & 63) == 0 {
+            meter.charge_steps(1)?;
+        }
         if pgno == lbp {
             continue;
         }
         if !visited.contains(&pgno) {
-            errors.push(format!("page {pgno} is never used"));
+            record_err!(format!("page {pgno} is never used"));
         }
     }
 
     if errors.is_empty() {
-        vec!["ok".to_string()]
+        Ok(vec!["ok".to_string()])
     } else {
-        errors
+        Ok(errors)
     }
 }
 
@@ -7703,12 +7784,15 @@ pub fn index_eq_scan_direct(
 
     let mut out: Vec<Vec<SqlValue>> = Vec::with_capacity(32);
     let mut mem = DirectScanMemGuard::new(metered.then_some(meter.as_ref()));
-    // Pinned table leaf cache: `(leaf_pgno, min_rowid, max_rowid, last_hit_ci)`.
-    let mut pinned_leaf: Option<(u32, i64, i64, usize)> = None;
+    // Pinned table leaf cache: `(leaf_pgno, page_slice, min_rowid, max_rowid, last_hit_ci, last_hit_rid)`.
+    type PinnedLeaf<'a> = (u32, &'a [u8], i64, i64, usize, i64);
+    let mut pinned_leaf: Option<PinnedLeaf<'_>> = None;
     let mut stack_dec = [const { SqlValue::Null }; 32];
     let mut heap_dec: Vec<SqlValue> = Vec::new();
     let mut visited_count = 0u32;
-    let mut visited = HashSet::<u32>::new();
+    let mut visited_small = [0u32; 16];
+    let mut visited_small_len = 0usize;
+    let mut visited_overflow: Option<HashSet<u32>> = None;
 
     // Check cell at `(pgno, ci)`: returns `Ok(true)` if matched & emitted, `Ok(false)` to STOP scan!
     let mut emit_if_eq = |data: &[u8],
@@ -7762,11 +7846,31 @@ pub fn index_eq_scan_direct(
             owned_full.as_slice()
         };
 
-        if cmp_lead_payload(payload)? != Ordering::Equal {
+        // Fused 2-integer `(int_key, rowid)` comparison + rowid extraction in a single pass!
+        let mut fused_rid: Option<i64> = None;
+        if let (
+            SqlValue::Int(target_k),
+            DirectIndexEqMode::TableLookup { rid_idx_pos: 1, .. },
+        ) = (lookup_key, &mode)
+        {
+            if payload.len() >= 3 && payload[0] == 3 {
+                if let Some((k0, l0)) = decode_int_st_fast(payload[1], payload, 3) {
+                    if let Some((r1, l1)) = decode_int_st_fast(payload[2], payload, 3 + l0) {
+                        if 3 + l0 + l1 == payload.len() {
+                            if k0 != *target_k {
+                                return Ok(false);
+                            }
+                            fused_rid = Some(r1);
+                        }
+                    }
+                }
+            }
+        }
+        if fused_rid.is_none() && cmp_lead_payload(payload)? != Ordering::Equal {
             return Ok(false);
         }
 
-        match mode {
+        match &mode {
             DirectIndexEqMode::Covering(slots) => {
                 let row = decode_direct_index_payload(payload, slots, encoding, meter.as_ref())?;
                 if metered {
@@ -7780,33 +7884,12 @@ pub fn index_eq_scan_direct(
                 want_fields,
                 slots,
             } => {
-                // Fast-path 2-int index record rowid extraction (skips sparse decoder loop!).
-                let rid = if rid_idx_pos == 1 && payload.len() >= 3 && payload[0] == 3 {
-                    let fast_rid = decode_int_st_fast(payload[1], payload, 3)
-                        .and_then(|(_, l0)| decode_int_st_fast(payload[2], payload, 3 + l0))
-                        .and_then(|(r, l1)| {
-                            let l0 = serial_type_length(u32::from(payload[1]));
-                            (3 + l0 + l1 == payload.len()).then_some(r)
-                        });
-                    if let Some(r) = fast_rid {
-                        r
-                    } else {
-                        let mut one = [SqlValue::Null];
-                        let nf = decode_record_sparse_fields_into_metered(
-                            payload,
-                            encoding,
-                            &[rid_idx_pos],
-                            &mut one,
-                            meter.as_ref(),
-                        )?;
-                        if rid_idx_pos >= nf {
-                            return Err(SqliteError::corrupt("index record missing rowid"));
-                        }
-                        let SqlValue::Int(r) = one[0] else {
-                            return Err(SqliteError::corrupt("index record non-integer rowid"));
-                        };
-                        r
-                    }
+                let table_root = *table_root;
+                let rid_idx_pos = *rid_idx_pos;
+                let want_fields = *want_fields;
+                let slots = *slots;
+                let rid = if let Some(r) = fused_rid {
+                    r
                 } else {
                     let mut one = [SqlValue::Null];
                     let nf = decode_record_sparse_fields_into_metered(
@@ -7825,17 +7908,15 @@ pub fn index_eq_scan_direct(
                     r
                 };
 
-                // Look up `rid` on `table_root`, hitting `pinned_leaf` when on the same leaf page
-                // and returning `ldata` directly so we never call `read_page(leaf_pgno)` twice!
+                // Look up `rid` on `table_root`, hitting `pinned_leaf` directly on the pinned
+                // `&[u8]` slice (zero `read_page` call!) and narrowing binary search when monotonic!
                 let (leaf_pgno, ldata, hit_ci) =
-                    if let Some((lpg, min_r, max_r, last_ci)) = pinned_leaf {
+                    if let Some((lpg, ldata, min_r, max_r, last_ci, last_rid)) = pinned_leaf {
                         if rid >= min_r && rid <= max_r {
-                            let ldata = pager.read_page(lpg)?;
                             let lhdr = if lpg == 1 { HEADER_SIZE } else { 0 };
                             let lbound = (usable as usize).min(ldata.len());
                             let ln_cell = usize::from(read_u16_be(ldata, lhdr + 3));
                             let lptr = lhdr + 8;
-                            // O(1) peek at `last_ci + 1` for adjacent rows on the same leaf.
                             let mut found_ci = None;
                             if last_ci + 1 < ln_cell {
                                 let next_pc =
@@ -7854,11 +7935,39 @@ pub fn index_eq_scan_direct(
                             }
                             let ci = match found_ci {
                                 Some(c) => Some(c),
-                                None => table_leaf_binary_search(ldata, lpg, usable, rid)?.ok(),
+                                None => {
+                                    let mut lo = if rid > last_rid { last_ci + 1 } else { 0 };
+                                    let mut hi = if rid < last_rid { last_ci } else { ln_cell };
+                                    let mut hit = None;
+                                    while lo < hi {
+                                        let mid = lo + (hi - lo) / 2;
+                                        let pc = usize::from(read_u16_be(ldata, lptr + 2 * mid));
+                                        if pc >= lbound {
+                                            return Err(SqliteError::corrupt(format!(
+                                                "page {lpg}: leaf cell {mid} offset out of bounds"
+                                            )));
+                                        }
+                                        let (_, n1) = if ldata[pc] < 0x80 {
+                                            (u32::from(ldata[pc]), 1usize)
+                                        } else {
+                                            get_payload_size_varint(ldata, pc)
+                                        };
+                                        let (mr, _) = get_varint(ldata, pc + n1);
+                                        match mr.cmp(&rid) {
+                                            Ordering::Equal => {
+                                                hit = Some(mid);
+                                                break;
+                                            }
+                                            Ordering::Less => lo = mid + 1,
+                                            Ordering::Greater => hi = mid,
+                                        }
+                                    }
+                                    hit
+                                }
                             };
                             match ci {
                                 Some(c) => {
-                                    pinned_leaf = Some((lpg, min_r, max_r, c));
+                                    pinned_leaf = Some((lpg, ldata, min_r, max_r, c, rid));
                                     (lpg, ldata, c)
                                 }
                                 None => return Ok(true),
@@ -7900,7 +8009,7 @@ pub fn index_eq_scan_direct(
                                 )));
                             }
                             let (l_rid, _) = get_varint(ldata, last_pc + ln1);
-                            pinned_leaf = Some((lpg, f_rid, l_rid, c));
+                            pinned_leaf = Some((lpg, ldata, f_rid, l_rid, c, rid));
                             (lpg, ldata, c)
                         }
                     } else {
@@ -7939,7 +8048,7 @@ pub fn index_eq_scan_direct(
                             )));
                         }
                         let (l_rid, _) = get_varint(ldata, last_pc + ln1);
-                        pinned_leaf = Some((lpg, f_rid, l_rid, c));
+                        pinned_leaf = Some((lpg, ldata, f_rid, l_rid, c, rid));
                         (lpg, ldata, c)
                     };
 
@@ -8031,15 +8140,68 @@ pub fn index_eq_scan_direct(
         Ok(true)
     };
 
+    #[derive(Clone, Copy)]
     enum EqStep {
         Seek(u32, usize),
         ScanAll(u32, usize),
         InteriorFrom { pgno: u32, next_ci: usize, depth: usize },
     }
-    let mut stack: Vec<EqStep> = Vec::with_capacity(BTREE_MAX_DEPTH);
-    stack.push(EqStep::Seek(idx_root, 0));
+    let mut stack_buf = [EqStep::Seek(0, 0); 24];
+    let mut stack_len = 1usize;
+    stack_buf[0] = EqStep::Seek(idx_root, 0);
+    let mut stack_heap: Vec<EqStep> = Vec::new();
 
-    while let Some(step) = stack.pop() {
+    macro_rules! push_step {
+        ($st:expr) => {{
+            if stack_heap.is_empty() && stack_len < stack_buf.len() {
+                stack_buf[stack_len] = $st;
+                stack_len += 1;
+            } else {
+                stack_heap.push($st);
+            }
+        }};
+    }
+    macro_rules! pop_step {
+        () => {{
+            if let Some(st) = stack_heap.pop() {
+                Some(st)
+            } else if stack_len > 0 {
+                stack_len -= 1;
+                Some(stack_buf[stack_len])
+            } else {
+                None
+            }
+        }};
+    }
+    macro_rules! visit_pg {
+        ($pgno:expr) => {{
+            visited_count = visited_count.saturating_add(1);
+            let fresh = if let Some(ref mut set) = visited_overflow {
+                set.insert($pgno)
+            } else if visited_small[..visited_small_len].contains(&$pgno) {
+                false
+            } else if visited_small_len < visited_small.len() {
+                visited_small[visited_small_len] = $pgno;
+                visited_small_len += 1;
+                true
+            } else {
+                let mut set = HashSet::with_capacity(32);
+                for &p in &visited_small[..visited_small_len] {
+                    set.insert(p);
+                }
+                let ok = set.insert($pgno);
+                visited_overflow = Some(set);
+                ok
+            };
+            if visited_count > page_count || !fresh {
+                return Err(SqliteError::corrupt(format!(
+                    "index B-tree {idx_root} contains a cycle"
+                )));
+            }
+        }};
+    }
+
+    while let Some(step) = pop_step!() {
         match step {
             EqStep::InteriorFrom {
                 pgno,
@@ -8066,24 +8228,19 @@ pub fn index_eq_scan_direct(
                         )));
                     }
                     let next_left = read_u32_be(data, next_pc);
-                    stack.push(EqStep::InteriorFrom {
+                    push_step!(EqStep::InteriorFrom {
                         pgno,
                         next_ci: next_ci + 1,
                         depth,
                     });
-                    stack.push(EqStep::ScanAll(next_left, depth + 1));
+                    push_step!(EqStep::ScanAll(next_left, depth + 1));
                 } else {
                     let right_child = read_u32_be(data, hdr + 8);
-                    stack.push(EqStep::ScanAll(right_child, depth + 1));
+                    push_step!(EqStep::ScanAll(right_child, depth + 1));
                 }
             }
             EqStep::Seek(pgno, depth) => {
-                visited_count = visited_count.saturating_add(1);
-                if visited_count > page_count || !visited.insert(pgno) {
-                    return Err(SqliteError::corrupt(format!(
-                        "index B-tree {idx_root} contains a cycle"
-                    )));
-                }
+                visit_pg!(pgno);
                 if depth >= BTREE_MAX_DEPTH {
                     return Err(SqliteError::corrupt(format!(
                         "index B-tree {idx_root} exceeds max depth"
@@ -8155,15 +8312,15 @@ pub fn index_eq_scan_direct(
                                 )));
                             }
                             let left_child = read_u32_be(data, pc);
-                            stack.push(EqStep::InteriorFrom {
+                            push_step!(EqStep::InteriorFrom {
                                 pgno,
                                 next_ci: lo,
                                 depth,
                             });
-                            stack.push(EqStep::Seek(left_child, depth + 1));
+                            push_step!(EqStep::Seek(left_child, depth + 1));
                         } else {
                             let right_child = read_u32_be(data, hdr + 8);
-                            stack.push(EqStep::Seek(right_child, depth + 1));
+                            push_step!(EqStep::Seek(right_child, depth + 1));
                         }
                     }
                     _ => {
@@ -8175,12 +8332,7 @@ pub fn index_eq_scan_direct(
                 }
             }
             EqStep::ScanAll(pgno, depth) => {
-                visited_count = visited_count.saturating_add(1);
-                if visited_count > page_count || !visited.insert(pgno) {
-                    return Err(SqliteError::corrupt(format!(
-                        "index B-tree {idx_root} contains a cycle"
-                    )));
-                }
+                visit_pg!(pgno);
                 if depth >= BTREE_MAX_DEPTH {
                     return Err(SqliteError::corrupt(format!(
                         "index B-tree {idx_root} exceeds max depth"
@@ -8231,15 +8383,15 @@ pub fn index_eq_scan_direct(
                                 )));
                             }
                             let left_child = read_u32_be(data, pc);
-                            stack.push(EqStep::InteriorFrom {
+                            push_step!(EqStep::InteriorFrom {
                                 pgno,
                                 next_ci: 0,
                                 depth,
                             });
-                            stack.push(EqStep::ScanAll(left_child, depth + 1));
+                            push_step!(EqStep::ScanAll(left_child, depth + 1));
                         } else {
                             let right_child = read_u32_be(data, hdr + 8);
-                            stack.push(EqStep::ScanAll(right_child, depth + 1));
+                            push_step!(EqStep::ScanAll(right_child, depth + 1));
                         }
                     }
                     _ => {

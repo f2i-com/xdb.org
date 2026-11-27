@@ -2412,3 +2412,272 @@ fn test_pass9_audit_having_in_collation_kbn_utf16_hash_metering_and_subq_validat
     assert_eq_val(&gres.rows[1][2], &SqlValue::Int(20), "group sum");
     assert_eq_val(&gres.rows[1][3], &SqlValue::Real(20.0), "group avg");
 }
+
+#[test]
+fn test_pass10_audit_ctes_compounds_windows_case_math_date_json_utf16_and_metering() {
+    use xdb_core::TextEncoding;
+
+    let mut cat = MemoryCatalog::new();
+    cat.add_table(
+        "t",
+        vec![
+            ColumnMeta::simple("id", Affinity::Integer),
+            ColumnMeta::simple("x", Affinity::Integer),
+            ColumnMeta::simple("s", Affinity::Text),
+        ],
+        vec![
+            vec![SqlValue::Int(1), SqlValue::Int(10), SqlValue::text("a")],
+            vec![SqlValue::Int(2), SqlValue::Int(20), SqlValue::text("b")],
+            vec![SqlValue::Int(3), SqlValue::Int(30), SqlValue::text("c")],
+        ],
+    );
+
+    // 1. Recursive CTE without `RECURSIVE`, inner `WITH`, `ORDER BY` against `base_cols`,
+    //    subquery/circular self-reference errors, and inner-`WITH` shadowing!
+    let r1 = run(
+        &cat,
+        "WITH c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) SELECT n FROM c",
+    );
+    assert_eq!(r1.rows.len(), 4);
+    assert_eq_val(&r1.rows[3][0], &SqlValue::Int(4), "recursive without RECURSIVE");
+
+    let r2 = run(
+        &cat,
+        "WITH RECURSIVE c(n) AS (WITH seed(v) AS (SELECT 10) SELECT v FROM seed UNION ALL SELECT n + 1 FROM c WHERE n < 12) SELECT n FROM c",
+    );
+    assert_eq!(r2.rows.len(), 3);
+    assert_eq_val(&r2.rows[0][0], &SqlValue::Int(10), "inner WITH in recursive CTE");
+    assert_eq_val(&r2.rows[2][0], &SqlValue::Int(12), "inner WITH in recursive CTE end");
+
+    let r3 = run(
+        &cat,
+        "WITH RECURSIVE c(a, b) AS (SELECT 1 AS p, 10 AS q UNION ALL SELECT a + 1, b + 10 FROM c WHERE a < 3 ORDER BY p DESC) SELECT a, b FROM c",
+    );
+    assert_eq!(r3.rows.len(), 3);
+
+    for bad_cte in [
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT * FROM c) WHERE n < 3) SELECT * FROM c",
+        "WITH c(n) AS (SELECT * FROM c) SELECT * FROM c",
+    ] {
+        assert!(
+            execute_query(&cat, bad_cte, &QueryParams::empty(), &QueryOptions::default()).is_err(),
+            "expected circular/subquery recursive CTE error for `{bad_cte}`"
+        );
+    }
+    let shadow = run(
+        &cat,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 AND EXISTS (WITH c(y) AS (SELECT 99) SELECT y FROM c)) SELECT n FROM c",
+    );
+    assert_eq!(shadow.rows.len(), 3);
+
+    // 2. Compound `ORDER BY`: right-branch alias, stacked `COLLATE` on ordinal, reject expressions!
+    let cmp1 = run(&cat, "SELECT 1 AS a UNION ALL SELECT 2 AS b ORDER BY b DESC");
+    assert_eq_val(&cmp1.rows[0][0], &SqlValue::Int(2), "compound ORDER BY right alias");
+    let cmp2 = run(
+        &cat,
+        "SELECT 'b' UNION ALL SELECT 'A' ORDER BY 1 COLLATE BINARY COLLATE NOCASE",
+    );
+    assert_eq_val(&cmp2.rows[0][0], &SqlValue::text("A"), "compound stacked COLLATE ordinal");
+    assert!(execute_query(
+        &cat,
+        "SELECT 1 AS a UNION ALL SELECT 2 AS a ORDER BY a + 1",
+        &QueryParams::empty(),
+        &QueryOptions::default()
+    )
+    .is_err());
+
+    // 3. `HAVING` with window-internal agg, unused `WINDOW`, `ORDER BY count(*)`, `GROUP BY cnt COLLATE`!
+    assert!(execute_query(
+        &cat,
+        "SELECT sum(x) OVER () FROM t HAVING 1",
+        &QueryParams::empty(),
+        &QueryOptions::default()
+    )
+    .is_err());
+    let unused_win = run(&cat, "SELECT id FROM t WINDOW w AS (ORDER BY id)");
+    assert_eq!(unused_win.rows.len(), 3);
+    let ord_agg_err = execute_query(
+        &cat,
+        "SELECT id FROM t ORDER BY count(*)",
+        &QueryParams::empty(),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(ord_agg_err.to_string().contains("misuse of aggregate"));
+    assert!(execute_query(
+        &cat,
+        "SELECT count(*) AS cnt FROM t GROUP BY cnt COLLATE NOCASE",
+        &QueryParams::empty(),
+        &QueryOptions::default()
+    )
+    .is_err());
+
+    // 4. Row-value simple `CASE` and 1-element vs 2-element row-value `IN` affinity!
+    assert_eq_val(
+        &scalar("SELECT CASE (1, 2) WHEN (1, 3) THEN 'no' WHEN (1, 2) THEN 'yes' ELSE 'other' END"),
+        &SqlValue::text("yes"),
+        "row-value simple CASE match",
+    );
+    assert_eq_val(
+        &scalar("SELECT CASE (1, NULL) WHEN (1, NULL) THEN 'no' ELSE 'else' END"),
+        &SqlValue::text("else"),
+        "row-value simple CASE NULL non-match",
+    );
+    assert_eq_val(
+        &run(&cat, "SELECT ('10', 1) IN ((x, 1)) FROM t WHERE id = 1").rows[0][0],
+        &SqlValue::Int(1),
+        "1-item row-value IN applies INTEGER column affinity",
+    );
+    assert_eq_val(
+        &run(&cat, "SELECT ('10', 1) IN ((x, 1), (99, 2)) FROM t WHERE id = 1").rows[0][0],
+        &SqlValue::Int(0),
+        "2-item row-value IN does not inherit RHS column affinity",
+    );
+
+    // 5. Window `lag`/`lead` fractional offset & `range_bound` crossing `2^52`!
+    let frac_lag = run(&cat, "SELECT lag(x, 1.5, 99) OVER (ORDER BY id) FROM t");
+    for r in &frac_lag.rows {
+        assert_eq_val(&r[0], &SqlValue::Int(99), "fractional lag returns default");
+    }
+    let rb52 = run(
+        &cat,
+        "WITH v(x) AS (VALUES (4503599627370495.5), (4503599627370497)) \
+         SELECT x, count(*) OVER (ORDER BY x RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM v",
+    );
+    assert_eq_val(&rb52.rows[1][1], &SqlValue::Int(2), "range_bound crosses 2^52 cleanly");
+
+    // 6. `ceil`/`floor`/`trunc` integer preservation, `concat`/`concat_ws` arity, date sign, `U+FFFE`!
+    assert_eq_val(&scalar("SELECT typeof(ceil(5))"), &SqlValue::text("integer"), "ceil(5) int");
+    assert_eq_val(&scalar("SELECT typeof(floor('5'))"), &SqlValue::text("integer"), "floor('5') int");
+    assert_eq_val(&scalar("SELECT typeof(trunc(5.0))"), &SqlValue::text("real"), "trunc(5.0) real");
+    assert_eq_val(&scalar("SELECT typeof(ceil('5.0'))"), &SqlValue::text("real"), "ceil('5.0') real");
+    assert_eq_val(
+        &scalar("SELECT ceil('9007199254740993')"),
+        &SqlValue::Int(9_007_199_254_740_993),
+        "ceil exact large int text",
+    );
+    assert!(execute_query(&cat, "SELECT concat()", &QueryParams::empty(), &QueryOptions::default()).is_err());
+    assert!(execute_query(&cat, "SELECT concat_ws(',')", &QueryParams::empty(), &QueryOptions::default()).is_err());
+    assert_eq_val(&scalar("SELECT concat('ok')"), &SqlValue::text("ok"), "concat 1 arg");
+    assert_eq_val(&scalar("SELECT concat_ws(',', 'ok')"), &SqlValue::text("ok"), "concat_ws 2 args");
+    assert_eq_val(
+        &scalar("SELECT datetime('-0005-12-31 24:00:00')"),
+        &SqlValue::text("-0004-01-01 00:00:00"),
+        "negative year 24:00:00 rollover",
+    );
+    assert_eq_val(
+        &scalar("SELECT date('2024-01-01', 'weekday 1e-0')"),
+        &SqlValue::text("2024-01-01"),
+        "weekday positive scientific notation",
+    );
+    assert_eq_val(
+        &scalar("SELECT unicode(CAST(X'EFBFBE' AS TEXT))"),
+        &SqlValue::Int(0xFFFD),
+        "U+FFFE -> U+FFFD",
+    );
+    assert_eq_val(
+        &scalar("SELECT unicode(CAST(X'EFBFBF' AS TEXT))"),
+        &SqlValue::Int(0xFFFD),
+        "U+FFFF -> U+FFFD",
+    );
+
+    // 7. JSON raw non-UTF-8 string bytes, trailing token error position, lazy paths, 0-arg & eponymous TVFs!
+    assert_eq_val(
+        &scalar("SELECT json_valid(CAST(X'22FF22' AS TEXT))"),
+        &SqlValue::Int(1),
+        "raw non-UTF-8 byte in JSON string valid",
+    );
+    assert_eq_val(
+        &scalar("SELECT json_error_position('1 2')"),
+        &SqlValue::Int(1),
+        "json_error_position trailing token returns 1",
+    );
+    assert_eq_val(
+        &scalar(r#"SELECT json_type('{"a":[1,2,3],"b":{"c":4}}', '$.b.c')"#),
+        &SqlValue::text("integer"),
+        "lazy json_type path",
+    );
+    assert_eq_val(
+        &scalar(r#"SELECT json_array_length('{"a":[1,2,3]}', '$.a')"#),
+        &SqlValue::Int(3),
+        "lazy json_array_length path",
+    );
+    assert_eq_val(
+        &scalar(r#"SELECT json_set('{"a":1,"b":2}', '$.a', 99)"#),
+        &SqlValue::text(r#"{"a":99,"b":2}"#),
+        "lazy json_set path",
+    );
+    assert_eq_val(
+        &scalar(r#"SELECT json_remove('{"a":1,"b":2}', '$.a')"#),
+        &SqlValue::text(r#"{"b":2}"#),
+        "lazy json_remove path",
+    );
+    assert!(run(&cat, "SELECT value FROM json_each()").rows.is_empty());
+    assert!(run(&cat, "SELECT value FROM json_tree()").rows.is_empty());
+    assert!(run(&cat, "SELECT key, value FROM json_each").rows.is_empty());
+    assert!(run(&cat, "SELECT key, value FROM json_tree").rows.is_empty());
+
+    // 8. `generate_series` LIMIT cap pushdown under tight step meter!
+    let gs_opts = QueryOptions {
+        meter: Some(Arc::new(BudgetMeter::new(ResourceLimits {
+            max_steps: Some(500),
+            max_memory_bytes: Some(64 * 1024),
+            max_page_reads: None,
+        }))),
+        ..QueryOptions::default()
+    };
+    let gs = execute_query(
+        &cat,
+        "SELECT value FROM generate_series(1) LIMIT 3",
+        &QueryParams::empty(),
+        &gs_opts,
+    )
+    .unwrap();
+    assert_eq!(gs.rows.len(), 3);
+    assert_eq_val(&gs.rows[2][0], &SqlValue::Int(3), "generate_series capped by LIMIT 3");
+
+    // 9. UTF-16LE/BE BLOB arithmetic, negation, and boolean coercion through SQL eval!
+    let u16le_opts = QueryOptions {
+        collations: xdb_core::value::CollationRegistry::new(TextEncoding::Utf16Le),
+        ..QueryOptions::default()
+    };
+    let u16_res = execute_query(
+        &cat,
+        "SELECT X'34003200' + 8, -X'34003200', CASE WHEN X'3100' THEN 1 ELSE 0 END",
+        &QueryParams::empty(),
+        &u16le_opts,
+    )
+    .unwrap();
+    assert_eq_val(&u16_res.rows[0][0], &SqlValue::Int(50), "UTF-16LE BLOB + 8");
+    assert_eq_val(&u16_res.rows[0][1], &SqlValue::Int(-42), "UTF-16LE -BLOB");
+    assert_eq_val(&u16_res.rows[0][2], &SqlValue::Int(1), "UTF-16LE BLOB boolean");
+
+    // 10. Window frame `acc.heap_bytes()` & CTE clone metering under tight memory budget!
+    let big_rows: Vec<Vec<SqlValue>> = (0..120)
+        .map(|i| vec![SqlValue::Int(i), SqlValue::text("w".repeat(64))])
+        .collect();
+    cat.add_table(
+        "wm",
+        vec![
+            ColumnMeta::simple("id", Affinity::Integer),
+            ColumnMeta::simple("s", Affinity::Text),
+        ],
+        big_rows,
+    );
+    let tight_w = QueryOptions {
+        meter: Some(Arc::new(BudgetMeter::new(ResourceLimits {
+            max_memory_bytes: Some(4096),
+            max_steps: Some(1_000_000),
+            max_page_reads: None,
+        }))),
+        ..QueryOptions::default()
+    };
+    let w_err = execute_query(
+        &cat,
+        "SELECT group_concat(s) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wm",
+        &QueryParams::empty(),
+        &tight_w,
+    )
+    .unwrap_err();
+    assert!(matches!(w_err, SqlError::ResourceLimit(e) if e.kind == LimitKind::Memory));
+}
