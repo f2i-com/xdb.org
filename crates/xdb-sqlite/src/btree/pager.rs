@@ -176,7 +176,7 @@ impl Pager {
             return Ok(());
         }
         inner.stats.misses += 1;
-        Self::insert_locked(inner, pgno, data, self.db.page_size as u64)
+        Self::insert_locked(inner, pgno, data, None, self.db.page_size as u64)
     }
 
     /// Shared immutable bytes of page `pgno`.
@@ -225,13 +225,27 @@ impl Pager {
             }
             return Ok(parsed);
         }
-        // Cache miss: load page bytes, parse, and store parsed BtreePage in single insertion.
-        inner.tick -= 1;
-        let data = Self::fetch_page_locked(inner, pgno, self.db.page_size)?;
-        let parsed = Arc::new(BtreePage::parse(pgno, data, &self.db)?);
-        if let Some(entry) = inner.cache.get_mut(&pgno) {
-            entry.btree = Some(parsed.clone());
+        // Cache miss: load page bytes, parse BtreePage, and insert both in a single cache insert!
+        if !inner.noop_meter {
+            inner.meter.charge_page_reads(1)?;
         }
+        inner.stats.misses += 1;
+        let arc = inner.source.read_page_shared(pgno)?;
+        if arc.len() != self.db.page_size as usize {
+            return Err(SqliteError::corrupt(format!(
+                "PageSource returned {} bytes for page {pgno}, expected {}",
+                arc.len(),
+                self.db.page_size
+            )));
+        }
+        let parsed = Arc::new(BtreePage::parse(pgno, arc.clone(), &self.db)?);
+        Self::insert_locked(
+            inner,
+            pgno,
+            arc,
+            Some(parsed.clone()),
+            u64::from(self.db.page_size),
+        )?;
         Ok(parsed)
     }
 
@@ -273,7 +287,7 @@ impl Pager {
                 arc.len()
             )));
         }
-        Self::insert_locked(inner, pgno, arc.clone(), u64::from(page_size))?;
+        Self::insert_locked(inner, pgno, arc.clone(), None, u64::from(page_size))?;
         Ok(arc)
     }
 
@@ -281,6 +295,7 @@ impl Pager {
         inner: &mut PagerInner,
         pgno: u32,
         data: Arc<[u8]>,
+        btree: Option<Arc<BtreePage>>,
         page_bytes: u64,
     ) -> SqliteResult<()> {
         if inner.cache.len() >= inner.capacity {
@@ -317,11 +332,7 @@ impl Pager {
         let tick = inner.tick;
         inner.cache.insert(
             pgno,
-            CacheEntry {
-                data,
-                btree: None,
-                tick,
-            },
+            CacheEntry { data, btree, tick },
         );
         inner.lru.push_back((pgno, tick));
         Ok(())

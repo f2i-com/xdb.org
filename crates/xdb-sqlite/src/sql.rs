@@ -14,6 +14,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use xdb_core::value::{mem_compare, BuiltinCollation, Collation, CollationRegistry, TextEncoding};
@@ -107,16 +108,26 @@ fn map_sqlite_err(e: SqliteError) -> SqlError {
 pub(crate) struct SqliteSqlCatalog<'a> {
     db: &'a SqliteDatabase,
     options: &'a QueryOptions,
+    in_table_list: AtomicBool,
+    in_table_info: AtomicBool,
 }
 
 pub(crate) fn live_catalog_for<'a>(
     db: &'a SqliteDatabase,
     options: &'a QueryOptions,
 ) -> SqliteSqlCatalog<'a> {
-    SqliteSqlCatalog { db, options }
+    SqliteSqlCatalog::new(db, options)
 }
 
 impl<'a> SqliteSqlCatalog<'a> {
+    fn new(db: &'a SqliteDatabase, options: &'a QueryOptions) -> Self {
+        Self {
+            db,
+            options,
+            in_table_list: AtomicBool::new(false),
+            in_table_info: AtomicBool::new(false),
+        }
+    }
     fn check_schema(schema: Option<&str>) -> bool {
         match schema {
             None => true,
@@ -161,6 +172,7 @@ impl<'a> SqliteSqlCatalog<'a> {
                     key_collations,
                     key_desc,
                     partial: idx.partial,
+                    where_clause: idx.definition.where_clause.clone(),
                 }
             })
             .collect();
@@ -1425,15 +1437,30 @@ impl<'a> SqliteSqlCatalog<'a> {
         Ok(Some(rows))
     }
 
-    fn eval_pragma_tvf(&self, lower_name: &str, args: &[SqlValue]) -> SqlResult<Option<TableValuedResult>> {
+    fn eval_pragma_tvf(
+        &self,
+        lower_name: &str,
+        args: &[SqlValue],
+        meter: Option<&dyn Meter>,
+    ) -> SqlResult<Option<TableValuedResult>> {
         let arg_str = |idx: usize| -> Option<String> {
             args.get(idx).and_then(|v| {
                 xdb_sql::utf8::text_bytes_of(v).map(|b| String::from_utf8_lossy(&b).into_owned())
             })
         };
 
+        let check_schema_arg = |idx: usize| -> SqlResult<()> {
+            if let Some(s) = arg_str(idx) {
+                if !s.is_empty() && !Self::check_schema(Some(&s)) {
+                    return Err(SqlError::runtime(format!("unknown database '{s}'")));
+                }
+            }
+            Ok(())
+        };
+
         match lower_name {
             "pragma_table_info" | "pragma_table_xinfo" => {
+                check_schema_arg(1)?;
                 let include_hidden = lower_name == "pragma_table_xinfo";
                 let mut columns = vec![
                     "cid".to_string(),
@@ -1452,43 +1479,83 @@ impl<'a> SqliteSqlCatalog<'a> {
                         rows: Vec::new(),
                     }));
                 };
-                let Some(table) = self.db.schema().table(&tname) else {
-                    return Ok(Some(TableValuedResult {
-                        columns,
-                        rows: Vec::new(),
-                    }));
-                };
-                let mut rows = Vec::new();
-                let mut visible_cid = 0i64;
-                for col in &table.columns {
-                    if !include_hidden && col.hidden != ColumnHiddenKind::Normal {
-                        continue;
+                if let Some(table) = self.db.schema().table(&tname) {
+                    let mut rows = Vec::new();
+                    let mut visible_cid = 0i64;
+                    for col in &table.columns {
+                        if !include_hidden && col.hidden != ColumnHiddenKind::Normal {
+                            continue;
+                        }
+                        let cid_val = if include_hidden {
+                            col.cid as i64
+                        } else {
+                            let c = visible_cid;
+                            visible_cid += 1;
+                            c
+                        };
+                        let mut row = vec![
+                            SqlValue::Int(cid_val),
+                            SqlValue::text(col.name.as_str()),
+                            SqlValue::text(col.decl_type.as_str()),
+                            SqlValue::Int(i64::from(col.not_null)),
+                            col.default_sql
+                                .as_deref()
+                                .map_or(SqlValue::Null, SqlValue::text),
+                            SqlValue::Int(col.pk as i64),
+                        ];
+                        if include_hidden {
+                            row.push(SqlValue::Int(i64::from(col.hidden as u8)));
+                        }
+                        rows.push(row);
                     }
-                    let cid_val = if include_hidden {
-                        col.cid as i64
-                    } else {
-                        let c = visible_cid;
-                        visible_cid += 1;
-                        c
-                    };
-                    let mut row = vec![
-                        SqlValue::Int(cid_val),
-                        SqlValue::text(col.name.as_str()),
-                        SqlValue::text(col.decl_type.as_str()),
-                        SqlValue::Int(i64::from(col.not_null)),
-                        col.default_sql
-                            .as_deref()
-                            .map_or(SqlValue::Null, SqlValue::text),
-                        SqlValue::Int(col.pk as i64),
-                    ];
-                    if include_hidden {
-                        row.push(SqlValue::Int(i64::from(col.hidden as u8)));
-                    }
-                    rows.push(row);
+                    return Ok(Some(TableValuedResult { columns, rows }));
                 }
-                Ok(Some(TableValuedResult { columns, rows }))
+                if let Some(view) = self.db.schema().view(&tname) {
+                    if self.in_table_info.swap(true, AtomicOrdering::AcqRel) {
+                        return Ok(Some(TableValuedResult {
+                            columns,
+                            rows: Vec::new(),
+                        }));
+                    }
+                    struct TableInfoGuard<'b>(&'b AtomicBool);
+                    impl Drop for TableInfoGuard<'_> {
+                        fn drop(&mut self) {
+                            self.0.store(false, AtomicOrdering::Release);
+                        }
+                    }
+                    let _ti_guard = TableInfoGuard(&self.in_table_info);
+                    let mut visiting = vec![view.name.to_ascii_lowercase()];
+                    let vcols = self.infer_view_cols(
+                        &view.sql,
+                        view.column_names.as_deref(),
+                        &mut visiting,
+                        meter,
+                        true,
+                    )?;
+                    let mut rows = Vec::with_capacity(vcols.len());
+                    for (cid, (cname, ctype)) in vcols.into_iter().enumerate() {
+                        let mut row = vec![
+                            SqlValue::Int(cid as i64),
+                            SqlValue::text(cname),
+                            SqlValue::text(ctype),
+                            SqlValue::Int(0),
+                            SqlValue::Null,
+                            SqlValue::Int(0),
+                        ];
+                        if include_hidden {
+                            row.push(SqlValue::Int(0));
+                        }
+                        rows.push(row);
+                    }
+                    return Ok(Some(TableValuedResult { columns, rows }));
+                }
+                Ok(Some(TableValuedResult {
+                    columns,
+                    rows: Vec::new(),
+                }))
             }
             "pragma_index_list" => {
+                check_schema_arg(1)?;
                 let columns = vec![
                     "seq".to_string(),
                     "name".to_string(),
@@ -1526,6 +1593,7 @@ impl<'a> SqliteSqlCatalog<'a> {
                 Ok(Some(TableValuedResult { columns, rows }))
             }
             "pragma_index_info" | "pragma_index_xinfo" => {
+                check_schema_arg(1)?;
                 let extended = lower_name == "pragma_index_xinfo";
                 let mut columns = vec![
                     "seqno".to_string(),
@@ -1576,6 +1644,7 @@ impl<'a> SqliteSqlCatalog<'a> {
                 Ok(Some(TableValuedResult { columns, rows }))
             }
             "pragma_foreign_key_list" => {
+                check_schema_arg(1)?;
                 let columns = vec![
                     "id".to_string(),
                     "seq".to_string(),
@@ -1636,6 +1705,7 @@ impl<'a> SqliteSqlCatalog<'a> {
                 Ok(Some(TableValuedResult { columns, rows }))
             }
             "pragma_table_list" => {
+                check_schema_arg(1)?;
                 let columns = vec![
                     "schema".to_string(),
                     "name".to_string(),
@@ -1644,6 +1714,19 @@ impl<'a> SqliteSqlCatalog<'a> {
                     "wr".to_string(),
                     "strict".to_string(),
                 ];
+                if self.in_table_list.swap(true, AtomicOrdering::AcqRel) {
+                    return Ok(Some(TableValuedResult {
+                        columns,
+                        rows: Vec::new(),
+                    }));
+                }
+                struct TableListGuard<'b>(&'b AtomicBool);
+                impl Drop for TableListGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, AtomicOrdering::Release);
+                    }
+                }
+                let _tl_guard = TableListGuard(&self.in_table_list);
                 let filter = arg_str(0);
                 let matches_filter = |n: &str| {
                     filter
@@ -1683,7 +1766,18 @@ impl<'a> SqliteSqlCatalog<'a> {
                     if !matches_filter(&v.name) {
                         continue;
                     }
-                    let ncol = v.column_names.as_ref().map_or(0, |c| c.len());
+                    let mut visiting = vec![v.name.to_ascii_lowercase()];
+                    let ncol = match self.infer_view_cols(
+                        &v.sql,
+                        v.column_names.as_deref(),
+                        &mut visiting,
+                        meter,
+                        true,
+                    ) {
+                        Ok(cols) => cols.len(),
+                        Err(SqlError::ResourceLimit(rl)) => return Err(SqlError::ResourceLimit(rl)),
+                        Err(_) => 0,
+                    };
                     rows.push(vec![
                         SqlValue::text("main"),
                         SqlValue::text(v.name.as_str()),
@@ -1708,7 +1802,784 @@ impl<'a> SqliteSqlCatalog<'a> {
                 }
                 Ok(Some(TableValuedResult { columns, rows }))
             }
+            "pragma_foreign_key_check" => {
+                check_schema_arg(1)?;
+                let columns = vec![
+                    "table".to_string(),
+                    "rowid".to_string(),
+                    "parent".to_string(),
+                    "fkid".to_string(),
+                ];
+                let filter = arg_str(0);
+                let rows = crate::write::fk::collect_fk_violations_db(
+                    self.db,
+                    filter.as_deref(),
+                    self.options,
+                )
+                .map_err(map_sqlite_err)?;
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
+            "pragma_collation_list" => {
+                let columns = vec!["seq".to_string(), "name".to_string()];
+                let mut rows = vec![
+                    vec![SqlValue::Int(0), SqlValue::text("RTRIM")],
+                    vec![SqlValue::Int(1), SqlValue::text("NOCASE")],
+                    vec![SqlValue::Int(2), SqlValue::text("BINARY")],
+                ];
+                for cname in self.options.collations.custom_names() {
+                    let seq = rows.len() as i64;
+                    rows.push(vec![SqlValue::Int(seq), SqlValue::text(cname)]);
+                }
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
+            "pragma_compile_options" => {
+                let columns = vec!["compile_options".to_string()];
+                let rows = xdb_sql::functions::core::COMPILE_OPTIONS
+                    .iter()
+                    .map(|&opt| vec![SqlValue::text(opt)])
+                    .collect();
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
+            "pragma_pragma_list" => {
+                let columns = vec!["name".to_string()];
+                let names = [
+                    "application_id",
+                    "auto_vacuum",
+                    "busy_timeout",
+                    "case_sensitive_like",
+                    "collation_list",
+                    "compile_options",
+                    "data_version",
+                    "database_list",
+                    "defer_foreign_keys",
+                    "encoding",
+                    "foreign_key_check",
+                    "foreign_key_list",
+                    "foreign_keys",
+                    "freelist_count",
+                    "function_list",
+                    "ignore_check_constraints",
+                    "index_info",
+                    "index_list",
+                    "index_xinfo",
+                    "integrity_check",
+                    "journal_mode",
+                    "page_count",
+                    "page_size",
+                    "pragma_list",
+                    "query_only",
+                    "quick_check",
+                    "recursive_triggers",
+                    "schema_version",
+                    "synchronous",
+                    "table_info",
+                    "table_list",
+                    "table_xinfo",
+                    "user_version",
+                ];
+                let rows = names
+                    .into_iter()
+                    .map(|n| vec![SqlValue::text(n)])
+                    .collect();
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
+            "pragma_function_list" => {
+                let columns = vec![
+                    "name".to_string(),
+                    "builtin".to_string(),
+                    "type".to_string(),
+                    "enc".to_string(),
+                    "narg".to_string(),
+                    "flags".to_string(),
+                ];
+                // Built-in SQLite + JSON1 + math + date + aggregate + window + TVF catalog.
+                let builtins: &[(&str, &str, i64)] = &[
+                    // Core scalar functions
+                    ("abs", "s", 1),
+                    ("changes", "s", 0),
+                    ("char", "s", -1),
+                    ("coalesce", "s", -1),
+                    ("concat", "s", -1),
+                    ("concat_ws", "s", -1),
+                    ("format", "s", -1),
+                    ("glob", "s", 2),
+                    ("hex", "s", 1),
+                    ("if", "s", -1),
+                    ("ifnull", "s", 2),
+                    ("iif", "s", -1),
+                    ("instr", "s", 2),
+                    ("last_insert_rowid", "s", 0),
+                    ("length", "s", 1),
+                    ("like", "s", 2),
+                    ("like", "s", 3),
+                    ("likelihood", "s", 2),
+                    ("likely", "s", 1),
+                    ("lower", "s", 1),
+                    ("ltrim", "s", 1),
+                    ("ltrim", "s", 2),
+                    ("max", "s", -1),
+                    ("min", "s", -1),
+                    ("nullif", "s", 2),
+                    ("octet_length", "s", 1),
+                    ("printf", "s", -1),
+                    ("quote", "s", 1),
+                    ("random", "s", 0),
+                    ("randomblob", "s", 1),
+                    ("replace", "s", 3),
+                    ("round", "s", 1),
+                    ("round", "s", 2),
+                    ("rtrim", "s", 1),
+                    ("rtrim", "s", 2),
+                    ("sign", "s", 1),
+                    ("sqlite_compileoption_get", "s", 1),
+                    ("sqlite_compileoption_used", "s", 1),
+                    ("sqlite_source_id", "s", 0),
+                    ("sqlite_version", "s", 0),
+                    ("substr", "s", 2),
+                    ("substr", "s", 3),
+                    ("substring", "s", 2),
+                    ("substring", "s", 3),
+                    ("total_changes", "s", 0),
+                    ("trim", "s", 1),
+                    ("trim", "s", 2),
+                    ("typeof", "s", 1),
+                    ("unhex", "s", 1),
+                    ("unhex", "s", 2),
+                    ("unicode", "s", 1),
+                    ("unistr", "s", 1),
+                    ("unistr_quote", "s", 1),
+                    ("unlikely", "s", 1),
+                    ("upper", "s", 1),
+                    ("zeroblob", "s", 1),
+                    // Math functions
+                    ("acos", "s", 1),
+                    ("acosh", "s", 1),
+                    ("asin", "s", 1),
+                    ("asinh", "s", 1),
+                    ("atan", "s", 1),
+                    ("atan2", "s", 2),
+                    ("atanh", "s", 1),
+                    ("ceil", "s", 1),
+                    ("ceiling", "s", 1),
+                    ("cos", "s", 1),
+                    ("cosh", "s", 1),
+                    ("degrees", "s", 1),
+                    ("exp", "s", 1),
+                    ("floor", "s", 1),
+                    ("ln", "s", 1),
+                    ("log", "s", 1),
+                    ("log", "s", 2),
+                    ("log10", "s", 1),
+                    ("log2", "s", 1),
+                    ("mod", "s", 2),
+                    ("pi", "s", 0),
+                    ("pow", "s", 2),
+                    ("power", "s", 2),
+                    ("radians", "s", 1),
+                    ("sin", "s", 1),
+                    ("sinh", "s", 1),
+                    ("sqrt", "s", 1),
+                    ("tan", "s", 1),
+                    ("tanh", "s", 1),
+                    ("trunc", "s", 1),
+                    // Date / Time functions
+                    ("date", "s", -1),
+                    ("datetime", "s", -1),
+                    ("julianday", "s", -1),
+                    ("strftime", "s", -1),
+                    ("time", "s", -1),
+                    ("timediff", "s", 2),
+                    ("unixepoch", "s", -1),
+                    // JSON functions
+                    ("json", "s", 1),
+                    ("json_array", "s", -1),
+                    ("json_array_length", "s", 1),
+                    ("json_array_length", "s", 2),
+                    ("json_error_position", "s", 1),
+                    ("json_extract", "s", -1),
+                    ("json_insert", "s", -1),
+                    ("json_object", "s", -1),
+                    ("json_patch", "s", 2),
+                    ("json_pretty", "s", 1),
+                    ("json_pretty", "s", 2),
+                    ("json_quote", "s", 1),
+                    ("json_remove", "s", -1),
+                    ("json_replace", "s", -1),
+                    ("json_set", "s", -1),
+                    ("json_type", "s", 1),
+                    ("json_type", "s", 2),
+                    ("json_valid", "s", 1),
+                    ("json_valid", "s", 2),
+                    // Aggregate functions
+                    ("avg", "w", 1),
+                    ("count", "w", 0),
+                    ("count", "w", 1),
+                    ("group_concat", "w", 1),
+                    ("group_concat", "w", 2),
+                    ("json_group_array", "w", 1),
+                    ("json_group_object", "w", 2),
+                    ("max", "w", 1),
+                    ("median", "w", 1),
+                    ("min", "w", 1),
+                    ("percentile", "w", 2),
+                    ("percentile_cont", "w", 2),
+                    ("percentile_disc", "w", 2),
+                    ("string_agg", "w", 2),
+                    ("sum", "w", 1),
+                    ("total", "w", 1),
+                    // Window-only functions
+                    ("cume_dist", "w", 0),
+                    ("dense_rank", "w", 0),
+                    ("first_value", "w", 1),
+                    ("lag", "w", 1),
+                    ("lag", "w", 2),
+                    ("lag", "w", 3),
+                    ("last_value", "w", 1),
+                    ("lead", "w", 1),
+                    ("lead", "w", 2),
+                    ("lead", "w", 3),
+                    ("nth_value", "w", 2),
+                    ("ntile", "w", 1),
+                    ("percent_rank", "w", 0),
+                    ("rank", "w", 0),
+                    ("row_number", "w", 0),
+                    // Built-in table-valued functions
+                    ("generate_series", "v", -1),
+                    ("json_each", "v", 1),
+                    ("json_each", "v", 2),
+                    ("json_tree", "v", 1),
+                    ("json_tree", "v", 2),
+                ];
+                let mut rows: Vec<Vec<SqlValue>> = builtins
+                    .iter()
+                    .map(|&(fname, ftype, narg)| {
+                        vec![
+                            SqlValue::text(fname),
+                            SqlValue::Int(1),
+                            SqlValue::text(ftype),
+                            SqlValue::text("utf8"),
+                            SqlValue::Int(narg),
+                            SqlValue::Int(0),
+                        ]
+                    })
+                    .collect();
+                for (fname, arity) in self.options.functions.custom_scalars() {
+                    rows.push(vec![
+                        SqlValue::text(fname),
+                        SqlValue::Int(0),
+                        SqlValue::text("s"),
+                        SqlValue::text("utf8"),
+                        SqlValue::Int(arity.map_or(-1, |a| a as i64)),
+                        SqlValue::Int(0),
+                    ]);
+                }
+                Ok(Some(TableValuedResult { columns, rows }))
+            }
             _ => Ok(None),
+        }
+    }
+
+    /// Statically infer a view's output `(column_name, decl_type)` pairs from its parsed `SELECT`
+    /// AST + catalog schema, avoiding view materialization, runtime errors, and `pragma_table_list`
+    /// recursion, and handling `NATURAL JOIN` / `USING` deduplication accurately.
+    fn infer_expr_decl_type(
+        mut expr: &xdb_parser::Expr,
+        all_from_cols: &[(Option<String>, String, String)],
+    ) -> (Option<String>, String) {
+        while let xdb_parser::Expr::Collate { operand, .. } = expr {
+            expr = operand;
+        }
+        match expr {
+            xdb_parser::Expr::Column(c) => {
+                let want_tbl = c.table.as_ref().map(|t| t.name.as_str());
+                let cname = c.column.name.as_str();
+                if let Some((_, decl_name, ty)) = all_from_cols.iter().find(|(src_alias, col_name, _)| {
+                    col_name.eq_ignore_ascii_case(cname)
+                        && want_tbl.is_none_or(|wt| {
+                            src_alias
+                                .as_deref()
+                                .is_some_and(|sa| sa.eq_ignore_ascii_case(wt))
+                        })
+                }) {
+                    return (Some(decl_name.clone()), ty.clone());
+                }
+                (None, String::new())
+            }
+            xdb_parser::Expr::Cast { type_name, .. } => (
+                None,
+                type_name
+                    .as_ref()
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => (None, String::new()),
+        }
+    }
+
+    fn deduplicate_view_col_names(cols: &mut [(String, String)]) {
+        let mut seen: HashSet<String> = HashSet::with_capacity(cols.len());
+        for (name, _) in cols.iter_mut() {
+            let lower = name.to_ascii_lowercase();
+            if seen.insert(lower) {
+                continue;
+            }
+            let base = name.clone();
+            let mut n = 1usize;
+            loop {
+                let cand = format!("{base}:{n}");
+                if seen.insert(cand.to_ascii_lowercase()) {
+                    *name = cand;
+                    break;
+                }
+                n += 1;
+            }
+        }
+    }
+
+    fn infer_view_cols(
+        &self,
+        select_sql: &str,
+        explicit_names: Option<&[String]>,
+        visiting: &mut Vec<String>,
+        meter: Option<&dyn Meter>,
+        strict_missing: bool,
+    ) -> SqlResult<Vec<(String, String)>> {
+        let eff_meter = meter.or(self.options.meter.as_deref());
+        if let Some(m) = eff_meter {
+            m.charge_steps(1)?;
+        }
+        if visiting.len() > 64 {
+            if strict_missing {
+                let vname = visiting.first().map_or("", String::as_str);
+                return Err(SqlError::runtime(format!(
+                    "view {vname} is circularly defined"
+                )));
+            }
+            return Ok(Vec::new());
+        }
+        let parse_opts = xdb_parser::ParseOptions {
+            dialect: self.options.dialect,
+            ..xdb_parser::ParseOptions::default()
+        };
+        let mut parsed = match eff_meter {
+            Some(m) => xdb_parser::parse_statement_metered(select_sql, &parse_opts, m),
+            None => xdb_parser::parse_statement(select_sql, &parse_opts),
+        };
+        if let Err(ref e) = parsed {
+            if e.kind != xdb_parser::SqlParseErrorKind::ResourceLimit
+                && self.options.dialect != xdb_parser::Dialect::Xdb
+            {
+                let xdb_opts = xdb_parser::ParseOptions {
+                    dialect: xdb_parser::Dialect::Xdb,
+                    ..xdb_parser::ParseOptions::default()
+                };
+                parsed = match eff_meter {
+                    Some(m) => xdb_parser::parse_statement_metered(select_sql, &xdb_opts, m),
+                    None => xdb_parser::parse_statement(select_sql, &xdb_opts),
+                };
+            }
+        }
+        let sel = match parsed {
+            Ok(xdb_parser::Statement::Select(s)) => s,
+            Ok(xdb_parser::Statement::CreateView(cv)) => cv.select,
+            Ok(_) => return Ok(Vec::new()),
+            Err(e) => {
+                if strict_missing || e.kind == xdb_parser::SqlParseErrorKind::ResourceLimit {
+                    return Err(SqlError::from(e));
+                }
+                return Ok(Vec::new());
+            }
+        };
+        // When `strict_missing` is requested at the top-level view (e.g. `PRAGMA table_info(v)`),
+        // run full zero-row schema validation so circular views, missing tables in compound right
+        // branches, compound arity mismatches, and invalid WHERE/GROUP BY/HAVING/ORDER BY columns
+        // fail cleanly just like SQLite's `sqlite3ViewGetColumnNames`.
+        if strict_missing && visiting.len() <= 1 {
+            let _ = xdb_sql::validate_select_stmt_schema(self, &sel, self.options, &[], None)?;
+        }
+        let mut cols = self.infer_select_cols(
+            &sel,
+            select_sql,
+            &[],
+            visiting,
+            eff_meter,
+            strict_missing,
+        )?;
+        if let Some(names) = explicit_names {
+            if names.len() == cols.len() {
+                for (i, n) in names.iter().enumerate() {
+                    cols[i].0 = n.clone();
+                }
+            } else if strict_missing {
+                return Err(SqlError::runtime(format!(
+                    "expected {} columns but got {}",
+                    names.len(),
+                    cols.len()
+                )));
+            } else {
+                cols = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let ty = cols.get(i).map(|c| c.1.clone()).unwrap_or_default();
+                        (n.clone(), ty)
+                    })
+                    .collect();
+            }
+        }
+        Self::deduplicate_view_col_names(&mut cols);
+        Ok(cols)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_select_cols(
+        &self,
+        sel: &xdb_parser::SelectStmt,
+        raw_sql: &str,
+        outer_ctes: &[(String, Vec<(String, String)>)],
+        visiting: &mut Vec<String>,
+        meter: Option<&dyn Meter>,
+        strict_missing: bool,
+    ) -> SqlResult<Vec<(String, String)>> {
+        if let Some(m) = meter {
+            m.charge_steps(1)?;
+        }
+        if visiting.len() > 64 {
+            return Ok(Vec::new());
+        }
+        let mut ctes: Vec<(String, Vec<(String, String)>)> = outer_ctes.to_vec();
+        if let Some(ref with) = sel.with {
+            for cte in &with.ctes {
+                let cols = if let Some(ref explicit) = cte.columns {
+                    explicit
+                        .iter()
+                        .map(|n| (n.name.name.clone(), String::new()))
+                        .collect()
+                } else {
+                    self.infer_select_cols(
+                        &cte.select,
+                        raw_sql,
+                        &ctes,
+                        visiting,
+                        meter,
+                        strict_missing,
+                    )?
+                };
+                ctes.push((cte.name.name.to_ascii_lowercase(), cols));
+            }
+        }
+        self.infer_body_cols(&sel.body, raw_sql, &ctes, visiting, meter, strict_missing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_body_cols(
+        &self,
+        body: &xdb_parser::SelectBody,
+        raw_sql: &str,
+        ctes: &[(String, Vec<(String, String)>)],
+        visiting: &mut Vec<String>,
+        meter: Option<&dyn Meter>,
+        strict_missing: bool,
+    ) -> SqlResult<Vec<(String, String)>> {
+        if let Some(m) = meter {
+            m.charge_steps(1)?;
+        }
+        match body {
+            xdb_parser::SelectBody::Values(vals) => Ok(vals
+                .rows
+                .first()
+                .map(|r| {
+                    (0..r.items.len())
+                        .map(|i| (format!("column{}", i + 1), String::new()))
+                        .collect()
+                })
+                .unwrap_or_default()),
+            xdb_parser::SelectBody::Compound { left, .. } => {
+                self.infer_body_cols(left, raw_sql, ctes, visiting, meter, strict_missing)
+            }
+            xdb_parser::SelectBody::Core(core) => {
+                let all_from_cols = if let Some(ref from) = core.from {
+                    self.infer_from_cols(
+                        from,
+                        raw_sql,
+                        None,
+                        ctes,
+                        visiting,
+                        meter,
+                        strict_missing,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let mut out = Vec::new();
+                for rc in &core.columns {
+                    match rc {
+                        xdb_parser::ResultColumn::Expr(re) => {
+                            let (decl_name, inferred_type) =
+                                Self::infer_expr_decl_type(&re.expr, &all_from_cols);
+                            let mut base_expr = &re.expr;
+                            while let xdb_parser::Expr::Collate { operand, .. } = base_expr {
+                                base_expr = operand;
+                            }
+                            let col_name = if let Some(ref a) = re.alias {
+                                a.name.clone()
+                            } else if let Some(dn) = decl_name {
+                                dn
+                            } else if let xdb_parser::Expr::Column(c) = base_expr {
+                                c.column.name.clone()
+                            } else if re.span.end <= raw_sql.len() && re.span.start <= re.span.end {
+                                raw_sql[re.span.start..re.span.end].trim().to_string()
+                            } else {
+                                format!("column{}", out.len() + 1)
+                            };
+                            out.push((col_name, inferred_type));
+                        }
+                        xdb_parser::ResultColumn::Star(rs) => {
+                            let Some(ref from) = core.from else {
+                                return Ok(Vec::new());
+                            };
+                            let target = rs.table.as_ref().map(|t| t.name.as_str());
+                            let mut expanded = self.infer_from_cols(
+                                from,
+                                raw_sql,
+                                target,
+                                ctes,
+                                visiting,
+                                meter,
+                                strict_missing,
+                            )?;
+                            if let Some(ref excl) = rs.exclude {
+                                expanded.retain(|(_, cname, _)| {
+                                    !excl.iter().any(|ex| ex.name.eq_ignore_ascii_case(cname))
+                                });
+                            }
+                            for (_, cname, mut cty) in expanded {
+                                if let Some(ref reps) = rs.replace {
+                                    if let Some(rep) =
+                                        reps.iter().find(|r| r.name.name.eq_ignore_ascii_case(&cname))
+                                    {
+                                        cty = Self::infer_expr_decl_type(&rep.expr, &all_from_cols).1;
+                                    }
+                                }
+                                out.push((cname, cty));
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Returns `(source_alias, col_name, decl_type)` entries for a `FROM` clause.
+    #[allow(clippy::too_many_arguments)]
+    fn infer_from_cols(
+        &self,
+        from: &xdb_parser::FromSource,
+        raw_sql: &str,
+        target_alias: Option<&str>,
+        ctes: &[(String, Vec<(String, String)>)],
+        visiting: &mut Vec<String>,
+        meter: Option<&dyn Meter>,
+        strict_missing: bool,
+    ) -> SqlResult<Vec<(Option<String>, String, String)>> {
+        if let Some(m) = meter {
+            m.charge_steps(1)?;
+        }
+        match from {
+            xdb_parser::FromSource::Table(ft) => {
+                let eff_alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+                if let Some(t) = target_alias {
+                    if !eff_alias.eq_ignore_ascii_case(t) {
+                        return Ok(Vec::new());
+                    }
+                }
+                let src_tag = Some(eff_alias.to_string());
+                let schema = ft.schema.as_ref().map(|s| s.name.as_str());
+                if schema.is_none() {
+                    if let Some((_, ccols)) = ctes
+                        .iter()
+                        .rev()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&ft.name.name))
+                    {
+                        return Ok(ccols
+                            .iter()
+                            .map(|(n, ty)| (src_tag.clone(), n.clone(), ty.clone()))
+                            .collect());
+                    }
+                }
+                if !Self::check_schema(schema) {
+                    if strict_missing {
+                        return Err(SqlError::runtime(format!(
+                            "no such table: {}.{}",
+                            schema.unwrap_or("main"),
+                            ft.name.name
+                        )));
+                    }
+                    return Ok(Vec::new());
+                }
+                if let Some(tbl) = self.db.schema().table(&ft.name.name) {
+                    return Ok(tbl
+                        .columns
+                        .iter()
+                        .map(|c| (src_tag.clone(), c.name.clone(), c.decl_type.clone()))
+                        .collect());
+                }
+                if let Some(v) = self.db.schema().view(&ft.name.name) {
+                    let lower = v.name.to_ascii_lowercase();
+                    if visiting.iter().any(|x| x == &lower) {
+                        if strict_missing {
+                            return Err(SqlError::runtime(format!(
+                                "view {} is circularly defined",
+                                v.name
+                            )));
+                        }
+                        return Ok(Vec::new());
+                    }
+                    visiting.push(lower);
+                    let res = self.infer_view_cols(
+                        &v.sql,
+                        v.column_names.as_deref(),
+                        visiting,
+                        meter,
+                        strict_missing,
+                    );
+                    visiting.pop();
+                    return Ok(res?
+                        .into_iter()
+                        .map(|(n, ty)| (src_tag.clone(), n, ty))
+                        .collect());
+                }
+                if let Some(names) = Self::static_tvf_col_names(&ft.name.name) {
+                    return Ok(names
+                        .iter()
+                        .map(|&n| (src_tag.clone(), n.to_string(), String::new()))
+                        .collect());
+                }
+                if strict_missing {
+                    return Err(SqlError::runtime(format!(
+                        "no such table: {}.{}",
+                        schema.unwrap_or("main"),
+                        ft.name.name
+                    )));
+                }
+                Ok(Vec::new())
+            }
+            xdb_parser::FromSource::Function(ff) => {
+                let eff_alias = ff.alias.as_ref().unwrap_or(&ff.name).name.as_str();
+                if let Some(t) = target_alias {
+                    if !eff_alias.eq_ignore_ascii_case(t) {
+                        return Ok(Vec::new());
+                    }
+                }
+                let src_tag = Some(eff_alias.to_string());
+                Ok(Self::static_tvf_col_names(&ff.name.name)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .map(|&n| (src_tag.clone(), n.to_string(), String::new()))
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            }
+            xdb_parser::FromSource::Subquery(fs) => {
+                let eff_alias = fs.alias.as_ref().map(|a| a.name.as_str());
+                if let Some(t) = target_alias {
+                    if !eff_alias.is_some_and(|a| a.eq_ignore_ascii_case(t)) {
+                        return Ok(Vec::new());
+                    }
+                }
+                let src_tag = eff_alias.map(str::to_string);
+                Ok(self
+                    .infer_select_cols(
+                        &fs.select,
+                        raw_sql,
+                        ctes,
+                        visiting,
+                        meter,
+                        strict_missing,
+                    )?
+                    .into_iter()
+                    .map(|(n, ty)| (src_tag.clone(), n, ty))
+                    .collect())
+            }
+            xdb_parser::FromSource::Group(fg) => self.infer_from_cols(
+                &fg.source,
+                raw_sql,
+                target_alias,
+                ctes,
+                visiting,
+                meter,
+                strict_missing,
+            ),
+            xdb_parser::FromSource::Join {
+                left,
+                right,
+                operator,
+                using,
+                ..
+            } => {
+                let mut lcols = self.infer_from_cols(
+                    left,
+                    raw_sql,
+                    target_alias,
+                    ctes,
+                    visiting,
+                    meter,
+                    strict_missing,
+                )?;
+                let mut rcols = self.infer_from_cols(
+                    right,
+                    raw_sql,
+                    target_alias,
+                    ctes,
+                    visiting,
+                    meter,
+                    strict_missing,
+                )?;
+                if target_alias.is_none() {
+                    if let Some(u) = using {
+                        rcols.retain(|(_, cname, _)| {
+                            !u.iter().any(|un| un.name.eq_ignore_ascii_case(cname))
+                        });
+                    } else if (operator.flags & xdb_parser::join_flag::NATURAL) != 0 {
+                        rcols.retain(|(_, cname, _)| {
+                            !lcols
+                                .iter()
+                                .any(|(_, lname, _)| lname.eq_ignore_ascii_case(cname))
+                        });
+                    }
+                }
+                lcols.extend(rcols);
+                Ok(lcols)
+            }
+        }
+    }
+
+    fn static_tvf_col_names(name: &str) -> Option<&'static [&'static str]> {
+        match name.to_ascii_lowercase().as_str() {
+            "pragma_table_info" => Some(&["cid", "name", "type", "notnull", "dflt_value", "pk"]),
+            "pragma_table_xinfo" => {
+                Some(&["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"])
+            }
+            "pragma_table_list" => Some(&["schema", "name", "type", "ncol", "wr", "strict"]),
+            "pragma_index_list" => Some(&["seq", "name", "unique", "origin", "partial"]),
+            "pragma_index_info" => Some(&["seqno", "cid", "name"]),
+            "pragma_index_xinfo" => Some(&["seqno", "cid", "name", "desc", "coll", "key"]),
+            "pragma_database_list" => Some(&["seq", "name", "file"]),
+            "pragma_foreign_key_list" => {
+                Some(&["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"])
+            }
+            "pragma_foreign_key_check" => Some(&["table", "rowid", "parent", "fkid"]),
+            "pragma_collation_list" => Some(&["seq", "name"]),
+            "pragma_compile_options" => Some(&["compile_options"]),
+            "pragma_pragma_list" => Some(&["name"]),
+            "pragma_function_list" => Some(&["name", "builtin", "type", "enc", "narg", "flags"]),
+            "json_each" | "json_tree" => {
+                Some(&["key", "value", "type", "atom", "id", "parent", "fullkey", "path"])
+            }
+            "generate_series" => Some(&["value"]),
+            _ => None,
         }
     }
 }
@@ -1735,6 +2606,40 @@ impl SqlCatalog for SqliteSqlCatalog<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    fn get_without_rowid_pk(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<IndexMeta>> {
+        if !Self::check_schema(schema) {
+            return Ok(None);
+        }
+        let Some(SchemaObject::Table(t)) = self.db.schema().object(name) else {
+            return Ok(None);
+        };
+        let Some(pk) = t.indexes.iter().find(|ix| ix.without_rowid_primary_key) else {
+            return Ok(None);
+        };
+        Ok(Some(IndexMeta {
+            name: pk.name.clone(),
+            unique: pk.unique,
+            key_columns: pk.columns[..pk.key_count]
+                .iter()
+                .map(|ic| if ic.cid >= 0 { Some(ic.cid as usize) } else { None })
+                .collect(),
+            key_collations: pk.columns[..pk.key_count]
+                .iter()
+                .map(|ic| ic.collation.clone())
+                .collect(),
+            key_desc: pk.columns[..pk.key_count]
+                .iter()
+                .map(|ic| ic.desc)
+                .collect(),
+            partial: pk.partial,
+            where_clause: None,
+        }))
+    }
+
+    fn has_table_valued_function(&self, name: &str) -> bool {
+        Self::static_tvf_col_names(name).is_some()
     }
 
     fn get_view(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<ViewMeta>> {
@@ -1811,25 +2716,25 @@ impl SqlCatalog for SqliteSqlCatalog<'_> {
         schema: Option<&str>,
         name: &str,
         args: &[SqlValue],
-        _meter: Option<&dyn Meter>,
+        meter: Option<&dyn Meter>,
     ) -> SqlResult<Option<TableValuedResult>> {
         if !Self::check_schema(schema) {
             return Ok(None);
         }
-        self.eval_pragma_tvf(&name.to_ascii_lowercase(), args)
+        self.eval_pragma_tvf(&name.to_ascii_lowercase(), args, meter)
     }
 }
 
 // ───────────────────────────── VIRTUAL generated columns ─────────────────────────────
 
-struct VirtualColumnPlan<'a> {
+pub(crate) struct VirtualColumnPlan<'a> {
     scope_cols: Vec<ScopeColumn>,
     /// Evaluation order of VIRTUAL columns: `(cid, generated_expr, target_affinity)`.
     eval_order: Vec<(usize, &'a Expr, Affinity)>,
 }
 
 impl<'a> VirtualColumnPlan<'a> {
-    fn build_for(table: &'a TableInfo, needed_columns: Option<&[usize]>) -> SqlResult<Self> {
+    pub(crate) fn build_for(table: &'a TableInfo, needed_columns: Option<&[usize]>) -> SqlResult<Self> {
         let scope_cols: Vec<ScopeColumn> = table
             .columns
             .iter()
@@ -1907,7 +2812,7 @@ impl<'a> VirtualColumnPlan<'a> {
         })
     }
 
-    fn evaluate(&self, row: &mut [SqlValue], options: &QueryOptions) -> SqlResult<()> {
+    pub(crate) fn evaluate(&self, row: &mut [SqlValue], options: &QueryOptions) -> SqlResult<()> {
         for &(cid, expr, aff) in &self.eval_order {
             let val = eval_generated_expr(expr, &self.scope_cols, row, aff, options)?;
             row[cid] = val;
@@ -1999,13 +2904,10 @@ impl SqliteDatabase {
         if options.meter.is_none() && !self.btree().pager().is_noop_meter() {
             let mut effective = options.clone();
             effective.meter = Some(self.btree().pager().meter().clone());
-            let catalog = SqliteSqlCatalog {
-                db: self,
-                options: &effective,
-            };
+            let catalog = SqliteSqlCatalog::new(self, &effective);
             return execute_query(&catalog, sql, params, &effective).map_err(SqliteError::from);
         }
-        let catalog = SqliteSqlCatalog { db: self, options };
+        let catalog = SqliteSqlCatalog::new(self, options);
         execute_query(&catalog, sql, params, options).map_err(SqliteError::from)
     }
 
@@ -2022,14 +2924,11 @@ impl SqliteDatabase {
         if options.meter.is_none() && !self.btree().pager().is_noop_meter() {
             let mut effective = options.clone();
             effective.meter = Some(self.btree().pager().meter().clone());
-            let catalog = SqliteSqlCatalog {
-                db: self,
-                options: &effective,
-            };
+            let catalog = SqliteSqlCatalog::new(self, &effective);
             return execute_select_stmt(&catalog, stmt, params, &effective)
                 .map_err(SqliteError::from);
         }
-        let catalog = SqliteSqlCatalog { db: self, options };
+        let catalog = SqliteSqlCatalog::new(self, options);
         execute_select_stmt(&catalog, stmt, params, options).map_err(SqliteError::from)
     }
 }

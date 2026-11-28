@@ -91,7 +91,7 @@ impl RecordView {
         local_size: usize,
         payload_size: u32,
     ) {
-        let room = page.len().saturating_sub(local_offset);
+        let room = self.usable.min(page.len()).saturating_sub(local_offset);
         self.pgno = pgno;
         self.page = page;
         self.local0 = local_offset;
@@ -125,7 +125,7 @@ impl RecordView {
     /// Re-point this view at another cell on the SAME already-held page (avoids `Arc::clone`).
     #[inline]
     pub fn reset_same_page(&mut self, local_offset: usize, local_size: usize, payload_size: u32) {
-        let room = self.page.len().saturating_sub(local_offset);
+        let room = self.usable.min(self.page.len()).saturating_sub(local_offset);
         self.local0 = local_offset;
         self.n_local = local_size;
         self.sz_row = local_size.min(room);
@@ -355,9 +355,10 @@ impl RecordView {
     fn overflow_page(&mut self, k: usize) -> SqliteResult<Arc<[u8]>> {
         if self.ovfl.is_empty() {
             let p = self.local0 + self.n_local;
-            if p + 4 > self.page.len() {
+            let bound = self.usable.min(self.page.len());
+            if p + 4 > bound {
                 return Err(SqliteError::corrupt(format!(
-                    "page {}: overflow pointer lies past the end of the page",
+                    "page {}: overflow pointer lies past the end of the usable page area",
                     self.pgno
                 )));
             }
@@ -389,9 +390,9 @@ impl RecordView {
                 self.pgno, self.n_ovfl
             )));
         }
-        if pgno > self.pager.page_count() {
+        if pgno == 1 || pgno > self.pager.page_count() {
             return Err(SqliteError::corrupt(format!(
-                "page {}: overflow page {pgno} is beyond the database",
+                "page {}: invalid overflow page {pgno}",
                 self.pgno
             )));
         }
@@ -507,7 +508,7 @@ impl RecordView {
         if hdr_size <= self.sz_row {
             if hdr_size <= len {
                 return Err(SqliteError::corrupt(format!(
-                    "page {}: record header size {hdr_size} leaves no serial types",
+                    "page {}: record header size {hdr_size} is not larger than header length varint {len}",
                     self.pgno
                 )));
             }
@@ -525,7 +526,7 @@ impl RecordView {
             self.hdr_base = 0;
             if hdr_size <= len {
                 return Err(SqliteError::corrupt(format!(
-                    "page {}: record header size {hdr_size} leaves no serial types",
+                    "page {}: record header size {hdr_size} is not larger than header length varint {len}",
                     self.pgno
                 )));
             }

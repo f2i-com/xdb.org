@@ -5,7 +5,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use xdb_core::value::{
-    apply_affinity, apply_numeric_affinity, boolean_value, compare_op, comparison_affinity,
+    apply_affinity, apply_numeric_affinity, compare_op, comparison_affinity,
     comparison_collation_name, int64_to_text, mem_compare, must_be_int, real_to_exact_i64,
     real_to_text, BuiltinCollation, Collation, CompareOp, OperandCollation, TextEncoding,
     DEFAULT_FP_DIGITS,
@@ -311,8 +311,11 @@ struct QueryExec<'a> {
     params: &'a QueryParams,
     ctes: HashMap<String, Arc<CteTable>>,
     view_depth: usize,
+    active_views: Vec<String>,
     query_depth: usize,
     now_julian_ms: i64,
+    in_trigger: bool,
+    validate_only: bool,
 }
 
 impl<'a> QueryExec<'a> {
@@ -327,9 +330,17 @@ impl<'a> QueryExec<'a> {
             params,
             ctes: HashMap::new(),
             view_depth: 0,
+            active_views: Vec::new(),
             query_depth: 0,
             now_julian_ms: options.effective_now_julian_ms(),
+            in_trigger: options.in_trigger,
+            validate_only: false,
         }
+    }
+
+    fn with_validate_only(mut self) -> Self {
+        self.validate_only = true;
+        self
     }
 
     fn child_with_ctes(&self, ctes: HashMap<String, Arc<CteTable>>) -> Self {
@@ -339,8 +350,11 @@ impl<'a> QueryExec<'a> {
             params: self.params,
             ctes,
             view_depth: self.view_depth,
+            active_views: self.active_views.clone(),
             query_depth: self.query_depth + 1,
             now_julian_ms: self.now_julian_ms,
+            in_trigger: self.in_trigger,
+            validate_only: self.validate_only,
         }
     }
 
@@ -365,8 +379,10 @@ impl<'a> QueryExec<'a> {
     }
 
     fn make_env(&self) -> EvalEnv<'_> {
-        EvalEnv::new_with_now(self.options, self.params, self, self.now_julian_ms)
-            .with_subquery_cache(true)
+        let mut env = EvalEnv::new_with_now(self.options, self.params, self, self.now_julian_ms)
+            .with_subquery_cache(true);
+        env.in_trigger = self.in_trigger;
+        env
     }
 
     fn execute_select_stmt(
@@ -384,6 +400,15 @@ impl<'a> QueryExec<'a> {
         outer_scopes: &[EvalScope<'_>],
     ) -> SqlResult<SelectRowsMeta> {
         self.check_depth(self.query_depth)?;
+        if !self.validate_only
+            && !self.in_trigger
+            && self.query_depth == 0
+            && crate::eval::select_contains_raise(stmt)
+        {
+            return Err(SqlError::runtime(
+                "RAISE() may only be used within a trigger-program",
+            ));
+        }
         if let Some(ref with) = stmt.with {
             let child = self.materialize_with(with, outer_scopes)?;
             return child.execute_select_no_with(stmt, outer_scopes);
@@ -505,6 +530,46 @@ impl<'a> QueryExec<'a> {
                     cte.name.name
                 )));
             }
+            for (_, b) in &flat[rec_start..] {
+                if select_body_count_direct_table_refs(b, &cte.name.name) > 1 {
+                    return Err(SqlError::runtime(format!(
+                        "multiple references to recursive table: {}",
+                        cte.name.name
+                    )));
+                }
+                if let SelectBody::Core(core) = b {
+                    let has_agg = core.group_by.is_some()
+                        || core.group_by_all
+                        || core.having.is_some()
+                        || core.columns.iter().any(|rc| match rc {
+                            ResultColumn::Expr(re) => {
+                                expr_contains_aggregate(&re.expr, self.options)
+                            }
+                            ResultColumn::Star(s) => s.replace.as_deref().is_some_and(|rs| {
+                                rs.iter()
+                                    .any(|r| expr_contains_aggregate(&r.expr, self.options))
+                            }),
+                        });
+                    if has_agg {
+                        return Err(SqlError::runtime(
+                            "recursive aggregate queries not supported",
+                        ));
+                    }
+                    let has_win = core.windows.is_some()
+                        || core.columns.iter().any(|rc| match rc {
+                            ResultColumn::Expr(re) => expr_contains_window(&re.expr),
+                            ResultColumn::Star(s) => s
+                                .replace
+                                .as_deref()
+                                .is_some_and(|rs| rs.iter().any(|r| expr_contains_window(&r.expr))),
+                        });
+                    if has_win {
+                        return Err(SqlError::runtime(
+                            "cannot use window functions in recursive queries",
+                        ));
+                    }
+                }
+            }
             let base_existing = if let Some(ref inner_with) = cte.select.with {
                 if inner_with
                     .ctes
@@ -563,6 +628,38 @@ impl<'a> QueryExec<'a> {
                 base_runner.execute_select_stmt(&base_stmt, outer_scopes)?;
             let cte_cols = apply_cte_column_names(cte, &base_cols)?;
             let width = cte_cols.len();
+            // Always validate every recursive branch's schema and column count upfront, even when
+            // `base_rows` is empty, `LIMIT` stops on base rows, or we are in `validate_only` mode.
+            {
+                let mut val_map = base_existing.clone();
+                val_map.insert(
+                    cte.name.name.to_ascii_lowercase(),
+                    Arc::new(CteTable::untracked(cte_cols.clone(), Vec::new())),
+                );
+                let val_runner = self.child_with_ctes(val_map).with_validate_only();
+                for (_, step_stmt) in &rec_branches {
+                    let (new_cols, _) =
+                        val_runner.execute_select_stmt(step_stmt, outer_scopes)?;
+                    if new_cols.len() != width {
+                        return Err(SqlError::runtime(
+                            "SELECTs to the left and right of UNION do not have the same number of result columns",
+                        ));
+                    }
+                }
+            }
+            if self.validate_only {
+                let _ = self.apply_order_and_limit(
+                    &cte_cols,
+                    Vec::new(),
+                    None,
+                    None,
+                    cte.select.order_by.as_deref(),
+                    cte.select.order_by_all.as_ref(),
+                    cte.select.limit.as_ref(),
+                    outer_scopes,
+                )?;
+                return Ok(CteTable::untracked(cte_cols, Vec::new()));
+            }
             let env = self.make_env();
             let colls: Vec<&Collation> = cte_cols
                 .iter()
@@ -597,10 +694,53 @@ impl<'a> QueryExec<'a> {
             let key = cte.name.name.to_ascii_lowercase();
 
             if let Some(ref ord_terms) = cte.select.order_by {
+                // Collect output column names (and qualified source `(table, col)` pairs) across
+                // ALL compound branches (initial + recursive) so `ORDER BY <col>` or `ORDER BY t.col`
+                // resolves per SQLite compound ORDER BY rules, while invalid qualifiers or
+                // arbitrary expressions (e.g. `ORDER BY -a`, `ORDER BY bogus.a`) are rejected!
+                let mut branch_col_names: Vec<CompoundBranchNames> = Vec::new();
+                record_compound_branch_names(&mut branch_col_names, &base_cols, match &base_stmt.body {
+                    SelectBody::Core(c) => Some(c),
+                    _ => None,
+                });
+                for (_, rb) in &rec_branches {
+                    if let SelectBody::Core(rcore) = &rb.body {
+                        if branch_col_names.len() < width {
+                            branch_col_names.resize_with(width, CompoundBranchNames::default);
+                        }
+                        let single_tbl = single_from_source_alias(rcore.from.as_ref());
+                        for (idx, rc) in rcore.columns.iter().enumerate() {
+                            if idx < width {
+                                if let ResultColumn::Expr(re) = rc {
+                                    let nm = re
+                                        .alias
+                                        .as_ref()
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_else(|| derive_column_name(&re.expr, &re.text));
+                                    branch_col_names[idx].push_unqualified(nm);
+                                    if let Some((t, c)) =
+                                        extract_bare_col_source(&re.expr, single_tbl)
+                                    {
+                                        branch_col_names[idx].push_qualified(t, c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // SQLite recursive CTE `ORDER BY`: min-heap priority-queue traversal popping the
                 // minimum frontier row per step in O(log N) time.
                 let mut term_colls: Vec<&Collation> = Vec::with_capacity(ord_terms.len());
+                let mut term_indices: Vec<usize> = Vec::with_capacity(ord_terms.len());
                 for (tidx, term) in ord_terms.iter().enumerate() {
+                    let mut coll_walk = &term.expr;
+                    while let Expr::Collate {
+                        operand, collation, ..
+                    } = coll_walk
+                    {
+                        let _ = env.lookup_collation(&collation.name)?;
+                        coll_walk = operand;
+                    }
                     if let Some((ord, ov_coll)) = integer_ordinal_with_collation(&term.expr) {
                         if ord < 1 || ord > width {
                             return Err(SqlError::runtime(format!(
@@ -610,27 +750,41 @@ impl<'a> QueryExec<'a> {
                         }
                         let cname = ov_coll.unwrap_or(&cte_cols[ord - 1].collation);
                         term_colls.push(env.lookup_collation(cname)?);
+                        term_indices.push(ord - 1);
+                    } else if let Expr::Column(c) = coll_walk {
+                        let ov_coll = if let Expr::Collate { collation, .. } = &term.expr {
+                            Some(collation.name.as_str())
+                        } else {
+                            None
+                        };
+                        let col_name = c.column.name.as_str();
+                        let pos = resolve_compound_order_col(
+                            c.schema.as_ref().map(|s| s.name.as_str()),
+                            c.table.as_ref().map(|t| t.name.as_str()),
+                            col_name,
+                            &base_cols,
+                            &branch_col_names,
+                        );
+                        let Some(pos) = pos else {
+                            return Err(SqlError::runtime(format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                ordinal_label(tidx + 1)
+                            )));
+                        };
+                        let cname = ov_coll.unwrap_or(&cte_cols[pos].collation);
+                        term_colls.push(env.lookup_collation(cname)?);
+                        term_indices.push(pos);
                     } else {
-                        // SQLite resolves recursive CTE ORDER BY column names against the
-                        // initial SELECT's output column names (`base_cols`), not `cte_cols`.
-                        let mut sc_vec = outer_scopes.to_vec();
-                        sc_vec.push(EvalScope::simple(&base_cols, &[]));
-                        let cname = expr_collation(&term.expr, &sc_vec)
-                            .name
-                            .unwrap_or_else(|| "BINARY".to_string());
-                        term_colls.push(env.lookup_collation(&cname)?);
+                        return Err(SqlError::runtime(format!(
+                            "{} ORDER BY term does not match any column in the result set",
+                            ordinal_label(tidx + 1)
+                        )));
                     }
                 }
                 let compute_keys = |row: &[SqlValue]| -> SqlResult<Vec<SqlValue>> {
-                    let mut ks = Vec::with_capacity(ord_terms.len());
-                    let mut sc_vec = outer_scopes.to_vec();
-                    sc_vec.push(EvalScope::simple(&base_cols, row));
-                    for term in ord_terms {
-                        if let Some((ord, _)) = integer_ordinal_with_collation(&term.expr) {
-                            ks.push(row[ord - 1].clone());
-                        } else {
-                            ks.push(eval_expr(&term.expr, &sc_vec, &env)?);
-                        }
+                    let mut ks = Vec::with_capacity(term_indices.len());
+                    for &pos in &term_indices {
+                        ks.push(row[pos].clone());
                     }
                     Ok(ks)
                 };
@@ -902,7 +1056,7 @@ impl<'a> QueryExec<'a> {
                 Ok((out_cols, out_expl, final_rows))
             }
             SelectBody::Compound { .. } => {
-                let mut branch_col_names: Vec<Vec<String>> = Vec::new();
+                let mut branch_col_names: Vec<CompoundBranchNames> = Vec::new();
                 let (out_cols, out_expl, out_rows) = self.execute_select_body_depth(
                     &stmt.body,
                     outer_scopes,
@@ -937,7 +1091,7 @@ impl<'a> QueryExec<'a> {
         body: &SelectBody,
         outer_scopes: &[EvalScope<'_>],
         depth: usize,
-        mut branch_names: Option<&mut Vec<Vec<String>>>,
+        mut branch_names: Option<&mut Vec<CompoundBranchNames>>,
     ) -> SqlResult<SelectRowsMeta> {
         self.check_depth(depth)?;
         match body {
@@ -945,7 +1099,7 @@ impl<'a> QueryExec<'a> {
                 let (cols, expl, rows, _) =
                     self.execute_select_core(core, outer_scopes, None, None, None)?;
                 if let Some(ref mut bn) = branch_names {
-                    record_compound_branch_names(bn, &cols);
+                    record_compound_branch_names(bn, &cols, Some(core));
                 }
                 Ok((cols, expl, rows))
             }
@@ -965,12 +1119,18 @@ impl<'a> QueryExec<'a> {
                     } else {
                         width = Some(vrow.items.len());
                     }
-                    let mut vals = Vec::with_capacity(vrow.items.len());
-                    for item in &vrow.items {
-                        vals.push(eval_expr(item, outer_scopes, &env)?);
+                    if self.validate_only {
+                        for item in &vrow.items {
+                            self.validate_expr_and_subqueries(item, outer_scopes)?;
+                        }
+                    } else {
+                        let mut vals = Vec::with_capacity(vrow.items.len());
+                        for item in &vrow.items {
+                            vals.push(eval_expr(item, outer_scopes, &env)?);
+                        }
+                        mem.reserve(estimate_row_bytes(&vals))?;
+                        rows.push(vals);
                     }
-                    mem.reserve(estimate_row_bytes(&vals))?;
-                    rows.push(vals);
                 }
                 let w = width.unwrap_or(0);
                 let cols: Vec<ScopeColumn> = (1..=w)
@@ -983,122 +1143,144 @@ impl<'a> QueryExec<'a> {
                     })
                     .collect();
                 if let Some(ref mut bn) = branch_names {
-                    record_compound_branch_names(bn, &cols);
+                    record_compound_branch_names(bn, &cols, None);
                 }
                 Ok((cols, vec![ExprCollation::none(); w], rows))
             }
-            SelectBody::Compound {
-                op, left, right, ..
-            } => {
-                let (mut lcols, mut lcolls, lrows) = self.execute_select_body_depth(
-                    left,
+            SelectBody::Compound { .. } => {
+                // Flatten left-associative compound chain iteratively so up to 500 compound terms
+                // execute cleanly without hitting subquery `MAX_QUERY_DEPTH = 128`.
+                let mut chain: Vec<(Option<CompoundOperator>, &SelectBody)> = Vec::new();
+                let mut cur = body;
+                while let SelectBody::Compound {
+                    op, left, right, ..
+                } = cur
+                {
+                    if chain.len() >= 500 {
+                        return Err(SqlError::runtime("too many terms in compound SELECT"));
+                    }
+                    chain.push((Some(*op), right.as_ref()));
+                    cur = left.as_ref();
+                }
+                chain.push((None, cur));
+                if chain.len() > 500 {
+                    return Err(SqlError::runtime("too many terms in compound SELECT"));
+                }
+                chain.reverse();
+
+                let (mut lcols, mut lcolls, mut acc_rows) = self.execute_select_body_depth(
+                    chain[0].1,
                     outer_scopes,
                     depth + 1,
                     branch_names.as_deref_mut(),
                 )?;
-                let (rcols, rcolls, rrows) = self.execute_select_body_depth(
-                    right,
-                    outer_scopes,
-                    depth + 1,
-                    branch_names,
-                )?;
-                if lcols.len() != rcols.len() {
-                    return Err(SqlError::runtime(format!(
-                        "SELECTs to the left and right of {} do not have the same number of result columns",
-                        op.as_str()
-                    )));
-                }
-                // Merge collations across compound branches (`select.c:2641-2656`
-                // `multiSelectCollSeq`): leftmost non-`None` collation wins, and compound
-                // SELECTs drop column affinity.
-                for i in 0..lcols.len() {
-                    lcols[i].affinity = Affinity::None;
-                    let merged_name = lcolls[i]
-                        .name
-                        .clone()
-                        .or_else(|| rcolls[i].name.clone());
-                    let merged_expl = if lcolls[i].name.is_some() {
-                        lcolls[i].explicit
-                    } else {
-                        rcolls[i].explicit
-                    };
-                    if let Some(ref eff) = merged_name {
-                        lcols[i].collation = eff.clone();
-                    }
-                    lcolls[i] = ExprCollation {
-                        name: merged_name,
-                        explicit: merged_expl,
-                    };
-                }
                 let env = self.make_env();
-                let colls: Vec<&Collation> = lcols
-                    .iter()
-                    .map(|c| env.lookup_collation(&c.collation))
-                    .collect::<SqlResult<Vec<_>>>()?;
-                let coll_names: Vec<&str> = lcols.iter().map(|c| c.collation.as_str()).collect();
                 let mut mem = self.make_mem_guard();
-                let out_rows = match op {
-                    CompoundOperator::UnionAll => {
-                        let mut out = lrows;
-                        for r in rrows {
-                            mem.reserve(estimate_row_bytes(&r))?;
-                            out.push(r);
-                        }
-                        out
+
+                for (op_opt, branch) in &chain[1..] {
+                    let op = op_opt.expect("compound op");
+                    let (rcols, rcolls, rrows) = self.execute_select_body_depth(
+                        branch,
+                        outer_scopes,
+                        depth + 1,
+                        branch_names.as_deref_mut(),
+                    )?;
+                    if lcols.len() != rcols.len() {
+                        return Err(SqlError::runtime(format!(
+                            "SELECTs to the left and right of {} do not have the same number of result columns",
+                            op.as_str()
+                        )));
                     }
-                    CompoundOperator::Union => {
-                        let mut dedup =
-                            RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
-                        let mut out = Vec::new();
-                        for r in lrows.into_iter().chain(rrows) {
-                            self.charge_steps(1)?;
-                            if dedup.insert(&r, self)? {
+                    // Merge collations across compound branches (`select.c:2641-2656`
+                    // `multiSelectCollSeq`): leftmost non-`None` collation wins, and compound
+                    // SELECTs drop column affinity.
+                    for i in 0..lcols.len() {
+                        lcols[i].affinity = Affinity::None;
+                        let merged_name = lcolls[i]
+                            .name
+                            .clone()
+                            .or_else(|| rcolls[i].name.clone());
+                        let merged_expl = if lcolls[i].name.is_some() {
+                            lcolls[i].explicit
+                        } else {
+                            rcolls[i].explicit
+                        };
+                        if let Some(ref eff) = merged_name {
+                            lcols[i].collation = eff.clone();
+                        }
+                        lcolls[i] = ExprCollation {
+                            name: merged_name,
+                            explicit: merged_expl,
+                        };
+                    }
+                    let colls: Vec<&Collation> = lcols
+                        .iter()
+                        .map(|c| env.lookup_collation(&c.collation))
+                        .collect::<SqlResult<Vec<_>>>()?;
+                    let coll_names: Vec<&str> = lcols.iter().map(|c| c.collation.as_str()).collect();
+                    acc_rows = match op {
+                        CompoundOperator::UnionAll => {
+                            let mut out = acc_rows;
+                            for r in rrows {
                                 mem.reserve(estimate_row_bytes(&r))?;
                                 out.push(r);
                             }
+                            out
                         }
-                        out
-                    }
-                    CompoundOperator::Intersect => {
-                        let mut rset =
-                            RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
-                        for r in &rrows {
-                            self.charge_steps(1)?;
-                            let _ = rset.insert(r, self)?;
-                        }
-                        let mut out_set =
-                            RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
-                        let mut out = Vec::new();
-                        for r in lrows {
-                            self.charge_steps(1)?;
-                            if rset.contains(&r, self)? && out_set.insert(&r, self)? {
-                                mem.reserve(estimate_row_bytes(&r))?;
-                                out.push(r);
+                        CompoundOperator::Union => {
+                            let mut dedup =
+                                RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
+                            let mut out = Vec::new();
+                            for r in acc_rows.into_iter().chain(rrows) {
+                                self.charge_steps(1)?;
+                                if dedup.insert(&r, self)? {
+                                    mem.reserve(estimate_row_bytes(&r))?;
+                                    out.push(r);
+                                }
                             }
+                            out
                         }
-                        out
-                    }
-                    CompoundOperator::Except => {
-                        let mut rset =
-                            RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
-                        for r in &rrows {
-                            self.charge_steps(1)?;
-                            let _ = rset.insert(r, self)?;
-                        }
-                        let mut out_set =
-                            RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
-                        let mut out = Vec::new();
-                        for r in lrows {
-                            self.charge_steps(1)?;
-                            if !rset.contains(&r, self)? && out_set.insert(&r, self)? {
-                                mem.reserve(estimate_row_bytes(&r))?;
-                                out.push(r);
+                        CompoundOperator::Intersect => {
+                            let mut rset =
+                                RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
+                            for r in &rrows {
+                                self.charge_steps(1)?;
+                                let _ = rset.insert(r, self)?;
                             }
+                            let mut out_set =
+                                RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
+                            let mut out = Vec::new();
+                            for r in acc_rows {
+                                self.charge_steps(1)?;
+                                if rset.contains(&r, self)? && out_set.insert(&r, self)? {
+                                    mem.reserve(estimate_row_bytes(&r))?;
+                                    out.push(r);
+                                }
+                            }
+                            out
                         }
-                        out
-                    }
-                };
-                Ok((lcols, lcolls, out_rows))
+                        CompoundOperator::Except => {
+                            let mut rset =
+                                RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
+                            for r in &rrows {
+                                self.charge_steps(1)?;
+                                let _ = rset.insert(r, self)?;
+                            }
+                            let mut out_set =
+                                RowDedup::new(&coll_names, &colls, self.options.meter.as_deref());
+                            let mut out = Vec::new();
+                            for r in acc_rows {
+                                self.charge_steps(1)?;
+                                if !rset.contains(&r, self)? && out_set.insert(&r, self)? {
+                                    mem.reserve(estimate_row_bytes(&r))?;
+                                    out.push(r);
+                                }
+                            }
+                            out
+                        }
+                    };
+                }
+                Ok((lcols, lcolls, acc_rows))
             }
         }
     }
@@ -1114,7 +1296,8 @@ impl<'a> QueryExec<'a> {
         let env = self.make_env();
 
         // 0. Fast-path `SELECT count(*) FROM single_table` without decoding row payloads.
-        if core.where_clause.is_none()
+        if !self.validate_only
+            && core.where_clause.is_none()
             && core.group_by.is_none()
             && !core.group_by_all
             && core.having.is_none()
@@ -1143,18 +1326,13 @@ impl<'a> QueryExec<'a> {
                             && self.ctes.contains_key(&ft.name.name.to_ascii_lowercase());
                         if !is_cte && is_valid_schema_name(schema) {
                             if let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? {
-                                if let Some(ref idx_name) = ft.indexed_by {
-                                    let exists = tmeta
-                                        .indexes
-                                        .iter()
-                                        .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
-                                    if !exists {
-                                        return Err(SqlError::runtime(format!(
-                                            "no such index: {}",
-                                            idx_name.name
-                                        )));
-                                    }
-                                }
+                                let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+                                Self::validate_table_indexed_by(
+                                    &tmeta,
+                                    ft.indexed_by.as_ref(),
+                                    core.where_clause.as_ref(),
+                                    alias,
+                                )?;
                                 if let Some(cnt) = self.catalog.count_table_rows(
                                     schema,
                                     &ft.name.name,
@@ -1209,7 +1387,7 @@ impl<'a> QueryExec<'a> {
         };
 
         // 0b. Streaming fast-path `SELECT count(*) FROM single_table WHERE <compiled>`
-        if outer_scopes.is_empty() && core.where_clause.is_some() {
+        if !self.validate_only && outer_scopes.is_empty() && core.where_clause.is_some() {
             if let Some(res) = self.try_streaming_count_where(
                 core,
                 outer_order_by,
@@ -1223,7 +1401,11 @@ impl<'a> QueryExec<'a> {
         // 0b2 / 0b3. Single-pass streaming table scan OR cumulative window fast path.
         // Pre-check whether any top-level SELECT item is a window call so windowed queries skip
         // `try_streaming_select_where` (and non-windowed queries skip `try_streaming_cumulative_window`).
-        if outer_scopes.is_empty() && outer_order_by.is_none() && outer_order_by_all.is_none() {
+        if !self.validate_only
+            && outer_scopes.is_empty()
+            && outer_order_by.is_none()
+            && outer_order_by_all.is_none()
+        {
             let has_top_window = core.columns.iter().any(|rc| {
                 matches!(
                     rc,
@@ -1251,7 +1433,11 @@ impl<'a> QueryExec<'a> {
         }
 
         // 0c. Streaming fast-path 2-table INNER/LEFT hash equijoin with direct column projection
-        if outer_scopes.is_empty() && outer_order_by.is_none() && core.where_clause.is_none() {
+        if !self.validate_only
+            && outer_scopes.is_empty()
+            && outer_order_by.is_none()
+            && core.where_clause.is_none()
+        {
             if let Some(res) = self.try_streaming_hash_join(
                 core,
                 table_needed_names.as_deref(),
@@ -1262,7 +1448,7 @@ impl<'a> QueryExec<'a> {
         }
 
         // 0d. Streaming fast-path single-table online `GROUP BY <single_col>`
-        let streamed_agg = if outer_scopes.is_empty() {
+        let streamed_agg = if !self.validate_only && outer_scopes.is_empty() {
             match self.try_streaming_group_by(
                 core,
                 outer_order_by,
@@ -1284,7 +1470,8 @@ impl<'a> QueryExec<'a> {
                 // Compute optional ORDER BY / LIMIT pushdown context for simple single-table queries
                 // (no WHERE, no GROUP BY/HAVING/DISTINCT, no aggregates or window functions).
                 let order_limit_ctx: Option<(&SelectCore, Option<&[OrderingTerm]>, usize)> =
-                    if core.where_clause.is_none()
+                    if !self.validate_only
+                        && core.where_clause.is_none()
                         && core.group_by.is_none()
                         && !core.group_by_all
                         && core.having.is_none()
@@ -1352,7 +1539,16 @@ impl<'a> QueryExec<'a> {
 
                 // 1. Evaluate FROM clause (with optional single-table WHERE/ORDER/LIMIT pushdown & projection pruning)
                 let mut rel = match &core.from {
-                    None => Relation::single_empty_row(),
+                    None => {
+                        if self.validate_only {
+                            Relation {
+                                rows: Vec::new(),
+                                ..Relation::single_empty_row()
+                            }
+                        } else {
+                            Relation::single_empty_row()
+                        }
+                    }
                     Some(from_src) => self.eval_from_depth(
                         from_src,
                         core.where_clause.as_ref(),
@@ -1407,7 +1603,11 @@ impl<'a> QueryExec<'a> {
                                 sc.hidden_unqualified = Some(&rel.using_hidden);
                                 sc.source_ids = Some(&rel.source_ids);
                                 let cond = eval_expr(where_expr, &[sc], &env)?;
-                                if boolean_value(&cond, false) {
+                                if xdb_core::value::boolean_value_enc(
+                                    &cond,
+                                    false,
+                                    self.options.collations.encoding(),
+                                ) {
                                     filtered.push(row);
                                 }
                             }
@@ -1433,7 +1633,11 @@ impl<'a> QueryExec<'a> {
                                 scopes.push(sc);
                                 eval_expr(where_expr, &scopes, &env)?
                             };
-                            if boolean_value(&cond, false) {
+                            if xdb_core::value::boolean_value_enc(
+                                &cond,
+                                false,
+                                self.options.collations.encoding(),
+                            ) {
                                 filtered.push(row);
                             }
                         }
@@ -1962,19 +2166,11 @@ impl<'a> QueryExec<'a> {
         let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? else {
             return Ok(None);
         };
-        if let Some(ref idx_name) = ft.indexed_by {
-            let exists = tmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
-            if !exists {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
+        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+        Self::validate_table_indexed_by(&tmeta, ft.indexed_by.as_ref(), Some(where_expr), alias)?;
         if Self::synth_rowid_referenced(&tmeta, table_needed_names) {
             return Ok(None);
         }
-        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
         let rel_meta = Self::build_table_rel_meta(&tmeta, alias);
         let Some(mut pred) = CompiledRowPred::try_compile(
             where_expr,
@@ -2081,19 +2277,16 @@ impl<'a> QueryExec<'a> {
         let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? else {
             return Ok(None);
         };
-        if let Some(ref idx_name) = ft.indexed_by {
-            let exists = tmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
-            if !exists {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
+        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+        Self::validate_table_indexed_by(
+            &tmeta,
+            ft.indexed_by.as_ref(),
+            core.where_clause.as_ref(),
+            alias,
+        )?;
         if Self::synth_rowid_referenced(&tmeta, table_needed_names) {
             return Ok(None);
         }
-        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
         let rel_meta = Self::build_table_rel_meta(&tmeta, alias);
         let expanded = expand_result_columns(core, &rel_meta)?;
         if !expanded.iter().all(|p| p.direct_col.is_some()) {
@@ -2250,19 +2443,16 @@ impl<'a> QueryExec<'a> {
         let Some(ipk_col) = tmeta.ipk_column else {
             return Ok(None);
         };
-        if let Some(ref idx_name) = ft.indexed_by {
-            let exists = tmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
-            if !exists {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
+        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+        Self::validate_table_indexed_by(
+            &tmeta,
+            ft.indexed_by.as_ref(),
+            core.where_clause.as_ref(),
+            alias,
+        )?;
         if Self::synth_rowid_referenced(&tmeta, table_needed_names) {
             return Ok(None);
         }
-        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
         let rel_meta = Self::build_table_rel_meta(&tmeta, alias);
         let expanded = expand_result_columns(core, &rel_meta)?;
 
@@ -2314,18 +2504,17 @@ impl<'a> QueryExec<'a> {
             if ocol != ipk_col {
                 return Ok(None);
             }
-            let resolved_frame = match &spec.frame {
-                Some(fspec) => ResolvedFrame::from_ast(fspec, |b| match &b.expr {
-                    Some(e) => Ok(Some(eval_expr(e, &[], env)?)),
-                    None => Ok(None),
-                })?,
-                None => ResolvedFrame::default_for(true),
-            };
-            if resolved_frame.exclude != FrameExclude::NoOthers
-                || resolved_frame.start_kind != FrameBoundType::UnboundedPreceding
-                || resolved_frame.end_kind != FrameBoundType::CurrentRow
-            {
-                return Ok(None);
+            if let Some(ref fspec) = spec.frame {
+                let is_cumul_ast = fspec.exclude.unwrap_or(FrameExclude::NoOthers)
+                    == FrameExclude::NoOthers
+                    && fspec.from.kind == FrameBoundType::UnboundedPreceding
+                    && fspec
+                        .to
+                        .as_ref()
+                        .is_none_or(|t| t.kind == FrameBoundType::CurrentRow);
+                if !is_cumul_ast {
+                    return Ok(None);
+                }
             }
             if !self
                 .options
@@ -2538,7 +2727,7 @@ impl<'a> QueryExec<'a> {
                         }
                         prev_ipk = Some(cur_ipk);
                         let run_val = if let Some(ref mut fb) = fallback {
-                            fb.step_value(&vals[sum_cid]);
+                            fb.step_value(&vals[sum_cid], env.fn_ctx.encoding);
                             fb.value_as(sk)?
                         } else {
                             match &vals[sum_cid] {
@@ -2554,9 +2743,12 @@ impl<'a> QueryExec<'a> {
                                     } else {
                                         let mut sa = crate::functions::aggregates::SumAcc::new(sk);
                                         if has_val {
-                                            sa.step_value(&SqlValue::Int(int_sum));
+                                            sa.step_value(
+                                                &SqlValue::Int(int_sum),
+                                                env.fn_ctx.encoding,
+                                            );
                                         }
-                                        sa.step_value(&vals[sum_cid]);
+                                        sa.step_value(&vals[sum_cid], env.fn_ctx.encoding);
                                         let rv = sa.value_as(sk)?;
                                         fallback = Some(sa);
                                         rv
@@ -2574,9 +2766,9 @@ impl<'a> QueryExec<'a> {
                                 other => {
                                     let mut sa = crate::functions::aggregates::SumAcc::new(sk);
                                     if has_val {
-                                        sa.step_value(&SqlValue::Int(int_sum));
+                                        sa.step_value(&SqlValue::Int(int_sum), env.fn_ctx.encoding);
                                     }
-                                    sa.step_value(other);
+                                    sa.step_value(other, env.fn_ctx.encoding);
                                     let rv = sa.value_as(sk)?;
                                     fallback = Some(sa);
                                     rv
@@ -2623,7 +2815,7 @@ impl<'a> QueryExec<'a> {
                             return Ok(false);
                         }
                         prev_ipk = Some(cur_ipk);
-                        sum_acc.step_value(&vals[sum_cid]);
+                        sum_acc.step_value(&vals[sum_cid], env.fn_ctx.encoding);
                         let v0 = if c0_is_ipk {
                             SqlValue::Int(cur_ipk)
                         } else {
@@ -2689,7 +2881,9 @@ impl<'a> QueryExec<'a> {
                                     *c += 1;
                                 }
                             }
-                            OnlineAggAcc::Sum(cid, sa) => sa.step_value(&vals[*cid]),
+                            OnlineAggAcc::Sum(cid, sa) => {
+                                sa.step_value(&vals[*cid], env.fn_ctx.encoding)
+                            }
                         }
                     }
                     let mut out_row = Vec::with_capacity(proj_len);
@@ -2785,26 +2979,20 @@ impl<'a> QueryExec<'a> {
         {
             return Ok(None);
         }
-        if let Some(ref idx_name) = lt.indexed_by {
-            if !lmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name))
-            {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
-        if let Some(ref idx_name) = rt.indexed_by {
-            if !rmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name))
-            {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
         let lalias = lt.alias.as_ref().unwrap_or(&lt.name).name.as_str();
         let ralias = rt.alias.as_ref().unwrap_or(&rt.name).name.as_str();
+        Self::validate_table_indexed_by(
+            &lmeta,
+            lt.indexed_by.as_ref(),
+            core.where_clause.as_ref(),
+            lalias,
+        )?;
+        Self::validate_table_indexed_by(
+            &rmeta,
+            rt.indexed_by.as_ref(),
+            core.where_clause.as_ref(),
+            ralias,
+        )?;
         let lrel_meta = Self::build_table_rel_meta(&lmeta, lalias);
         let rrel_meta = Self::build_table_rel_meta(&rmeta, ralias);
         let Some((lk, rk, aff, cname)) =
@@ -3038,14 +3226,9 @@ impl<'a> QueryExec<'a> {
                 .collect()
         });
         let init_cap = if has_meter {
-            r_row_count.max(64)
+            r_row_count.min(64)
         } else {
-            self.catalog
-                .count_table_rows(lschema, &lt.name.name, None)
-                .ok()
-                .flatten()
-                .map(|c| (c as usize).min(1_000_000))
-                .unwrap_or_else(|| r_row_count.max(1024))
+            r_row_count.max(1024)
         };
         let mut out_rows: Vec<Vec<SqlValue>> = Vec::with_capacity(init_cap);
         let proj_len = proj_srcs.len();
@@ -3084,24 +3267,8 @@ impl<'a> QueryExec<'a> {
                 None,
                 &mut |_rid, lvals| {
                     if let SqlValue::Int(k) = lvals[lk] {
-                        let uk = k as usize;
-                        if k >= 0 && uk < slots_len {
-                            let slot = small_int_slots[uk];
-                            if slot != 0 {
-                                out_rows.push(vec![
-                                    lvals[c0].clone(),
-                                    lvals[c1].clone(),
-                                    r_proj[(slot - 1) as usize].clone(),
-                                ]);
-                            }
-                        }
-                        return Ok(true);
-                    }
-                    if !lvals[lk].is_null() {
-                        let lv = coerce_numeric(&lvals[lk]);
-                        if let Some(HashKey::Num(k)) = HashKey::from_sql(&lv) {
-                            let uk = k as usize;
-                            if k >= 0 && uk < slots_len {
+                        if let Ok(uk) = usize::try_from(k) {
+                            if uk < slots_len {
                                 let slot = small_int_slots[uk];
                                 if slot != 0 {
                                     out_rows.push(vec![
@@ -3109,6 +3276,24 @@ impl<'a> QueryExec<'a> {
                                         lvals[c1].clone(),
                                         r_proj[(slot - 1) as usize].clone(),
                                     ]);
+                                }
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    if !lvals[lk].is_null() {
+                        let lv = coerce_numeric(&lvals[lk]);
+                        if let Some(HashKey::Num(k)) = HashKey::from_sql(&lv) {
+                            if let Ok(uk) = usize::try_from(k) {
+                                if uk < slots_len {
+                                    let slot = small_int_slots[uk];
+                                    if slot != 0 {
+                                        out_rows.push(vec![
+                                            lvals[c0].clone(),
+                                            lvals[c1].clone(),
+                                            r_proj[(slot - 1) as usize].clone(),
+                                        ]);
+                                    }
                                 }
                             }
                         }
@@ -3290,15 +3475,13 @@ impl<'a> QueryExec<'a> {
         let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? else {
             return Ok(None);
         };
-        if let Some(ref idx_name) = ft.indexed_by {
-            if !tmeta
-                .indexes
-                .iter()
-                .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name))
-            {
-                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
-            }
-        }
+        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
+        Self::validate_table_indexed_by(
+            &tmeta,
+            ft.indexed_by.as_ref(),
+            core.where_clause.as_ref(),
+            alias,
+        )?;
         if Self::synth_rowid_referenced(&tmeta, table_needed_names) {
             return Ok(None);
         }
@@ -3309,7 +3492,6 @@ impl<'a> QueryExec<'a> {
         {
             return Ok(None);
         }
-        let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
         let rel_meta = Self::build_table_rel_meta(&tmeta, alias);
         let expanded = expand_result_columns(core, &rel_meta)?;
         if expanded
@@ -3734,7 +3916,7 @@ impl<'a> QueryExec<'a> {
                 if let Some((sum_cid, _)) = fast_cs_sum {
                     let g = &mut cs_accs[gid];
                     g.0 += 1;
-                    g.1.step_value(&vals[sum_cid]);
+                    g.1.step_value(&vals[sum_cid], env.fn_ctx.encoding);
                 } else if stride > 0 {
                     let base = gid * stride;
                     for acc in &mut group_accs[base..base + stride] {
@@ -3745,7 +3927,9 @@ impl<'a> QueryExec<'a> {
                                     *c += 1;
                                 }
                             }
-                            OnlineAggAcc::Sum(cid, sa) => sa.step_value(&vals[*cid]),
+                            OnlineAggAcc::Sum(cid, sa) => {
+                                sa.step_value(&vals[*cid], env.fn_ctx.encoding)
+                            }
                         }
                     }
                 }
@@ -3920,6 +4104,53 @@ impl<'a> QueryExec<'a> {
 
     // ───────────────────────────── FROM / JOINS ─────────────────────────────
 
+    fn validate_table_indexed_by(
+        tmeta: &crate::catalog::TableMeta,
+        indexed_by: Option<&xdb_parser::Name>,
+        where_clause: Option<&Expr>,
+        alias: &str,
+    ) -> SqlResult<()> {
+        if let Some(idx_name) = indexed_by {
+            let Some(ix) = tmeta
+                .indexes
+                .iter()
+                .find(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name))
+            else {
+                return Err(SqlError::runtime(format!("no such index: {}", idx_name.name)));
+            };
+            if ix.partial {
+                let mut preds = Vec::new();
+                if let Some(we) = where_clause {
+                    let mut stack = vec![we];
+                    while let Some(cur) = stack.pop() {
+                        if let Expr::Binary {
+                            op: BinaryOp::And,
+                            left,
+                            right,
+                            ..
+                        } = cur
+                        {
+                            stack.push(right);
+                            stack.push(left);
+                        } else {
+                            preds.push(cur);
+                        }
+                    }
+                }
+                let matched = ix.where_clause.as_ref().is_some_and(|iw| {
+                    crate::explain::where_implies_partial_index(&preds, iw, &tmeta.name, alias)
+                });
+                if !matched {
+                    return Err(SqlError::runtime(format!(
+                        "cannot use index: {}",
+                        ix.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn eval_from_depth(
         &self,
         source: &FromSource,
@@ -3938,6 +4169,12 @@ impl<'a> QueryExec<'a> {
                 // 1. Check CTEs first (only when unqualified)
                 if schema.is_none() {
                     if let Some(cte) = self.ctes.get(&ft.name.name.to_ascii_lowercase()) {
+                        if let Some(ref idx_name) = ft.indexed_by {
+                            return Err(SqlError::runtime(format!(
+                                "no such index: {}",
+                                idx_name.name
+                            )));
+                        }
                         let columns: Vec<ScopeColumn> = cte
                             .columns
                             .iter()
@@ -3952,7 +4189,9 @@ impl<'a> QueryExec<'a> {
                         let star_hidden = vec![false; columns.len()];
                         let using_hidden = vec![false; columns.len()];
                         let source_ids = vec![0u32; columns.len()];
-                        let rows = if let Some(m) = self.options.meter.as_deref() {
+                        let rows = if self.validate_only {
+                            Vec::new()
+                        } else if let Some(m) = self.options.meter.as_deref() {
                             m.charge_steps((cte.rows.len() as u64).max(1))?;
                             let bytes: u64 = cte.rows.iter().map(|r| estimate_row_bytes(r)).sum();
                             m.reserve_memory(bytes)?;
@@ -3981,18 +4220,12 @@ impl<'a> QueryExec<'a> {
                     )));
                 }
                 if let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? {
-                    if let Some(ref idx_name) = ft.indexed_by {
-                        let exists = tmeta
-                            .indexes
-                            .iter()
-                            .any(|ix| ix.name.eq_ignore_ascii_case(&idx_name.name));
-                        if !exists {
-                            return Err(SqlError::runtime(format!(
-                                "no such index: {}",
-                                idx_name.name
-                            )));
-                        }
-                    }
+                    Self::validate_table_indexed_by(
+                        &tmeta,
+                        ft.indexed_by.as_ref(),
+                        where_hint_expr,
+                        &alias,
+                    )?;
                     let hint = if let Some(we) = where_hint_expr {
                         if ft.not_indexed {
                             TableScanHint::FullScan
@@ -4022,13 +4255,17 @@ impl<'a> QueryExec<'a> {
                         }
                         idxs
                     });
-                    let scanned = self.catalog.scan_table(
-                        schema,
-                        &ft.name.name,
-                        &hint,
-                        needed_indices.as_deref(),
-                        self.options.meter.as_deref(),
-                    )?;
+                    let scanned = if self.validate_only {
+                        Vec::new()
+                    } else {
+                        self.catalog.scan_table(
+                            schema,
+                            &ft.name.name,
+                            &hint,
+                            needed_indices.as_deref(),
+                            self.options.meter.as_deref(),
+                        )?
+                    };
                     let synth_rowid_needed = tmeta.has_rowid
                         && needed_col_names.is_none_or(|names| {
                             names.iter().any(|n| {
@@ -4102,7 +4339,14 @@ impl<'a> QueryExec<'a> {
 
                 // 3. Check catalog views
                 if let Some(vmeta) = self.catalog.get_view(schema, &ft.name.name)? {
-                    if self.view_depth >= 64 {
+                    if let Some(ref idx_name) = ft.indexed_by {
+                        return Err(SqlError::runtime(format!(
+                            "no such index: {}",
+                            idx_name.name
+                        )));
+                    }
+                    let vlower = vmeta.name.to_ascii_lowercase();
+                    if self.view_depth >= 64 || self.active_views.iter().any(|v| v == &vlower) {
                         return Err(SqlError::runtime(format!(
                             "view {} is circularly defined",
                             vmeta.name
@@ -4110,6 +4354,8 @@ impl<'a> QueryExec<'a> {
                     }
                     let mut view_runner = self.child_with_ctes(HashMap::new());
                     view_runner.view_depth = self.view_depth + 1;
+                    view_runner.active_views.push(vlower);
+                    view_runner.in_trigger = false;
                     let parse_opts = ParseOptions {
                         dialect: self.options.dialect,
                         ..ParseOptions::default()
@@ -4128,6 +4374,11 @@ impl<'a> QueryExec<'a> {
                             )));
                         }
                     };
+                    if !self.validate_only && crate::eval::select_contains_raise(&view_select) {
+                        return Err(SqlError::runtime(
+                            "RAISE() may only be used within a trigger-program",
+                        ));
+                    }
                     let (mut vcols, vrows) = view_runner.execute_select_stmt(&view_select, &[])?;
                     if let Some(ref explicit_names) = vmeta.columns {
                         if explicit_names.len() != vcols.len() {
@@ -4158,19 +4409,37 @@ impl<'a> QueryExec<'a> {
                 }
 
                 // 4. Eponymous 0-arg TVF fallback (e.g. `SELECT * FROM pragma_database_list`, `FROM json_each`)
-                if let Some(tvf) = self.catalog.call_tvf(
+                if let Some(mut tvf) = self.catalog.call_tvf(
                     schema,
                     &ft.name.name,
                     &[],
                     self.options.meter.as_deref(),
                 )? {
+                    if let Some(ref idx_name) = ft.indexed_by {
+                        return Err(SqlError::runtime(format!(
+                            "no such index: {}",
+                            idx_name.name
+                        )));
+                    }
+                    if self.validate_only {
+                        tvf.rows.clear();
+                    }
                     return Ok(relation_from_tvf(&alias, tvf));
                 }
                 if schema.is_none() {
                     let lower = ft.name.name.to_ascii_lowercase();
                     if matches!(lower.as_str(), "json_each" | "json_tree") {
+                        if let Some(ref idx_name) = ft.indexed_by {
+                            return Err(SqlError::runtime(format!(
+                                "no such index: {}",
+                                idx_name.name
+                            )));
+                        }
                         let env = self.make_env();
-                        if let Some(tvf) = call_builtin_tvf(&lower, &[], &env.fn_ctx)? {
+                        if let Some(mut tvf) = call_builtin_tvf(&lower, &[], &env.fn_ctx)? {
+                            if self.validate_only {
+                                tvf.rows.clear();
+                            }
                             return Ok(relation_from_tvf(&alias, tvf));
                         }
                     }
@@ -4184,24 +4453,41 @@ impl<'a> QueryExec<'a> {
             FromSource::Function(ff) => {
                 let env = self.make_env();
                 let mut arg_vals = Vec::with_capacity(ff.args.len());
-                for a in &ff.args {
-                    arg_vals.push(eval_expr(a, outer_scopes, &env)?);
+                if self.validate_only {
+                    for a in &ff.args {
+                        self.validate_expr_and_subqueries(a, outer_scopes)?;
+                        arg_vals.push(SqlValue::Null);
+                    }
+                } else {
+                    for a in &ff.args {
+                        arg_vals.push(eval_expr(a, outer_scopes, &env)?);
+                    }
                 }
                 let schema = ff.schema.as_ref().map(|n| n.name.as_str());
                 let alias = ff.alias.as_ref().unwrap_or(&ff.name).name.clone();
-                if let Some(tvf) = self.catalog.call_tvf(
+                if let Some(mut tvf) = self.catalog.call_tvf(
                     schema,
                     &ff.name.name,
                     &arg_vals,
                     self.options.meter.as_deref(),
                 )? {
+                    if self.validate_only {
+                        tvf.rows.clear();
+                    }
                     return Ok(relation_from_tvf(&alias, tvf));
                 }
                 let lower = ff.name.name.to_ascii_lowercase();
-                let row_cap = order_limit_ctx.and_then(|(_, ob, k)| ob.is_none().then_some(k));
-                if let Some(tvf) =
+                let row_cap = if self.validate_only {
+                    Some(0)
+                } else {
+                    order_limit_ctx.and_then(|(_, ob, k)| ob.is_none().then_some(k))
+                };
+                if let Some(mut tvf) =
                     call_builtin_tvf_with_limit(&lower, &arg_vals, &env.fn_ctx, row_cap)?
                 {
+                    if self.validate_only {
+                        tvf.rows.clear();
+                    }
                     return Ok(relation_from_tvf(&alias, tvf));
                 }
                 Err(SqlError::runtime(format!(
@@ -4236,6 +4522,23 @@ impl<'a> QueryExec<'a> {
                     depth + 1,
                 )?;
                 if let Some(ref alias) = fg.alias {
+                    // When aliasing a parenthesized join (e.g. `(a FULL OUTER JOIN b USING (id)) AS g`),
+                    // drop duplicate `using_hidden` columns so `g.id` resolves unambiguously.
+                    if rel.using_hidden.iter().any(|&h| h) {
+                        let keep: Vec<usize> = rel
+                            .using_hidden
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &h)| (!h).then_some(i))
+                            .collect();
+                        rel.columns = keep.iter().map(|&i| rel.columns[i].clone()).collect();
+                        rel.star_hidden = keep.iter().map(|&i| rel.star_hidden[i]).collect();
+                        rel.using_hidden = vec![false; keep.len()];
+                        rel.source_ids = keep.iter().map(|&i| rel.source_ids[i]).collect();
+                        for row in &mut rel.rows {
+                            *row = keep.iter().map(|&i| row[i].clone()).collect();
+                        }
+                    }
                     for c in &mut rel.columns {
                         c.table = Some(alias.name.clone());
                     }
@@ -4380,7 +4683,7 @@ impl<'a> QueryExec<'a> {
                     on_sc.source_ids = Some(&combined_source_ids_cache);
                     on_scopes.push(on_sc);
                     let cond = eval_expr(on_expr, &on_scopes, &env)?;
-                    if !boolean_value(&cond, false) {
+                    if !xdb_core::value::boolean_value_enc(&cond, false, self.options.collations.encoding()) {
                         continue;
                     }
                 }
@@ -4397,10 +4700,19 @@ impl<'a> QueryExec<'a> {
             }
         }
 
-        // If left side was empty, obtain TVF column names with NULL args.
+        // If left side was empty, validate TVF argument expressions against the left scope
+        // and obtain TVF column names with NULL args.
         let r_col_names = match tvf_cols {
             Some(c) => c,
             None => {
+                let mut scopes = outer_scopes.to_vec();
+                let mut sc = EvalScope::simple(&lrel.columns, &[]);
+                sc.hidden_unqualified = Some(&lrel.using_hidden);
+                sc.source_ids = Some(&lrel.source_ids);
+                scopes.push(sc);
+                for a in &ff.args {
+                    self.validate_expr_and_subqueries(a, &scopes)?;
+                }
                 let nulls = vec![SqlValue::Null; ff.args.len()];
                 if let Some(r) = self.catalog.call_tvf(schema, &ff.name.name, &nulls, None)? {
                     r.columns
@@ -4427,6 +4739,16 @@ impl<'a> QueryExec<'a> {
             star_hidden.push(false);
             using_hidden.push(false);
             source_ids.push(rhs_sid);
+        }
+        if let Some(on_expr) = on {
+            if !checked_on {
+                let mut on_scopes = outer_scopes.to_vec();
+                let mut on_sc = EvalScope::simple(&columns, &[]);
+                on_sc.hidden_unqualified = Some(&using_hidden);
+                on_sc.source_ids = Some(&source_ids);
+                on_scopes.push(on_sc);
+                self.validate_expr_and_subqueries(on_expr, &on_scopes)?;
+            }
         }
         if let Some(on_expr) = on {
             if !checked_on {
@@ -4684,7 +5006,7 @@ impl<'a> QueryExec<'a> {
                     sc.source_ids = Some(&combined_source_ids);
                     scopes.push(sc);
                     let cond = eval_expr(on_expr, &scopes, &env)?;
-                    if !boolean_value(&cond, false) {
+                    if !xdb_core::value::boolean_value_enc(&cond, false, self.options.collations.encoding()) {
                         continue;
                     }
                 }
@@ -5801,8 +6123,8 @@ impl<'a> QueryExec<'a> {
             }
         }
 
-        // SQLite rejects referencing an aggregate SELECT alias in GROUP BY with a specific error
-        // (including through `COLLATE` wrappers such as `GROUP BY cnt COLLATE NOCASE`).
+        // SQLite rejects referencing an aggregate or window SELECT alias in GROUP BY with a
+        // specific error (including through `COLLATE` wrappers such as `GROUP BY cnt COLLATE NOCASE`).
         for g in &group_exprs {
             let mut inner = g;
             while let Expr::Collate { operand, .. } = inner {
@@ -5827,6 +6149,24 @@ impl<'a> QueryExec<'a> {
                             ));
                         }
                     }
+                    let is_win_alias = expanded.iter().any(|p| {
+                        p.explicit_alias
+                            .as_deref()
+                            .is_some_and(|a| a.eq_ignore_ascii_case(&c.column.name))
+                            && expr_contains_window(&p.expr)
+                    });
+                    if is_win_alias {
+                        let in_rel = rel.columns.iter().enumerate().any(|(idx, rc)| {
+                            !rel.using_hidden.get(idx).copied().unwrap_or(false)
+                                && rc.name.eq_ignore_ascii_case(&c.column.name)
+                        });
+                        if !in_rel {
+                            return Err(SqlError::runtime(format!(
+                                "misuse of aliased window function {}",
+                                c.column.name
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -5843,7 +6183,9 @@ impl<'a> QueryExec<'a> {
                 .iter()
                 .filter_map(|p| {
                     let alias = p.explicit_alias.as_ref()?;
-                    if expr_contains_aggregate(&p.expr, self.options) {
+                    if expr_contains_aggregate(&p.expr, self.options)
+                        || expr_contains_window(&p.expr)
+                    {
                         return None;
                     }
                     let aff = expr_affinity(&p.expr, &scopes).unwrap_or(Affinity::None);
@@ -5928,8 +6270,22 @@ impl<'a> QueryExec<'a> {
                 p.explicit_alias.as_ref().is_some_and(|alias| {
                     gb_needed_aliases.contains(&alias.to_ascii_lowercase())
                         && !expr_contains_aggregate(&p.expr, self.options)
+                        && !expr_contains_window(&p.expr)
                 })
             });
+        if self.validate_only {
+            for c in &group_colls {
+                let _ = env.lookup_collation(c)?;
+            }
+            for fcall in &agg_calls {
+                let _ = self.options.functions.create_aggregate(
+                    &fcall.name.name,
+                    fcall.args.len(),
+                    fcall.star,
+                )?;
+            }
+            return Ok((Vec::new(), Vec::new()));
+        }
         let hav_needed_aliases: HashSet<String> = {
             let mut names = HashSet::new();
             if let Some(ref hav) = core.having {
@@ -6094,6 +6450,7 @@ impl<'a> QueryExec<'a> {
 
                         if stride > 0 {
                             let base = gid * stride;
+                            let enc = self.options.collations.encoding();
                             for acc in &mut group_accs[base..base + stride] {
                                 match acc {
                                     OnlineAggAcc::CountStar(c) => *c += 1,
@@ -6102,7 +6459,7 @@ impl<'a> QueryExec<'a> {
                                             *c += 1;
                                         }
                                     }
-                                    OnlineAggAcc::Sum(cid, sa) => sa.step_value(&row[*cid]),
+                                    OnlineAggAcc::Sum(cid, sa) => sa.step_value(&row[*cid], enc),
                                 }
                             }
                         }
@@ -6313,7 +6670,7 @@ impl<'a> QueryExec<'a> {
                     }
                 }
                 let cond = eval_expr(hav, &scopes, &env)?;
-                if !boolean_value(&cond, false) {
+                if !xdb_core::value::boolean_value_enc(&cond, false, self.options.collations.encoding()) {
                     continue;
                 }
             }
@@ -6362,7 +6719,13 @@ impl<'a> QueryExec<'a> {
                     agg_coll_name = cname.clone();
                     Some(env.lookup_collation(cname)?)
                 }
-                None => None,
+                None => {
+                    if self.options.collations.encoding() != xdb_core::TextEncoding::Utf8 {
+                        Some(env.lookup_collation("BINARY")?)
+                    } else {
+                        None
+                    }
+                }
             }
         } else {
             None
@@ -6428,7 +6791,7 @@ impl<'a> QueryExec<'a> {
 
                 if let Some(ref flt) = fcall.filter {
                     let cond = eval_expr(flt, &scopes_buf, env)?;
-                    if !boolean_value(&cond, false) {
+                    if !xdb_core::value::boolean_value_enc(&cond, false, self.options.collations.encoding()) {
                         scopes_buf.pop();
                         continue;
                     }
@@ -6482,7 +6845,7 @@ impl<'a> QueryExec<'a> {
 
             if let Some(ref flt) = fcall.filter {
                 let cond = eval_expr(flt, &scopes_buf, env)?;
-                if !boolean_value(&cond, false) {
+                if !xdb_core::value::boolean_value_enc(&cond, false, self.options.collations.encoding()) {
                     scopes_buf.pop();
                     continue;
                 }
@@ -6706,6 +7069,14 @@ impl<'a> QueryExec<'a> {
                 || wcall.filter.as_deref().is_some_and(expr_contains_window)
                 || part_exprs.iter().any(expr_contains_window)
                 || ord_terms.iter().any(|ot| expr_contains_window(&ot.expr))
+                || spec.frame.as_ref().is_some_and(|fr| {
+                    fr.from.expr.as_deref().is_some_and(expr_contains_window)
+                        || fr
+                            .to
+                            .as_ref()
+                            .and_then(|b| b.expr.as_deref())
+                            .is_some_and(expr_contains_window)
+                })
             {
                 return Err(SqlError::runtime("misuse of window function"));
             }
@@ -6868,7 +7239,7 @@ impl<'a> QueryExec<'a> {
                                 let mut vals = Vec::with_capacity(rows.len());
                                 for row in rows {
                                     self.charge_steps(1)?;
-                                    step_online_acc(&mut acc, row);
+                                    step_online_acc(&mut acc, row, fctx.encoding);
                                     let v = value_online_acc(&acc, &fctx)?;
                                     if has_meter {
                                         win_mem
@@ -6885,7 +7256,7 @@ impl<'a> QueryExec<'a> {
                             WindowSink::PerRow(precomputed) => {
                                 for (ridx, row) in rows.iter().enumerate() {
                                     self.charge_steps(1)?;
-                                    step_online_acc(&mut acc, row);
+                                    step_online_acc(&mut acc, row, fctx.encoding);
                                     let v = value_online_acc(&acc, &fctx)?;
                                     if has_meter {
                                         win_mem
@@ -7116,7 +7487,7 @@ impl<'a> QueryExec<'a> {
                         let mut acc = make_online_acc(kind);
                         for &ridx in &part {
                             self.charge_steps(1)?;
-                            step_online_acc(&mut acc, &rows[ridx]);
+                            step_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                             let v = value_online_acc(&acc, &fctx)?;
                             if has_meter {
                                 win_mem.reserve(estimate_value_bytes(&v).saturating_add(16))?;
@@ -7196,14 +7567,14 @@ impl<'a> QueryExec<'a> {
                             if new_start >= new_end {
                                 for &ridx in &part[cur_start..cur_end] {
                                     self.charge_steps(1)?;
-                                    inverse_online_acc(&mut acc, &rows[ridx]);
+                                    inverse_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                                 }
                                 cur_start = 0;
                                 cur_end = 0;
                             } else if cur_start == cur_end {
                                 for &ridx in &part[new_start..new_end] {
                                     self.charge_steps(1)?;
-                                    step_online_acc(&mut acc, &rows[ridx]);
+                                    step_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                                 }
                                 cur_start = new_start;
                                 cur_end = new_end;
@@ -7211,12 +7582,12 @@ impl<'a> QueryExec<'a> {
                                 let evict_end = cur_end.min(new_start);
                                 for &ridx in &part[cur_start..evict_end] {
                                     self.charge_steps(1)?;
-                                    inverse_online_acc(&mut acc, &rows[ridx]);
+                                    inverse_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                                 }
                                 let enter_start = cur_end.max(new_start);
                                 for &ridx in &part[enter_start..new_end] {
                                     self.charge_steps(1)?;
-                                    step_online_acc(&mut acc, &rows[ridx]);
+                                    step_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                                 }
                                 cur_start = new_start;
                                 cur_end = new_end;
@@ -7224,7 +7595,7 @@ impl<'a> QueryExec<'a> {
                                 acc = make_online_acc(kind);
                                 for &ridx in &part[new_start..new_end] {
                                     self.charge_steps(1)?;
-                                    step_online_acc(&mut acc, &rows[ridx]);
+                                    step_online_acc(&mut acc, &rows[ridx], fctx.encoding);
                                 }
                                 cur_start = new_start;
                                 cur_end = new_end;
@@ -7279,30 +7650,42 @@ impl<'a> QueryExec<'a> {
                     let keep = if outer_scopes.is_empty() {
                         let sslice = [sc];
                         let k = match &wcall.filter {
-                            Some(flt) => boolean_value(&eval_expr(flt, &sslice, &env)?, false),
+                            Some(flt) => xdb_core::value::boolean_value_enc(
+                                &eval_expr(flt, &sslice, &env)?,
+                                false,
+                                self.options.collations.encoding(),
+                            ),
                             None => true,
                         };
-                        for (ai, ae) in wcall.args.iter().enumerate() {
-                            let (v, is_j) = crate::eval::eval_expr_tagged(ae, &sslice, &env)?;
-                            if is_j && ai < 64 {
-                                jmask |= 1u64 << ai;
+                        if k || is_win_only {
+                            for (ai, ae) in wcall.args.iter().enumerate() {
+                                let (v, is_j) = crate::eval::eval_expr_tagged(ae, &sslice, &env)?;
+                                if is_j && ai < 64 {
+                                    jmask |= 1u64 << ai;
+                                }
+                                avals.push(v);
                             }
-                            avals.push(v);
                         }
                         k
                     } else {
                         let mut scopes = outer_scopes.to_vec();
                         scopes.push(sc);
                         let k = match &wcall.filter {
-                            Some(flt) => boolean_value(&eval_expr(flt, &scopes, &env)?, false),
+                            Some(flt) => xdb_core::value::boolean_value_enc(
+                                &eval_expr(flt, &scopes, &env)?,
+                                false,
+                                self.options.collations.encoding(),
+                            ),
                             None => true,
                         };
-                        for (ai, ae) in wcall.args.iter().enumerate() {
-                            let (v, is_j) = crate::eval::eval_expr_tagged(ae, &scopes, &env)?;
-                            if is_j && ai < 64 {
-                                jmask |= 1u64 << ai;
+                        if k || is_win_only {
+                            for (ai, ae) in wcall.args.iter().enumerate() {
+                                let (v, is_j) = crate::eval::eval_expr_tagged(ae, &scopes, &env)?;
+                                if is_j && ai < 64 {
+                                    jmask |= 1u64 << ai;
+                                }
+                                avals.push(v);
                             }
-                            avals.push(v);
                         }
                         k
                     };
@@ -7342,6 +7725,9 @@ impl<'a> QueryExec<'a> {
                         scopes.push(sample);
                         match expr_collation(first_arg, &scopes).name {
                             Some(ref cname) => Some(env.lookup_collation(cname)?),
+                            None if self.options.collations.encoding() != xdb_core::TextEncoding::Utf8 => {
+                                Some(env.lookup_collation("BINARY")?)
+                            }
                             None => None,
                         }
                     } else {
@@ -7589,7 +7975,7 @@ impl<'a> QueryExec<'a> {
         out_cols: &[ScopeColumn],
         mut rows: Vec<Vec<SqlValue>>,
         order_ctx: Option<&OrderEvalContext>,
-        compound_col_aliases: Option<&[Vec<String>]>,
+        compound_col_aliases: Option<&[CompoundBranchNames]>,
         order_by: Option<&[OrderingTerm]>,
         order_by_all: Option<&OrderByAll>,
         limit: Option<&LimitClause>,
@@ -7635,23 +8021,8 @@ impl<'a> QueryExec<'a> {
                     .map(|c| (c.name.clone(), SqlValue::Null, c.affinity, c.collation.clone()))
                     .collect();
 
-                // Evaluate LIMIT/OFFSET early so we know whether the sort will be skipped
-                // (we still validate ORDER BY terms & collations first!).
-                let lim_eval = if let Some(lim) = limit {
-                    let count = eval_limit_int(&lim.count, outer_scopes, &env)?;
-                    let offset = match &lim.offset {
-                        Some(off_expr) => {
-                            let o = eval_limit_int(off_expr, outer_scopes, &env)?.max(0);
-                            usize::try_from(o).unwrap_or(usize::MAX)
-                        }
-                        None => 0,
-                    };
-                    Some((count, offset))
-                } else {
-                    None
-                };
-                let will_skip_sort = matches!(lim_eval, Some((count, offset)) if count == 0 || offset >= rows.len());
-
+                // Validate all ORDER BY terms, ordinals, and collations BEFORE evaluating LIMIT/OFFSET
+                // so `SELECT 1 ORDER BY 99 LIMIT 'abc'` reports the ORDER BY error first (per SQLite).
                 for (tidx, term) in terms.iter().enumerate() {
                     // Validate every collation in stacked `COLLATE` chains (even on ordinals/aliases).
                     let mut coll_walk = &term.expr;
@@ -7675,29 +8046,29 @@ impl<'a> QueryExec<'a> {
                         term_plans.push(OrderTermPlan::OutCol(ord - 1));
                     } else if let Some(c_aliases) = compound_col_aliases {
                         // SQLite compound SELECT `ORDER BY`: each non-ordinal term MUST match
-                        // an output column name (from any branch of the compound) with optional
-                        // `COLLATE`; arbitrary expressions like `ORDER BY x + 1` are rejected.
-                        let (col_name, ov_coll) = if let Expr::Column(c) = coll_walk {
+                        // an output column name or bare qualified `table.col` source from any
+                        // branch of the compound with optional `COLLATE`; arbitrary expressions
+                        // like `ORDER BY x + 1` or unmatched qualifiers are rejected.
+                        let (col_ref, ov_coll) = if let Expr::Column(c) = coll_walk {
                             let ov = if let Expr::Collate { collation, .. } = &term.expr {
                                 Some(collation.name.as_str())
                             } else {
                                 None
                             };
-                            (c.column.name.as_str(), ov)
+                            (c, ov)
                         } else {
                             return Err(SqlError::runtime(format!(
                                 "{} ORDER BY term does not match any column in the result set",
                                 ordinal_label(tidx + 1)
                             )));
                         };
-                        let pos = out_cols
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .or_else(|| {
-                                c_aliases.iter().position(|names| {
-                                    names.iter().any(|n| n.eq_ignore_ascii_case(col_name))
-                                })
-                            });
+                        let pos = resolve_compound_order_col(
+                            col_ref.schema.as_ref().map(|s| s.name.as_str()),
+                            col_ref.table.as_ref().map(|t| t.name.as_str()),
+                            col_ref.column.name.as_str(),
+                            out_cols,
+                            c_aliases,
+                        );
                         let Some(pos) = pos else {
                             return Err(SqlError::runtime(format!(
                                 "{} ORDER BY term does not match any column in the result set",
@@ -7786,20 +8157,7 @@ impl<'a> QueryExec<'a> {
                         });
                         term_plans.push(resolved_plan);
 
-                        // Validate column resolution on 0/1-row results AND when LIMIT 0 /
-                        // large OFFSET will skip evaluating ORDER BY expressions over rows!
-                        if rows.len() == 1 && !will_skip_sort {
-                            let _ = self.eval_order_term(
-                                &term.expr,
-                                out_cols,
-                                &rows[0],
-                                order_ctx,
-                                0,
-                                outer_scopes,
-                                &env,
-                                true,
-                            )?;
-                        } else if rows.is_empty() || will_skip_sort {
+                        if rows.is_empty() {
                             let dummy_row = vec![SqlValue::Null; out_cols.len()];
                             self.eval_order_term_validate(
                                 &term.expr,
@@ -7813,9 +8171,67 @@ impl<'a> QueryExec<'a> {
                     }
                 }
 
+                // Now evaluate LIMIT/OFFSET; only `LIMIT 0` skips evaluating ORDER BY over rows
+                // (a large `OFFSET >= rows.len()` still runs the sorter and evaluates ORDER BY!).
+                if self.validate_only {
+                    if let Some(lim) = limit {
+                        self.validate_expr_and_subqueries(&lim.count, outer_scopes)?;
+                        if let Some(ref off_expr) = lim.offset {
+                            self.validate_expr_and_subqueries(off_expr, outer_scopes)?;
+                        }
+                    }
+                    return Ok(Vec::new());
+                }
+                let lim_eval = if let Some(lim) = limit {
+                    let count = eval_limit_int(&lim.count, outer_scopes, &env)?;
+                    let offset = match &lim.offset {
+                        Some(off_expr) => {
+                            let o = eval_limit_int(off_expr, outer_scopes, &env)?.max(0);
+                            usize::try_from(o).unwrap_or(usize::MAX)
+                        }
+                        None => 0,
+                    };
+                    Some((count, offset))
+                } else {
+                    None
+                };
+                let will_skip_sort = matches!(lim_eval, Some((count, _)) if count == 0);
+
                 if will_skip_sort {
+                    if !rows.is_empty() && compound_col_aliases.is_none() {
+                        let dummy_row = vec![SqlValue::Null; out_cols.len()];
+                        for (tidx, term) in terms.iter().enumerate() {
+                            if !matches!(term_plans[tidx], OrderTermPlan::OutCol(_)) {
+                                self.eval_order_term_validate(
+                                    &term.expr,
+                                    out_cols,
+                                    &dummy_row,
+                                    order_ctx,
+                                    outer_scopes,
+                                    &env,
+                                )?;
+                            }
+                        }
+                    }
                     rows.clear();
                     return Ok(rows);
+                }
+
+                if rows.len() == 1 && compound_col_aliases.is_none() {
+                    for (tidx, term) in terms.iter().enumerate() {
+                        if !matches!(term_plans[tidx], OrderTermPlan::OutCol(_)) {
+                            let _ = self.eval_order_term(
+                                &term.expr,
+                                out_cols,
+                                &rows[0],
+                                order_ctx,
+                                0,
+                                outer_scopes,
+                                &env,
+                                true,
+                            )?;
+                        }
+                    }
                 }
 
                 let top_k: Option<usize> = lim_eval.and_then(|(count, offset)| {
@@ -7999,6 +8415,13 @@ impl<'a> QueryExec<'a> {
         }
 
         if let Some(lim) = limit {
+            if self.validate_only {
+                self.validate_expr_and_subqueries(&lim.count, outer_scopes)?;
+                if let Some(ref off_expr) = lim.offset {
+                    self.validate_expr_and_subqueries(off_expr, outer_scopes)?;
+                }
+                return Ok(Vec::new());
+            }
             let count = eval_limit_int(&lim.count, outer_scopes, &env)?;
             let offset = match &lim.offset {
                 Some(off_expr) => {
@@ -8233,11 +8656,52 @@ impl<'a> QueryExec<'a> {
                 }
                 Ok(())
             }
-            Expr::InTable { operand, args, .. } => {
+            Expr::InTable {
+                operand,
+                schema,
+                table,
+                args,
+                ..
+            } => {
                 self.validate_expr_subqueries_depth(operand, scopes, depth)?;
                 if let Some(list) = args {
                     for a in list {
                         self.validate_expr_subqueries_depth(a, scopes, depth)?;
+                    }
+                }
+                let s = schema.as_ref().map(|n| n.name.as_str());
+                if let Some(list) = args {
+                    let nulls = vec![SqlValue::Null; list.len()];
+                    let env = self.make_env();
+                    let lower = table.name.to_ascii_lowercase();
+                    let exists = self
+                        .catalog
+                        .call_tvf(s, &table.name, &nulls, None)?
+                        .is_some()
+                        || (s.is_none()
+                            && call_builtin_tvf(&lower, &nulls, &env.fn_ctx)?.is_some());
+                    if !exists {
+                        return Err(SqlError::runtime(format!("no such table: {}", table.name)));
+                    }
+                } else if !(s.is_none() && self.ctes.contains_key(&table.name.to_ascii_lowercase()))
+                {
+                    if !is_valid_schema_name(s) {
+                        return Err(SqlError::runtime(format!(
+                            "no such table: {}.{}",
+                            s.unwrap_or(""),
+                            table.name
+                        )));
+                    }
+                    let exists = self.catalog.get_table_arc(s, &table.name)?.is_some()
+                        || self.catalog.get_view(s, &table.name)?.is_some()
+                        || self.catalog.call_tvf(s, &table.name, &[], None)?.is_some()
+                        || (s.is_none()
+                            && matches!(
+                                table.name.to_ascii_lowercase().as_str(),
+                                "json_each" | "json_tree" | "generate_series"
+                            ));
+                    if !exists {
+                        return Err(SqlError::runtime(format!("no such table: {}", table.name)));
                     }
                 }
                 Ok(())
@@ -8282,6 +8746,12 @@ impl<'a> QueryExec<'a> {
                 Ok(())
             }
             Expr::Function(f) => {
+                self.options.functions.validate_function_call(
+                    &f.name.name,
+                    f.args.len(),
+                    f.star,
+                    f.over.is_some(),
+                )?;
                 for a in &f.args {
                     self.validate_expr_subqueries_depth(a, scopes, depth)?;
                 }
@@ -8304,6 +8774,16 @@ impl<'a> QueryExec<'a> {
                             self.validate_expr_subqueries_depth(&o.expr, scopes, depth)?;
                         }
                     }
+                    if let Some(ref fr) = ws.frame {
+                        if let Some(ref fe) = fr.from.expr {
+                            self.validate_expr_subqueries_depth(fe, scopes, depth)?;
+                        }
+                        if let Some(ref to) = fr.to {
+                            if let Some(ref te) = to.expr {
+                                self.validate_expr_subqueries_depth(te, scopes, depth)?;
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -8313,6 +8793,17 @@ impl<'a> QueryExec<'a> {
                 }
                 for i in items {
                     self.validate_expr_subqueries_depth(i, scopes, depth)?;
+                }
+                Ok(())
+            }
+            Expr::Raise { message, .. } => {
+                if !self.validate_only && !self.in_trigger {
+                    return Err(SqlError::runtime(
+                        "RAISE() may only be used within a trigger-program",
+                    ));
+                }
+                if let Some(m) = message {
+                    self.validate_expr_subqueries_depth(m, scopes, depth)?;
                 }
                 Ok(())
             }
@@ -8343,161 +8834,19 @@ impl<'a> QueryExec<'a> {
         }
     }
 
-    fn build_from_schema_only(&self, from: &FromSource) -> SqlResult<Option<Relation>> {
-        match from {
-            FromSource::Table(ft) => {
-                let schema = ft.schema.as_ref().map(|s| s.name.as_str());
-                let alias = ft.alias.as_ref().unwrap_or(&ft.name).name.as_str();
-                if schema.is_none() {
-                    if let Some(cte) = self.ctes.get(&ft.name.name.to_ascii_lowercase()) {
-                        let cols: Vec<ScopeColumn> = cte
-                            .columns
-                            .iter()
-                            .map(|c| ScopeColumn {
-                                table: Some(alias.to_string()),
-                                name: c.name.clone(),
-                                affinity: c.affinity,
-                                collation: c.collation.clone(),
-                                is_rowid_alias: false,
-                            })
-                            .collect();
-                        let n = cols.len();
-                        return Ok(Some(Relation {
-                            columns: cols,
-                            star_hidden: vec![false; n],
-                            using_hidden: vec![false; n],
-                            source_ids: vec![0; n],
-                            rows: Vec::new(),
-                        }));
-                    }
-                }
-                if let Some(tmeta) = self.catalog.get_table_arc(schema, &ft.name.name)? {
-                    let mut rel = Self::build_table_rel_meta(&tmeta, alias);
-                    if tmeta.has_rowid {
-                        for rname in ["rowid", "_rowid_", "oid"] {
-                            if !rel
-                                .columns
-                                .iter()
-                                .any(|c| c.name.eq_ignore_ascii_case(rname))
-                            {
-                                rel.columns.push(ScopeColumn {
-                                    table: Some(alias.to_string()),
-                                    name: rname.to_string(),
-                                    affinity: Affinity::Integer,
-                                    collation: "BINARY".to_string(),
-                                    is_rowid_alias: true,
-                                });
-                                rel.star_hidden.push(true);
-                                rel.using_hidden.push(false);
-                                rel.source_ids.push(0);
-                            }
-                        }
-                    }
-                    return Ok(Some(rel));
-                }
-                if self.catalog.get_view(schema, &ft.name.name)?.is_some() {
-                    return Ok(None);
-                }
-                if self
-                    .catalog
-                    .call_tvf(schema, &ft.name.name, &[], self.options.meter.as_deref())?
-                    .is_some()
-                {
-                    return Ok(None);
-                }
-                let full = match schema {
-                    Some(s) => format!("{s}.{}", ft.name.name),
-                    None => ft.name.name.clone(),
-                };
-                Err(SqlError::runtime(format!("no such table: {full}")))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn validate_subquery_schema(
         &self,
         sel: &SelectStmt,
         outer_scopes: &[EvalScope<'_>],
         depth: usize,
     ) -> SqlResult<Option<usize>> {
-        if depth >= MAX_QUERY_DEPTH || sel.with.is_some() {
-            return Ok(None);
-        }
-        self.validate_subquery_body(&sel.body, outer_scopes, depth)
-    }
-
-    fn validate_subquery_body(
-        &self,
-        body: &SelectBody,
-        outer_scopes: &[EvalScope<'_>],
-        depth: usize,
-    ) -> SqlResult<Option<usize>> {
         if depth >= MAX_QUERY_DEPTH {
             return Ok(None);
         }
-        match body {
-            SelectBody::Values(v) => {
-                for row in &v.rows {
-                    for item in &row.items {
-                        validate_expr_columns(
-                            item,
-                            outer_scopes,
-                            self.options.dqs,
-                        )?;
-                        self.validate_expr_subqueries_depth(item, outer_scopes, depth)?;
-                    }
-                }
-                Ok(v.rows.first().map(|r| r.items.len()))
-            }
-            SelectBody::Compound {
-                op, left, right, ..
-            } => {
-                let lc = self.validate_subquery_body(left, outer_scopes, depth + 1)?;
-                let rc = self.validate_subquery_body(right, outer_scopes, depth + 1)?;
-                if let (Some(l), Some(r)) = (lc, rc) {
-                    if l != r {
-                        return Err(SqlError::runtime(format!(
-                            "SELECTs to the left and right of {} do not have the same number of result columns",
-                            op.as_str()
-                        )));
-                    }
-                }
-                Ok(lc.or(rc))
-            }
-            SelectBody::Core(core) => {
-                let rel_opt = match &core.from {
-                    None => Some(Relation::single_empty_row()),
-                    Some(from_src) => self.build_from_schema_only(from_src)?,
-                };
-                if let Some(rel) = rel_opt {
-                    let expanded = expand_result_columns(core, &rel)?;
-                    let mut scopes = outer_scopes.to_vec();
-                    let mut sc = EvalScope::simple(&rel.columns, &[]);
-                    sc.hidden_unqualified = Some(&rel.using_hidden);
-                    sc.source_ids = Some(&rel.source_ids);
-                    scopes.push(sc);
-                    if let Some(ref we) = core.where_clause {
-                        self.validate_expr_and_subqueries(we, &scopes)?;
-                    }
-                    for p in &expanded {
-                        if p.direct_col.is_none() {
-                            self.validate_expr_and_subqueries(&p.expr, &scopes)?;
-                        }
-                    }
-                    Ok(Some(expanded.len()))
-                } else if !core.columns.is_empty()
-                    && core
-                        .columns
-                        .iter()
-                        .all(|c| matches!(c, ResultColumn::Expr(_)))
-                {
-                    Ok(Some(core.columns.len()))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        let mut sub_exec = self.child_with_ctes(self.ctes.clone()).with_validate_only();
+        sub_exec.query_depth = depth;
+        let (cols, _) = sub_exec.execute_select_stmt(sel, outer_scopes)?;
+        Ok(Some(cols.len()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8809,7 +9158,8 @@ impl SubqueryRunner for QueryExec<'_> {
         let tmeta = self.catalog.get_table_arc(schema, table)?;
         if tmeta.is_none() {
             if let Some(vmeta) = self.catalog.get_view(schema, table)? {
-                if self.view_depth >= 64 {
+                let vlower = vmeta.name.to_ascii_lowercase();
+                if self.view_depth >= 64 || self.active_views.iter().any(|v| v == &vlower) {
                     return Err(SqlError::runtime(format!(
                         "view {} is circularly defined",
                         vmeta.name
@@ -8817,6 +9167,7 @@ impl SubqueryRunner for QueryExec<'_> {
                 }
                 let mut view_runner = self.child_with_ctes(HashMap::new());
                 view_runner.view_depth = self.view_depth + 1;
+                view_runner.active_views.push(vlower);
                 let parse_opts = ParseOptions {
                     dialect: self.options.dialect,
                     ..ParseOptions::default()
@@ -9247,6 +9598,11 @@ fn collect_unqualified_col_names(expr: &Expr, out: &mut HashSet<String>) {
                 collect_unqualified_col_names(i, out);
             }
         }
+        Expr::Raise {
+            message: Some(m), ..
+        } => {
+            collect_unqualified_col_names(m, out);
+        }
         _ => {}
     }
 }
@@ -9445,6 +9801,12 @@ fn validate_expr_columns(expr: &Expr, scopes: &[EvalScope<'_>], dqs: bool) -> Sq
         Expr::Vector { items, .. } => {
             for i in items {
                 validate_expr_columns(i, scopes, dqs)?;
+            }
+            Ok(())
+        }
+        Expr::Raise { message, .. } => {
+            if let Some(m) = message {
+                validate_expr_columns(m, scopes, dqs)?;
             }
             Ok(())
         }
@@ -9657,18 +10019,122 @@ impl<'a> RowDedup<'a> {
     }
 }
 
-fn record_compound_branch_names(branch_names: &mut Vec<Vec<String>>, cols: &[ScopeColumn]) {
-    if branch_names.len() < cols.len() {
-        branch_names.resize_with(cols.len(), Vec::new);
-    }
-    for (i, c) in cols.iter().enumerate() {
-        if !branch_names[i]
+#[derive(Default)]
+struct CompoundBranchNames {
+    unqualified: Vec<String>,
+    qualified: Vec<(String, String)>,
+}
+
+impl CompoundBranchNames {
+    fn push_unqualified(&mut self, name: String) {
+        if !self
+            .unqualified
             .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&c.name))
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
         {
-            branch_names[i].push(c.name.clone());
+            self.unqualified.push(name);
         }
     }
+
+    fn push_qualified(&mut self, table: String, col: String) {
+        if !self
+            .qualified
+            .iter()
+            .any(|(t, c)| t.eq_ignore_ascii_case(&table) && c.eq_ignore_ascii_case(&col))
+        {
+            self.qualified.push((table, col));
+        }
+    }
+}
+
+fn single_from_source_alias(from: Option<&FromSource>) -> Option<&str> {
+    match from? {
+        FromSource::Table(ft) => {
+            Some(ft.alias.as_ref().map_or(ft.name.name.as_str(), |a| a.name.as_str()))
+        }
+        FromSource::Subquery(fs) => fs.alias.as_ref().map(|a| a.name.as_str()),
+        FromSource::Function(ff) => {
+            Some(ff.alias.as_ref().map_or(ff.name.name.as_str(), |a| a.name.as_str()))
+        }
+        FromSource::Group(fg) => fg
+            .alias
+            .as_ref()
+            .map(|a| a.name.as_str())
+            .or_else(|| single_from_source_alias(Some(&fg.source))),
+        FromSource::Join { .. } => None,
+    }
+}
+
+fn extract_bare_col_source(expr: &Expr, single_tbl: Option<&str>) -> Option<(String, String)> {
+    let mut cur = expr;
+    while let Expr::Collate { operand, .. } = cur {
+        cur = operand;
+    }
+    let Expr::Column(c) = cur else {
+        return None;
+    };
+    let tbl = c
+        .table
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .or(single_tbl)?;
+    Some((tbl.to_string(), c.column.name.clone()))
+}
+
+fn record_compound_branch_names(
+    branch_names: &mut Vec<CompoundBranchNames>,
+    cols: &[ScopeColumn],
+    core: Option<&SelectCore>,
+) {
+    if branch_names.len() < cols.len() {
+        branch_names.resize_with(cols.len(), CompoundBranchNames::default);
+    }
+    let single_tbl = core.and_then(|c| single_from_source_alias(c.from.as_ref()));
+    let has_1to1_exprs = core.is_some_and(|c| c.columns.len() == cols.len());
+    for (i, c) in cols.iter().enumerate() {
+        branch_names[i].push_unqualified(c.name.clone());
+        if let Some(ref tbl) = c.table {
+            branch_names[i].push_qualified(tbl.clone(), c.name.clone());
+        } else if has_1to1_exprs {
+            if let Some(ResultColumn::Expr(re)) = core.and_then(|cr| cr.columns.get(i)) {
+                if let Some((t, col)) = extract_bare_col_source(&re.expr, single_tbl) {
+                    branch_names[i].push_qualified(t, col);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_compound_order_col(
+    schema: Option<&str>,
+    table: Option<&str>,
+    col_name: &str,
+    out_cols: &[ScopeColumn],
+    branch_names: &[CompoundBranchNames],
+) -> Option<usize> {
+    if let Some(tbl) = table {
+        if schema.is_some_and(|s| !s.eq_ignore_ascii_case("main")) {
+            return None;
+        }
+        return branch_names.iter().position(|bn| {
+            bn.qualified
+                .iter()
+                .any(|(t, c)| t.eq_ignore_ascii_case(tbl) && c.eq_ignore_ascii_case(col_name))
+        });
+    }
+    if schema.is_some() {
+        return None;
+    }
+    out_cols
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+        .or_else(|| {
+            branch_names.iter().position(|bn| {
+                bn.unqualified
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(col_name))
+            })
+        })
 }
 
 fn collect_referenced_window_names(
@@ -9746,6 +10212,55 @@ fn select_stmt_references_table(stmt: &SelectStmt, name: &str) -> bool {
         })
 }
 
+fn window_spec_references_table(ws: &WindowSpec, name: &str) -> bool {
+    ws.partition_by
+        .as_deref()
+        .is_some_and(|es| es.iter().any(|e| expr_references_table(e, name)))
+        || ws
+            .order_by
+            .as_deref()
+            .is_some_and(|os| os.iter().any(|o| expr_references_table(&o.expr, name)))
+        || ws.frame.as_ref().is_some_and(|fr| {
+            fr.from
+                .expr
+                .as_deref()
+                .is_some_and(|e| expr_references_table(e, name))
+                || fr
+                    .to
+                    .as_ref()
+                    .and_then(|b| b.expr.as_deref())
+                    .is_some_and(|e| expr_references_table(e, name))
+        })
+}
+
+fn from_source_count_direct_table_refs(src: &FromSource, name: &str) -> usize {
+    match src {
+        FromSource::Table(ft) => {
+            usize::from(ft.schema.is_none() && ft.name.name.eq_ignore_ascii_case(name))
+        }
+        FromSource::Function(_) | FromSource::Subquery(_) => 0,
+        FromSource::Group(fg) => from_source_count_direct_table_refs(&fg.source, name),
+        FromSource::Join { left, right, .. } => {
+            from_source_count_direct_table_refs(left, name)
+                + from_source_count_direct_table_refs(right, name)
+        }
+    }
+}
+
+fn select_body_count_direct_table_refs(body: &SelectBody, name: &str) -> usize {
+    match body {
+        SelectBody::Core(core) => core
+            .from
+            .as_ref()
+            .map_or(0, |f| from_source_count_direct_table_refs(f, name)),
+        SelectBody::Values(_) => 0,
+        SelectBody::Compound { left, right, .. } => {
+            select_body_count_direct_table_refs(left, name)
+                + select_body_count_direct_table_refs(right, name)
+        }
+    }
+}
+
 fn select_body_references_table_in_subquery(body: &SelectBody, name: &str) -> bool {
     match body {
         SelectBody::Core(core) => {
@@ -9757,12 +10272,23 @@ fn select_body_references_table_in_subquery(body: &SelectBody, name: &str) -> bo
                     .as_ref()
                     .is_some_and(|e| expr_references_table(e, name))
                 || core
+                    .group_by
+                    .as_deref()
+                    .is_some_and(|gs| gs.iter().any(|e| expr_references_table(e, name)))
+                || core
                     .having
                     .as_ref()
                     .is_some_and(|e| expr_references_table(e, name))
+                || core
+                    .windows
+                    .as_deref()
+                    .is_some_and(|ws| ws.iter().any(|w| window_spec_references_table(&w.window, name)))
                 || core.columns.iter().any(|rc| match rc {
                     ResultColumn::Expr(re) => expr_references_table(&re.expr, name),
-                    ResultColumn::Star(_) => false,
+                    ResultColumn::Star(s) => s
+                        .replace
+                        .as_deref()
+                        .is_some_and(|rs| rs.iter().any(|r| expr_references_table(&r.expr, name))),
                 })
         }
         SelectBody::Values(v) => v
@@ -9803,12 +10329,23 @@ fn select_body_references_table(body: &SelectBody, name: &str) -> bool {
                     .as_ref()
                     .is_some_and(|e| expr_references_table(e, name))
                 || core
+                    .group_by
+                    .as_deref()
+                    .is_some_and(|gs| gs.iter().any(|e| expr_references_table(e, name)))
+                || core
                     .having
                     .as_ref()
                     .is_some_and(|e| expr_references_table(e, name))
+                || core
+                    .windows
+                    .as_deref()
+                    .is_some_and(|ws| ws.iter().any(|w| window_spec_references_table(&w.window, name)))
                 || core.columns.iter().any(|rc| match rc {
                     ResultColumn::Expr(re) => expr_references_table(&re.expr, name),
-                    ResultColumn::Star(_) => false,
+                    ResultColumn::Star(s) => s
+                        .replace
+                        .as_deref()
+                        .is_some_and(|rs| rs.iter().any(|r| expr_references_table(&r.expr, name))),
                 })
         }
         SelectBody::Values(v) => v
@@ -9849,10 +10386,14 @@ fn expr_references_table(expr: &Expr, name: &str) -> bool {
             operand,
             schema,
             table,
+            args,
             ..
         } => {
             expr_references_table(operand, name)
                 || (schema.is_none() && table.name.eq_ignore_ascii_case(name))
+                || args
+                    .as_deref()
+                    .is_some_and(|as_| as_.iter().any(|a| expr_references_table(a, name)))
         }
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
@@ -9900,8 +10441,20 @@ fn expr_references_table(expr: &Expr, name: &str) -> bool {
                     .as_deref()
                     .is_some_and(|e| expr_references_table(e, name))
         }
-        Expr::Function(f) => f.args.iter().any(|a| expr_references_table(a, name)),
+        Expr::Function(f) => {
+            f.args.iter().any(|a| expr_references_table(a, name))
+                || f.filter
+                    .as_deref()
+                    .is_some_and(|e| expr_references_table(e, name))
+                || f.order_by
+                    .as_deref()
+                    .is_some_and(|os| os.iter().any(|o| expr_references_table(&o.expr, name)))
+                || matches!(&f.over, Some(WindowRef::Spec(ws)) if window_spec_references_table(ws, name))
+        }
         Expr::Vector { items, .. } => items.iter().any(|e| expr_references_table(e, name)),
+        Expr::Raise { message, .. } => message
+            .as_deref()
+            .is_some_and(|m| expr_references_table(m, name)),
         _ => false,
     }
 }
@@ -9992,7 +10545,7 @@ fn push_online_accs(plan: &[OnlineAggKind], out: &mut Vec<OnlineAggAcc>) {
 }
 
 #[inline]
-fn step_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue]) {
+fn step_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue], encoding: TextEncoding) {
     match acc {
         OnlineAggAcc::CountStar(c) => *c += 1,
         OnlineAggAcc::CountCol(cid, c) => {
@@ -10000,12 +10553,12 @@ fn step_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue]) {
                 *c += 1;
             }
         }
-        OnlineAggAcc::Sum(cid, sa) => sa.step_value(&row[*cid]),
+        OnlineAggAcc::Sum(cid, sa) => sa.step_value(&row[*cid], encoding),
     }
 }
 
 #[inline]
-fn inverse_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue]) {
+fn inverse_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue], encoding: TextEncoding) {
     match acc {
         OnlineAggAcc::CountStar(c) => *c -= 1,
         OnlineAggAcc::CountCol(cid, c) => {
@@ -10013,7 +10566,7 @@ fn inverse_online_acc(acc: &mut OnlineAggAcc, row: &[SqlValue]) {
                 *c -= 1;
             }
         }
-        OnlineAggAcc::Sum(cid, sa) => sa.inverse_value(&row[*cid]),
+        OnlineAggAcc::Sum(cid, sa) => sa.inverse_value(&row[*cid], encoding),
     }
 }
 
@@ -10153,19 +10706,22 @@ fn compare_sort_keys(
 fn resolve_window_ref(wref: &WindowRef, defs: &[WindowDefinition]) -> SqlResult<WindowSpec> {
     match wref {
         WindowRef::Name(n) => {
-            let def = defs
+            let (idx, def) = defs
                 .iter()
-                .find(|d| d.name.name.eq_ignore_ascii_case(&n.name))
+                .enumerate()
+                .rev()
+                .find(|(_, d)| d.name.name.eq_ignore_ascii_case(&n.name))
                 .ok_or_else(|| SqlError::runtime(format!("no such window: {}", n.name)))?;
-            resolve_window_chain(&def.window, defs, 0)
+            resolve_window_chain(&def.window, defs, Some(idx), 0)
         }
-        WindowRef::Spec(ws) => resolve_window_chain(ws, defs, 0),
+        WindowRef::Spec(ws) => resolve_window_chain(ws, defs, None, 0),
     }
 }
 
 fn resolve_window_chain(
     spec: &WindowSpec,
     defs: &[WindowDefinition],
+    defined_at: Option<usize>,
     depth: usize,
 ) -> SqlResult<WindowSpec> {
     if depth > 32 {
@@ -10174,11 +10730,23 @@ fn resolve_window_chain(
     let Some(ref base_name) = spec.base else {
         return Ok(spec.clone());
     };
-    let base_def = defs
-        .iter()
-        .find(|d| d.name.name.eq_ignore_ascii_case(&base_name.name))
+    let found = defined_at
+        .and_then(|pos| {
+            defs[..pos]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, d)| d.name.name.eq_ignore_ascii_case(&base_name.name))
+        })
+        .or_else(|| {
+            defs.iter()
+                .enumerate()
+                .rev()
+                .find(|(_, d)| d.name.name.eq_ignore_ascii_case(&base_name.name))
+        });
+    let (base_idx, base_def) = found
         .ok_or_else(|| SqlError::runtime(format!("no such window: {}", base_name.name)))?;
-    let mut merged = resolve_window_chain(&base_def.window, defs, depth + 1)?;
+    let mut merged = resolve_window_chain(&base_def.window, defs, Some(base_idx), depth + 1)?;
     // SQLite window inheritance validation (`window.c:sqlite3WindowChain`):
     // 1. Derived window may NEVER specify a PARTITION BY clause.
     // 2. Derived window may NOT specify ORDER BY if base already has ORDER BY.
@@ -10324,6 +10892,7 @@ fn expr_has_column_ref(expr: &Expr) -> bool {
                 || else_expr.as_deref().is_some_and(expr_has_column_ref)
         }
         Expr::Vector { items, .. } => items.iter().any(expr_has_column_ref),
+        Expr::Raise { message, .. } => message.as_deref().is_some_and(expr_has_column_ref),
         Expr::Subquery { .. }
         | Expr::Exists { .. }
         | Expr::InSelect { .. }
@@ -10905,7 +11474,7 @@ fn collect_subquery_body_col_names<'a>(body: &'a SelectBody, out: &mut Vec<&'a s
                             || fr
                                 .to
                                 .as_ref()
-                                .is_none_or(|e| collect_frame_bound_col_names(e, out))
+                                .is_some_and(|e| !collect_frame_bound_col_names(e, out))
                         {
                             return false;
                         }
@@ -11762,6 +12331,76 @@ fn expr_is_uncorrelated_depth(
 
 // ───────────────────────────── Public entry points ─────────────────────────────
 
+/// Execute a parsed [`SelectStmt`] against `catalog` with caller-supplied outer scopes
+/// (e.g. `OLD.*` / `NEW.*` row scopes inside trigger programs).
+pub fn execute_select_stmt_with_scopes(
+    catalog: &dyn SqlCatalog,
+    stmt: &SelectStmt,
+    params: &QueryParams,
+    options: &QueryOptions,
+    outer_scopes: &[EvalScope<'_>],
+) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+    let exec = QueryExec::new(catalog, options, params);
+    exec.execute_select_stmt(stmt, outer_scopes)
+}
+
+/// Execute a parsed [`SelectStmt`] against `catalog` with both caller-supplied outer scopes
+/// and an optional outer `WITH` clause (e.g. `WITH a AS (...) INSERT INTO t WITH b AS (...) SELECT ...`),
+/// preserving outer CTEs even when `stmt` itself also declares an inner `WITH` clause.
+pub fn execute_select_stmt_with_outer_with(
+    catalog: &dyn SqlCatalog,
+    stmt: &SelectStmt,
+    params: &QueryParams,
+    options: &QueryOptions,
+    outer_scopes: &[EvalScope<'_>],
+    outer_with: Option<&WithClause>,
+) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
+    let base = QueryExec::new(catalog, options, params);
+    let exec = match outer_with {
+        Some(w) => base.materialize_with(w, outer_scopes)?,
+        None => base,
+    };
+    exec.execute_select_stmt(stmt, outer_scopes)
+}
+
+/// Validate a parsed [`SelectStmt`] schema (tables, views, CTEs, joins, columns, functions,
+/// subqueries, `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`, and compound arity) without scanning
+/// table rows or executing runtime scalar/TVF expressions, returning its output column metadata.
+pub fn validate_select_stmt_schema(
+    catalog: &dyn SqlCatalog,
+    stmt: &SelectStmt,
+    options: &QueryOptions,
+    outer_scopes: &[EvalScope<'_>],
+    outer_with: Option<&WithClause>,
+) -> SqlResult<Vec<ScopeColumn>> {
+    let params = QueryParams::default();
+    let base = QueryExec::new(catalog, options, &params).with_validate_only();
+    let exec = match outer_with {
+        Some(w) => base.materialize_with(w, outer_scopes)?,
+        None => base,
+    };
+    let (cols, _rows) = exec.execute_select_stmt(stmt, outer_scopes)?;
+    Ok(cols)
+}
+
+/// Validate an expression's column references, collations, functions, `IN table`, and nested
+/// subqueries against `catalog` and `outer_scopes` without executing runtime scalar/TVF logic.
+pub fn validate_expr_schema(
+    catalog: &dyn SqlCatalog,
+    expr: &Expr,
+    options: &QueryOptions,
+    outer_scopes: &[EvalScope<'_>],
+    outer_with: Option<&WithClause>,
+) -> SqlResult<()> {
+    let params = QueryParams::default();
+    let base = QueryExec::new(catalog, options, &params).with_validate_only();
+    let exec = match outer_with {
+        Some(w) => base.materialize_with(w, outer_scopes)?,
+        None => base,
+    };
+    exec.validate_expr_and_subqueries(expr, outer_scopes)
+}
+
 /// Execute a parsed [`SelectStmt`] against `catalog`, returning full column metadata
 /// (table qualifier, name, affinity, collation) alongside the result rows.
 pub fn execute_select_stmt_detailed(
@@ -11770,8 +12409,7 @@ pub fn execute_select_stmt_detailed(
     params: &QueryParams,
     options: &QueryOptions,
 ) -> SqlResult<(Vec<ScopeColumn>, Vec<Vec<SqlValue>>)> {
-    let exec = QueryExec::new(catalog, options, params);
-    exec.execute_select_stmt(stmt, &[])
+    execute_select_stmt_with_scopes(catalog, stmt, params, options, &[])
 }
 
 /// Execute a parsed [`SelectStmt`] against `catalog`.
@@ -11805,8 +12443,15 @@ pub fn execute_query(
     };
     match stmt {
         Statement::Select(sel) => execute_select_stmt(catalog, &sel, params, options),
-        Statement::Explain { .. } => Err(SqlError::unsupported(
-            "EXPLAIN is not yet supported in Phase 2 read-only engine",
+        Statement::Explain {
+            query_plan: true,
+            statement,
+            ..
+        } => crate::explain::explain_query_plan(catalog, &statement, params, options),
+        Statement::Explain {
+            query_plan: false, ..
+        } => Err(SqlError::unsupported(
+            "EXPLAIN bytecode listing is not supported; use EXPLAIN QUERY PLAN",
         )),
         _ => Err(SqlError::unsupported(
             "only SELECT / VALUES queries are supported in read-only execution",

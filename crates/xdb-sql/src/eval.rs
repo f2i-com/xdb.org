@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use xdb_core::value::{
     affinity_of_decl_type, apply_affinity, apply_comparison_affinity, arith_enc, bit_not_enc,
-    bitwise_enc, boolean_value_enc, cast_to_type, compare_op, comparison_affinity,
+    bitwise_enc, boolean_value_enc, cast_to_type, cast_value, compare_op, comparison_affinity,
     comparison_collation_name, in_affinity, integer_literal_value, mem_compare, negate_enc,
     real_literal_value, real_to_exact_i64, ArithOp, BitOp, BuiltinCollation, Collation, CompareOp,
     OperandCollation,
@@ -336,6 +336,7 @@ pub struct EvalEnv<'a> {
     pub fn_ctx: FunctionContext<'a>,
     pub subqueries: &'a dyn SubqueryRunner,
     pub dqs: bool,
+    pub in_trigger: bool,
     cache_subqueries: bool,
     eval_depth: Cell<u32>,
     subquery_cache: RefCell<SubqueryCacheVec<'a>>,
@@ -381,12 +382,14 @@ impl<'a> EvalEnv<'a> {
         fn_ctx.total_changes = options.total_changes;
         fn_ctx.last_insert_rowid = options.last_insert_rowid;
         fn_ctx.case_sensitive_like = options.case_sensitive_like;
+        fn_ctx.encoding = options.collations.encoding();
         Self {
             options,
             params,
             fn_ctx,
             subqueries,
             dqs: options.dqs,
+            in_trigger: options.in_trigger,
             cache_subqueries: false,
             eval_depth: Cell::new(0),
             subquery_cache: RefCell::new(Vec::new()),
@@ -507,7 +510,13 @@ impl<'a> EvalEnv<'a> {
     pub fn lookup_opt_collation(&self, name: Option<&str>) -> SqlResult<Option<&'a Collation>> {
         match name {
             Some(n) => self.lookup_collation(n).map(Some),
-            None => Ok(None),
+            None => {
+                if self.options.collations.encoding() == xdb_core::TextEncoding::Utf8 {
+                    Ok(None)
+                } else {
+                    self.lookup_collation("BINARY").map(Some)
+                }
+            }
         }
     }
 }
@@ -887,6 +896,15 @@ fn expr_collation_ref<'a>(expr: &'a Expr, scopes: &[EvalScope<'a>]) -> BorrowedC
                 let ec = expr_collation_ref(el, scopes);
                 if ec.explicit {
                     return ec;
+                }
+            }
+            BorrowedCollation::NONE
+        }
+        Expr::Function(f) => {
+            for a in &f.args {
+                let ac = expr_collation_ref(a, scopes);
+                if ac.explicit {
+                    return ac;
                 }
             }
             BorrowedCollation::NONE
@@ -1484,7 +1502,13 @@ pub fn eval_expr_tagged(
                 }
                 arg_vals.push(v);
             }
-            let coll_opt = explicit_coll.or(implicit_coll);
+            let coll_opt = match explicit_coll.or(implicit_coll) {
+                Some(c) => Some(c),
+                None if env.options.collations.encoding() != xdb_core::TextEncoding::Utf8 => {
+                    Some(env.lookup_collation("BINARY")?)
+                }
+                None => None,
+            };
             let extra_slice = (!json_extra.is_empty()).then_some(json_extra.as_slice());
             let call_ctx = env
                 .fn_ctx
@@ -1500,9 +1524,42 @@ pub fn eval_expr_tagged(
                 Err(SqlError::runtime("row value misused"))
             }
         }
-        Expr::Raise { .. } => Err(SqlError::runtime(
-            "RAISE() may only be used within a trigger-program",
-        )),
+        Expr::Raise {
+            action, message, ..
+        } => {
+            if !env.in_trigger {
+                return Err(SqlError::runtime(
+                    "RAISE() may only be used within a trigger-program",
+                ));
+            }
+            let msg = match message {
+                Some(mexpr) => {
+                    let v = eval_expr(mexpr, scopes, env)?;
+                    match v {
+                        SqlValue::Null => None,
+                        other => {
+                            let cast = cast_value(
+                                other,
+                                Affinity::Text,
+                                env.options.collations.encoding(),
+                            )
+                            .unwrap_or(SqlValue::Null);
+                            match cast {
+                                SqlValue::Text(b) => {
+                                    Some(String::from_utf8_lossy(&b).into_owned())
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
+            Err(SqlError::Raise {
+                action: *action,
+                message: msg,
+            })
+        }
     }
 }
 
@@ -1784,9 +1841,13 @@ fn eval_row_vector(
             let mut affs = Vec::with_capacity(items.len());
             let mut colls = Vec::with_capacity(items.len());
             for item in items {
-                vals.push(eval_expr(item, scopes, env)?);
-                affs.push(expr_affinity(item, scopes));
-                colls.push(expr_collation(item, scopes));
+                let (v, a, c) = eval_compare_operand(item, scopes, env)?;
+                vals.push(v);
+                affs.push(a);
+                colls.push(ExprCollation {
+                    name: c.name.map(str::to_string),
+                    explicit: c.explicit,
+                });
             }
             Ok((vals, affs, colls))
         }
@@ -1984,10 +2045,31 @@ fn eval_in_list(
         ));
     }
 
+    if items.iter().any(|it| matches!(it, Expr::Vector { .. })) {
+        return Err(SqlError::runtime("row value misused"));
+    }
+
     let (lhs_val, lhs_aff, lhs_coll) = eval_compare_operand(operand, scopes, env)?;
     let aff = in_affinity(lhs_aff, None);
 
     if lhs_val.is_null() {
+        // Per SQLite: single-item `x IN (e)` folds to `x = e` and validates RHS collations
+        // even when `x` is NULL!
+        if items.len() == 1 {
+            let mut walk = &items[0];
+            while let Expr::Collate {
+                operand: inner,
+                collation,
+                ..
+            } = walk
+            {
+                let _ = env.lookup_collation(&collation.name)?;
+                walk = inner;
+            }
+            if let Some(cname) = expr_collation_ref(&items[0], scopes).name {
+                let _ = env.lookup_collation(cname)?;
+            }
+        }
         return Ok((SqlValue::Null, false));
     }
     let mut saw_null = false;
@@ -2085,7 +2167,166 @@ fn expr_contains_column_ref(expr: &Expr, scopes: &[EvalScope<'_>]) -> bool {
         }
         Expr::Function(f) => f.args.iter().any(|a| expr_contains_column_ref(a, scopes)),
         Expr::Vector { items, .. } => items.iter().any(|i| expr_contains_column_ref(i, scopes)),
+        Expr::Raise { message, .. } => message
+            .as_deref()
+            .is_some_and(|m| expr_contains_column_ref(m, scopes)),
         _ => false,
+    }
+}
+
+/// Returns `true` if `expr` contains a `RAISE(...)` node anywhere in its subtree.
+pub fn expr_contains_raise(expr: &Expr) -> bool {
+    match expr {
+        Expr::Raise { .. } => true,
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => expr_contains_raise(operand),
+        Expr::Binary { left, right, .. } => expr_contains_raise(left) || expr_contains_raise(right),
+        Expr::Like {
+            left,
+            right,
+            escape,
+            ..
+        } => {
+            expr_contains_raise(left)
+                || expr_contains_raise(right)
+                || escape.as_deref().is_some_and(expr_contains_raise)
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => expr_contains_raise(operand) || expr_contains_raise(low) || expr_contains_raise(high),
+        Expr::InList { operand, items, .. } => {
+            expr_contains_raise(operand) || items.iter().any(expr_contains_raise)
+        }
+        Expr::InSelect { operand, select, .. } => {
+            expr_contains_raise(operand) || select_contains_raise(select)
+        }
+        Expr::InTable { operand, args, .. } => {
+            expr_contains_raise(operand)
+                || args
+                    .as_deref()
+                    .is_some_and(|a| a.iter().any(expr_contains_raise))
+        }
+        Expr::Subquery { select, .. } | Expr::Exists { select, .. } => {
+            select_contains_raise(select)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_raise)
+                || whens
+                    .iter()
+                    .any(|w| expr_contains_raise(&w.when) || expr_contains_raise(&w.then))
+                || else_expr.as_deref().is_some_and(expr_contains_raise)
+        }
+        Expr::Function(f) => {
+            f.args.iter().any(expr_contains_raise)
+                || f.filter.as_deref().is_some_and(expr_contains_raise)
+                || f.order_by
+                    .as_deref()
+                    .is_some_and(|obs| obs.iter().any(|o| expr_contains_raise(&o.expr)))
+                || matches!(
+                    f.over,
+                    Some(xdb_parser::WindowRef::Spec(ref ws))
+                        if window_spec_contains_raise(ws)
+                )
+        }
+        Expr::Vector { items, .. } => items.iter().any(expr_contains_raise),
+        _ => false,
+    }
+}
+
+fn window_spec_contains_raise(ws: &xdb_parser::WindowSpec) -> bool {
+    ws.partition_by
+        .as_deref()
+        .is_some_and(|ps| ps.iter().any(expr_contains_raise))
+        || ws
+            .order_by
+            .as_deref()
+            .is_some_and(|obs| obs.iter().any(|o| expr_contains_raise(&o.expr)))
+        || ws.frame.as_ref().is_some_and(|fr| {
+            fr.from.expr.as_deref().is_some_and(expr_contains_raise)
+                || fr
+                    .to
+                    .as_ref()
+                    .and_then(|t| t.expr.as_deref())
+                    .is_some_and(expr_contains_raise)
+        })
+}
+
+/// Returns `true` if `stmt` contains a `RAISE(...)` expression anywhere in its AST.
+pub fn select_contains_raise(stmt: &xdb_parser::SelectStmt) -> bool {
+    if let Some(ref with) = stmt.with {
+        if with.ctes.iter().any(|c| select_contains_raise(&c.select)) {
+            return true;
+        }
+    }
+    if select_body_contains_raise(&stmt.body) {
+        return true;
+    }
+    if stmt
+        .order_by
+        .as_deref()
+        .is_some_and(|obs| obs.iter().any(|o| expr_contains_raise(&o.expr)))
+    {
+        return true;
+    }
+    if let Some(ref lim) = stmt.limit {
+        if expr_contains_raise(&lim.count)
+            || lim.offset.as_deref().is_some_and(expr_contains_raise)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_body_contains_raise(body: &xdb_parser::SelectBody) -> bool {
+    match body {
+        xdb_parser::SelectBody::Core(core) => {
+            core.columns.iter().any(|rc| match rc {
+                xdb_parser::ResultColumn::Expr(re) => expr_contains_raise(&re.expr),
+                xdb_parser::ResultColumn::Star(rs) => rs
+                    .replace
+                    .as_deref()
+                    .is_some_and(|r| r.iter().any(|x| expr_contains_raise(&x.expr))),
+            }) || core.from.as_ref().is_some_and(from_contains_raise)
+                || core.where_clause.as_ref().is_some_and(expr_contains_raise)
+                || core
+                    .group_by
+                    .as_deref()
+                    .is_some_and(|gs| gs.iter().any(expr_contains_raise))
+                || core.having.as_ref().is_some_and(expr_contains_raise)
+                || core
+                    .windows
+                    .as_deref()
+                    .is_some_and(|ws| ws.iter().any(|w| window_spec_contains_raise(&w.window)))
+        }
+        xdb_parser::SelectBody::Values(vals) => vals
+            .rows
+            .iter()
+            .any(|r| r.items.iter().any(expr_contains_raise)),
+        xdb_parser::SelectBody::Compound { left, right, .. } => {
+            select_body_contains_raise(left) || select_body_contains_raise(right)
+        }
+    }
+}
+
+pub fn from_contains_raise(from: &xdb_parser::FromSource) -> bool {
+    match from {
+        xdb_parser::FromSource::Table(_) => false,
+        xdb_parser::FromSource::Function(ff) => ff.args.iter().any(expr_contains_raise),
+        xdb_parser::FromSource::Subquery(fs) => select_contains_raise(&fs.select),
+        xdb_parser::FromSource::Group(fg) => from_contains_raise(&fg.source),
+        xdb_parser::FromSource::Join { left, right, on, .. } => {
+            from_contains_raise(left)
+                || from_contains_raise(right)
+                || on.as_deref().is_some_and(expr_contains_raise)
+        }
     }
 }
 
@@ -2761,8 +3002,12 @@ pub fn expr_contains_aggregate(expr: &Expr, options: &QueryOptions) -> bool {
             expr_contains_aggregate(operand, options)
                 || items.iter().any(|i| expr_contains_aggregate(i, options))
         }
-        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+        Expr::InSelect { operand, .. } => expr_contains_aggregate(operand, options),
+        Expr::InTable { operand, args, .. } => {
             expr_contains_aggregate(operand, options)
+                || args
+                    .as_deref()
+                    .is_some_and(|as_| as_.iter().any(|a| expr_contains_aggregate(a, options)))
         }
         Expr::Case {
             operand,
@@ -2851,8 +3096,13 @@ pub fn expr_contains_non_window_aggregate(expr: &Expr, options: &QueryOptions) -
                     .iter()
                     .any(|i| expr_contains_non_window_aggregate(i, options))
         }
-        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+        Expr::InSelect { operand, .. } => expr_contains_non_window_aggregate(operand, options),
+        Expr::InTable { operand, args, .. } => {
             expr_contains_non_window_aggregate(operand, options)
+                || args.as_deref().is_some_and(|as_| {
+                    as_.iter()
+                        .any(|a| expr_contains_non_window_aggregate(a, options))
+                })
         }
         Expr::Case {
             operand,
@@ -2925,8 +3175,12 @@ pub fn expr_contains_window(expr: &Expr) -> bool {
         Expr::InList { operand, items, .. } => {
             expr_contains_window(operand) || items.iter().any(expr_contains_window)
         }
-        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+        Expr::InSelect { operand, .. } => expr_contains_window(operand),
+        Expr::InTable { operand, args, .. } => {
             expr_contains_window(operand)
+                || args
+                    .as_deref()
+                    .is_some_and(|as_| as_.iter().any(expr_contains_window))
         }
         Expr::Case {
             operand,
@@ -3031,8 +3285,16 @@ pub fn collect_aggregates<'a>(
                 collect_aggregates(item, options, out);
             }
         }
-        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+        Expr::InSelect { operand, .. } => {
             collect_aggregates(operand, options, out);
+        }
+        Expr::InTable { operand, args, .. } => {
+            collect_aggregates(operand, options, out);
+            if let Some(as_) = args {
+                for a in as_ {
+                    collect_aggregates(a, options, out);
+                }
+            }
         }
         Expr::Case {
             operand,
@@ -3113,8 +3375,16 @@ pub fn collect_windows<'a>(expr: &'a Expr, out: &mut Vec<&'a xdb_parser::Functio
                 collect_windows(item, out);
             }
         }
-        Expr::InSelect { operand, .. } | Expr::InTable { operand, .. } => {
+        Expr::InSelect { operand, .. } => {
             collect_windows(operand, out);
+        }
+        Expr::InTable { operand, args, .. } => {
+            collect_windows(operand, out);
+            if let Some(as_) = args {
+                for a in as_ {
+                    collect_windows(a, out);
+                }
+            }
         }
         Expr::Case {
             operand,

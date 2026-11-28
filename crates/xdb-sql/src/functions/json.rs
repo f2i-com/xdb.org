@@ -435,7 +435,12 @@ impl<'a, 'm> JsonParser<'a, 'm> {
                     b't' => out.push('\t'),
                     b'\'' if self.allow_json5 => out.push('\''),
                     b'v' if self.allow_json5 => out.push('\u{000b}'),
-                    b'0' if self.allow_json5 => out.push('\0'),
+                    b'0' if self.allow_json5 => {
+                        if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                            return Err(self.pos + 1);
+                        }
+                        out.push('\0');
+                    }
                     b'\n' if self.allow_json5 => {}
                     b'\r' if self.allow_json5 => {
                         if self.peek() == Some(b'\n') {
@@ -475,6 +480,10 @@ impl<'a, 'm> JsonParser<'a, 'm> {
                         }
                     }
                     _ if self.allow_json5 => {
+                        // JSON5 forbids decimal digit escapes (`\1`..`\9`); `\0` is handled above.
+                        if esc.is_ascii_digit() {
+                            return Err(self.pos);
+                        }
                         if esc < 0x80 {
                             out.push(esc as char);
                         } else {
@@ -932,6 +941,318 @@ fn parse_json_bytes_with_pos_metered(
         return Err(SqlError::ResourceLimit(e));
     }
     Ok(res)
+}
+
+fn parse_json_bytes_metered(
+    src: &[u8],
+    json5: bool,
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<JsonVal> {
+    parse_json_bytes_with_pos_metered(src, json5, ctx, false)?
+        .map_err(|_| SqlError::runtime("malformed JSON"))
+}
+
+/// Canonicalize JSON / JSON5 raw bytes into compact RFC-8259 JSON while preserving:
+/// - `-0` integer sign (`json('-0') -> '-0'`), and
+/// - raw non-UTF-8 bytes inside string literals (`json(X'22FF22') -> X'22FF22'`), matching SQLite.
+fn canonicalize_json_bytes_metered(
+    src: &[u8],
+    ctx: &FunctionContext<'_>,
+) -> SqlResult<SqlValue> {
+    if src.len() >= 64 {
+        ctx.charge_steps((src.len() / 64) as u64)?;
+    }
+    let mut out = crate::utf8::ByteAccum::new(ctx.limits.max_length, false, ctx.meter);
+    struct Canon<'a, 'm> {
+        p: JsonParser<'a, 'm>,
+        out: &'a mut crate::utf8::ByteAccum<'m>,
+    }
+    impl<'a, 'm> Canon<'a, 'm> {
+        fn push_escaped_byte(&mut self, b: u8) -> SqlResult<()> {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            match b {
+                b'"' => self.out.push_bytes(b"\\\""),
+                b'\\' => self.out.push_bytes(b"\\\\"),
+                0x08 => self.out.push_bytes(b"\\b"),
+                0x0c => self.out.push_bytes(b"\\f"),
+                b'\n' => self.out.push_bytes(b"\\n"),
+                b'\r' => self.out.push_bytes(b"\\r"),
+                b'\t' => self.out.push_bytes(b"\\t"),
+                0x00..=0x1f => self.out.push_bytes(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(b >> 4) as usize],
+                    HEX[(b & 0x0f) as usize],
+                ]),
+                _ => self.out.push(b),
+            }
+        }
+
+        fn push_escaped_raw(&mut self, bytes: &[u8]) -> SqlResult<()> {
+            self.out.push(b'"')?;
+            for &b in bytes {
+                self.push_escaped_byte(b)?;
+            }
+            self.out.push(b'"')
+        }
+
+        fn emit_escaped_string(&mut self, quote: u8) -> SqlResult<()> {
+            let map_err = |p: &JsonParser<'_, '_>| -> SqlError {
+                if let Some(e) = p.limit_err {
+                    SqlError::ResourceLimit(e)
+                } else {
+                    SqlError::runtime("malformed JSON")
+                }
+            };
+            self.p.pos += 1;
+            self.out.push(b'"')?;
+            let mut ticks = 0u64;
+            while self.p.pos < self.p.src.len() {
+                ticks += 1;
+                if (ticks & 255) == 0 && self.p.charge_node(0).is_err() {
+                    return Err(map_err(&self.p));
+                }
+                let b = self.p.src[self.p.pos];
+                if b == quote {
+                    self.p.pos += 1;
+                    return self.out.push(b'"');
+                }
+                if b < 0x20 {
+                    return Err(SqlError::runtime("malformed JSON"));
+                }
+                if b == b'\\' {
+                    self.p.pos += 1;
+                    let esc = *self
+                        .p
+                        .src
+                        .get(self.p.pos)
+                        .ok_or_else(|| SqlError::runtime("malformed JSON"))?;
+                    self.p.pos += 1;
+                    match esc {
+                        b'"' => self.push_escaped_byte(b'"')?,
+                        b'\\' => self.push_escaped_byte(b'\\')?,
+                        b'/' => self.push_escaped_byte(b'/')?,
+                        b'b' => self.push_escaped_byte(0x08)?,
+                        b'f' => self.push_escaped_byte(0x0c)?,
+                        b'n' => self.push_escaped_byte(b'\n')?,
+                        b'r' => self.push_escaped_byte(b'\r')?,
+                        b't' => self.push_escaped_byte(b'\t')?,
+                        b'\'' if self.p.allow_json5 => self.push_escaped_byte(b'\'')?,
+                        b'v' if self.p.allow_json5 => self.push_escaped_byte(0x0b)?,
+                        b'0' if self.p.allow_json5 => {
+                            if self.p.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                return Err(SqlError::runtime("malformed JSON"));
+                            }
+                            self.push_escaped_byte(0)?;
+                        }
+                        b'\n' if self.p.allow_json5 => {}
+                        b'\r' if self.p.allow_json5 => {
+                            if self.p.peek() == Some(b'\n') {
+                                self.p.pos += 1;
+                            }
+                        }
+                        b'x' if self.p.allow_json5 => {
+                            let h = self.p.parse_hex(2).map_err(|_| map_err(&self.p))?;
+                            let mut ubuf = [0u8; 4];
+                            let s = char::from_u32(h).unwrap_or('\u{FFFD}').encode_utf8(&mut ubuf);
+                            for &ub in s.as_bytes() {
+                                self.push_escaped_byte(ub)?;
+                            }
+                        }
+                        b'u' => {
+                            let code = self.p.parse_hex(4).map_err(|_| map_err(&self.p))?;
+                            let mut ubuf = [0u8; 4];
+                            let ch = if (0xd800..=0xdbff).contains(&code) {
+                                let save = self.p.pos;
+                                if self.p.pos + 6 <= self.p.src.len()
+                                    && self.p.src[self.p.pos] == b'\\'
+                                    && self.p.src[self.p.pos + 1] == b'u'
+                                {
+                                    self.p.pos += 2;
+                                    if let Ok(low) = self.p.parse_hex(4) {
+                                        if (0xdc00..=0xdfff).contains(&low) {
+                                            let cp =
+                                                0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                                            char::from_u32(cp).unwrap_or('\u{FFFD}')
+                                        } else {
+                                            self.p.pos = save;
+                                            '\u{FFFD}'
+                                        }
+                                    } else {
+                                        self.p.pos = save;
+                                        '\u{FFFD}'
+                                    }
+                                } else {
+                                    '\u{FFFD}'
+                                }
+                            } else if (0xdc00..=0xdfff).contains(&code) {
+                                '\u{FFFD}'
+                            } else {
+                                char::from_u32(code).unwrap_or('\u{FFFD}')
+                            };
+                            for &ub in ch.encode_utf8(&mut ubuf).as_bytes() {
+                                self.push_escaped_byte(ub)?;
+                            }
+                        }
+                        _ if self.p.allow_json5 => {
+                            if esc.is_ascii_digit() {
+                                return Err(SqlError::runtime("malformed JSON"));
+                            }
+                            self.push_escaped_byte(esc)?;
+                        }
+                        _ => return Err(SqlError::runtime("malformed JSON")),
+                    }
+                } else {
+                    self.push_escaped_byte(b)?;
+                    self.p.pos += 1;
+                }
+            }
+            Err(SqlError::runtime("malformed JSON"))
+        }
+
+        fn emit_value(&mut self) -> SqlResult<()> {
+            let map_err = |p: &JsonParser<'_, '_>| -> SqlError {
+                if let Some(e) = p.limit_err {
+                    SqlError::ResourceLimit(e)
+                } else {
+                    SqlError::runtime("malformed JSON")
+                }
+            };
+            self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+            self.p.charge_node(0).map_err(|_| map_err(&self.p))?;
+            if self.p.depth >= JSON_MAX_DEPTH {
+                return Err(SqlError::runtime("malformed JSON"));
+            }
+            let b = self.p.peek().ok_or_else(|| SqlError::runtime("malformed JSON"))?;
+            match b {
+                b'{' => {
+                    self.p.pos += 1;
+                    self.p.depth += 1;
+                    self.out.push(b'{')?;
+                    self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                    let mut first = true;
+                    if self.p.peek() == Some(b'}') {
+                        self.p.pos += 1;
+                        self.p.depth -= 1;
+                        self.out.push(b'}')?;
+                        return Ok(());
+                    }
+                    loop {
+                        self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                        let kb = self.p.peek().ok_or_else(|| SqlError::runtime("malformed JSON"))?;
+                        if !first {
+                            self.out.push(b',')?;
+                        }
+                        first = false;
+                        if kb == b'"' || (self.p.allow_json5 && kb == b'\'') {
+                            self.emit_escaped_string(kb)?;
+                        } else if self.p.allow_json5 && is_json5_ident_start(kb) {
+                            let ident = self.p.parse_ident().map_err(|_| map_err(&self.p))?;
+                            self.push_escaped_raw(ident.as_bytes())?;
+                        } else {
+                            return Err(SqlError::runtime("malformed JSON"));
+                        }
+                        self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                        if self.p.peek() != Some(b':') {
+                            return Err(SqlError::runtime("malformed JSON"));
+                        }
+                        self.p.pos += 1;
+                        self.out.push(b':')?;
+                        self.emit_value()?;
+                        self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                        match self.p.peek() {
+                            Some(b',') => {
+                                self.p.pos += 1;
+                                self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                                if self.p.allow_json5 && self.p.peek() == Some(b'}') {
+                                    self.p.pos += 1;
+                                    self.p.depth -= 1;
+                                    self.out.push(b'}')?;
+                                    return Ok(());
+                                }
+                            }
+                            Some(b'}') => {
+                                self.p.pos += 1;
+                                self.p.depth -= 1;
+                                self.out.push(b'}')?;
+                                return Ok(());
+                            }
+                            _ => return Err(SqlError::runtime("malformed JSON")),
+                        }
+                    }
+                }
+                b'[' => {
+                    self.p.pos += 1;
+                    self.p.depth += 1;
+                    self.out.push(b'[')?;
+                    self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                    let mut first = true;
+                    if self.p.peek() == Some(b']') {
+                        self.p.pos += 1;
+                        self.p.depth -= 1;
+                        self.out.push(b']')?;
+                        return Ok(());
+                    }
+                    loop {
+                        if !first {
+                            self.out.push(b',')?;
+                        }
+                        first = false;
+                        self.emit_value()?;
+                        self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                        match self.p.peek() {
+                            Some(b',') => {
+                                self.p.pos += 1;
+                                self.p.skip_ws().map_err(|_| map_err(&self.p))?;
+                                if self.p.allow_json5 && self.p.peek() == Some(b']') {
+                                    self.p.pos += 1;
+                                    self.p.depth -= 1;
+                                    self.out.push(b']')?;
+                                    return Ok(());
+                                }
+                            }
+                            Some(b']') => {
+                                self.p.pos += 1;
+                                self.p.depth -= 1;
+                                self.out.push(b']')?;
+                                return Ok(());
+                            }
+                            _ => return Err(SqlError::runtime("malformed JSON")),
+                        }
+                    }
+                }
+                b'"' => self.emit_escaped_string(b'"'),
+                b'\'' if self.p.allow_json5 => self.emit_escaped_string(b'\''),
+                _ => {
+                    let start = self.p.pos;
+                    let val = self.p.parse_value().map_err(|_| map_err(&self.p))?;
+                    let slice = &self.p.src[start..self.p.pos];
+                    if matches!(val, JsonVal::Int(0)) && slice.first() == Some(&b'-') {
+                        self.out.push_bytes(b"-0")
+                    } else {
+                        let mut tmp = String::new();
+                        render_json_compact(&val, &mut tmp);
+                        self.out.push_str(&tmp)
+                    }
+                }
+            }
+        }
+    }
+    let mut c = Canon {
+        p: JsonParser::from_bytes(src, true, ctx.meter),
+        out: &mut out,
+    };
+    c.emit_value()?;
+    let skip_ok = c.p.skip_ws().is_ok() && c.p.pos >= c.p.src.len();
+    if let Some(e) = c.p.limit_err {
+        return Err(SqlError::ResourceLimit(e));
+    }
+    if !skip_ok {
+        return Err(SqlError::runtime("malformed JSON"));
+    }
+    Ok(SqlValue::Text(out.into_boxed_bytes()))
 }
 
 fn parse_json_metered(src: &str, json5: bool, ctx: &FunctionContext<'_>) -> SqlResult<JsonVal> {
@@ -1937,8 +2258,7 @@ pub fn eval_json_arrow_metered(
     let Some(lhs_bytes) = text_bytes_of(lhs) else {
         return Ok(SqlValue::Null);
     };
-    let lhs_str = std::str::from_utf8(&lhs_bytes).map_err(|_| SqlError::runtime("malformed JSON"))?;
-    let doc = parse_json_metered(lhs_str, true, ctx)?;
+    let doc = parse_json_bytes_metered(&lhs_bytes, true, ctx)?;
     let Some(path_str) = arrow_rhs_to_path(rhs) else {
         return Ok(SqlValue::Null);
     };
@@ -1968,12 +2288,7 @@ pub fn call_json_scalar(
             }
             match text_bytes_of(&args[0]) {
                 None => (SqlValue::Null, false),
-                Some(b) => {
-                    let s = std::str::from_utf8(&b)
-                        .map_err(|_| SqlError::runtime("malformed JSON"))?;
-                    let doc = parse_json_metered(s, true, ctx)?;
-                    (render_json_value_metered(&doc, ctx)?, true)
-                }
+                Some(b) => (canonicalize_json_bytes_metered(&b, ctx)?, true),
             }
         }
         "json_valid" => {
@@ -2049,8 +2364,7 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let doc = parse_json_metered(s, true, ctx)?;
+            let doc = parse_json_bytes_metered(&b, true, ctx)?;
             let target = if args.len() == 2 {
                 let Some(pb) = text_bytes_of(&args[1]) else {
                     return Ok(Some((SqlValue::Null, false)));
@@ -2075,8 +2389,7 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let doc = parse_json_metered(s, true, ctx)?;
+            let doc = parse_json_bytes_metered(&b, true, ctx)?;
             let target = if args.len() == 2 {
                 let Some(pb) = text_bytes_of(&args[1]) else {
                     return Ok(Some((SqlValue::Null, false)));
@@ -2102,8 +2415,7 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let doc = parse_json_metered(s, true, ctx)?;
+            let doc = parse_json_bytes_metered(&b, true, ctx)?;
             if args.len() == 2 {
                 let Some(pb) = text_bytes_of(&args[1]) else {
                     return Ok(Some((SqlValue::Null, false)));
@@ -2190,10 +2502,9 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let mut doc = parse_json_metered(s, true, ctx)?;
+            let mut doc = parse_json_bytes_metered(&b, true, ctx)?;
             let mut mem = crate::utf8::MemoryGuard::new(ctx.meter);
-            mem.reserve(s.len() as u64)?;
+            mem.reserve(b.len() as u64)?;
             let mode = match lower_name {
                 "json_insert" => MutMode::Insert,
                 "json_replace" => MutMode::Replace,
@@ -2224,8 +2535,7 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-            let mut doc = parse_json_metered(s, true, ctx)?;
+            let mut doc = parse_json_bytes_metered(&b, true, ctx)?;
             let mut removed_root = false;
             for arg in &args[1..] {
                 let Some(pb) = text_bytes_of(arg) else {
@@ -2255,16 +2565,8 @@ pub fn call_json_scalar(
             let (Some(b1), Some(b2)) = (text_bytes_of(&args[0]), text_bytes_of(&args[1])) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let d1 = parse_json_metered(
-                std::str::from_utf8(&b1).map_err(|_| SqlError::runtime("malformed JSON"))?,
-                true,
-                ctx,
-            )?;
-            let d2 = parse_json_metered(
-                std::str::from_utf8(&b2).map_err(|_| SqlError::runtime("malformed JSON"))?,
-                true,
-                ctx,
-            )?;
+            let d1 = parse_json_bytes_metered(&b1, true, ctx)?;
+            let d2 = parse_json_bytes_metered(&b2, true, ctx)?;
             let merged = merge_patch(d1, d2, 0, ctx)?;
             (render_json_value_metered(&merged, ctx)?, true)
         }
@@ -2277,11 +2579,7 @@ pub fn call_json_scalar(
             let Some(b) = text_bytes_of(&args[0]) else {
                 return Ok(Some((SqlValue::Null, false)));
             };
-            let doc = parse_json_metered(
-                std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?,
-                true,
-                ctx,
-            )?;
+            let doc = parse_json_bytes_metered(&b, true, ctx)?;
             let indent = if args.len() == 2 {
                 text_bytes_of(&args[1])
                     .map(|ib| String::from_utf8_lossy(&ib).into_owned())
@@ -2365,8 +2663,7 @@ fn eval_json_tvf(
             rows: Vec::new(),
         });
     };
-    let s = std::str::from_utf8(&b).map_err(|_| SqlError::runtime("malformed JSON"))?;
-    let doc = parse_json_metered(s, true, ctx)?;
+    let doc = parse_json_bytes_metered(&b, true, ctx)?;
     let (root_path, parent_path, root_key, target) = if args.len() == 2 {
         let Some(pb) = text_bytes_of(&args[1]) else {
             return Ok(TableValuedResult {

@@ -2412,8 +2412,10 @@ fn pass7_audit_pager_limits_btree_safety_dml_and_fastpaths_verified_by_c_sqlite(
         "1-byte header-only (`hdr_len == hpos`) table record must return Corrupt"
     );
 
-    // 5. M2: `INSERT OR FAIL` inside an active transaction flushes `changes()`, `total_changes()`,
-    //    and `sqlite_sequence` for committed prefix rows!
+    // 5. M2: `INSERT OR FAIL` inside an active transaction flushes `changes()` & `total_changes()`
+    //    for committed prefix rows, while per C SQLite (`insert.c:autoIncEnd`) `sqlite_sequence`
+    //    is NOT updated when the statement halts early with `OE_Fail` (subsequent INSERT still
+    //    computes `max(table_max_rowid, seq) + 1 = 4` and advances `seq` to `4`).
     let mut c = SqliteConnection::open_in_memory(ConnectionOptions::default()).unwrap();
     c.execute(
         "CREATE TABLE ftab (id INTEGER PRIMARY KEY AUTOINCREMENT, k INT UNIQUE ON CONFLICT FAIL NOT NULL)",
@@ -2426,11 +2428,14 @@ fn pass7_audit_pager_limits_btree_safety_dml_and_fastpaths_verified_by_c_sqlite(
     assert_eq!(c.changes(), 2, "2 prefix rows must be counted in changes()");
     assert_eq!(c.total_changes(), 3, "total_changes() must reflect committed prefix");
     let fseq = c.query("SELECT seq FROM sqlite_sequence WHERE name = 'ftab'").unwrap();
-    assert!(fseq.rows[0][0].exact_eq(&SqlValue::Int(3)));
+    assert!(fseq.rows[0][0].exact_eq(&SqlValue::Int(1)));
     c.execute("COMMIT").unwrap();
     assert!(
         c.query("SELECT count(*) FROM ftab").unwrap().rows[0][0].exact_eq(&SqlValue::Int(3))
     );
+    c.execute("INSERT INTO ftab(k) VALUES (500)").unwrap();
+    let fseq2 = c.query("SELECT seq FROM sqlite_sequence WHERE name = 'ftab'").unwrap();
+    assert!(fseq2.rows[0][0].exact_eq(&SqlValue::Int(4)));
 
     // 6. M3: `ALTER TABLE ADD COLUMN` NOT NULL checks final DEFAULT including `+NULL` / `-NULL`.
     c.execute("CREATE TABLE alt_t (id INTEGER PRIMARY KEY)").unwrap();

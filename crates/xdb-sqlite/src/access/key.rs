@@ -50,17 +50,23 @@ pub fn resolve_collation(
     encoding: TextEncoding,
     registry: Option<&CollationRegistry>,
 ) -> SqliteResult<Option<Collation>> {
+    if let Some(reg) = registry {
+        if let Some(col) = reg.find(name) {
+            return Ok(match col {
+                Collation::Builtin {
+                    kind: BuiltinCollation::Binary,
+                    ..
+                } => None,
+                other => Some(other.clone()),
+            });
+        }
+    }
     if let Some(b) = BuiltinCollation::from_name(name) {
         return Ok(if b == BuiltinCollation::Binary {
             None
         } else {
             Some(Collation::builtin(b, encoding))
         });
-    }
-    if let Some(reg) = registry {
-        if let Some(user) = reg.find(name) {
-            return Ok(Some(user.clone()));
-        }
     }
     Err(SqliteError::UnknownCollation(name.to_string()))
 }
@@ -99,12 +105,25 @@ pub fn key_info_for_index(
     encoding: TextEncoding,
     registry: Option<&CollationRegistry>,
 ) -> SqliteResult<KeyInfo> {
+    // For a WITHOUT ROWID primary-key B-tree, `index.columns` stores all table columns
+    // (`n_all_field = columns.len()`) so full-row search keys work, while only the leading
+    // `key_count` PK columns are compared as keys; trailing payload columns use `BINARY`
+    // so non-PK custom collations never fail key resolution (matching `sqlite3KeyInfoOfIndex`).
     let specs: Vec<KeyFieldSpec<'_>> = index
         .columns
         .iter()
-        .map(|c| KeyFieldSpec {
-            collation: &c.collation,
-            desc: c.desc,
+        .enumerate()
+        .map(|(i, c)| KeyFieldSpec {
+            collation: if index.without_rowid_primary_key && i >= index.key_count {
+                "BINARY"
+            } else {
+                &c.collation
+            },
+            desc: if index.without_rowid_primary_key && i >= index.key_count {
+                false
+            } else {
+                c.desc
+            },
         })
         .collect();
     make_key_info(encoding, &specs, index.key_count, registry)

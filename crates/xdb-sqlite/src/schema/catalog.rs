@@ -473,8 +473,35 @@ impl<'a> SchemaLoader<'a> {
                 if let Some(rl) = err.resource_limit {
                     return Err(SqliteError::ResourceLimit(rl));
                 }
-                self.header_checks_first(sql, &err)?;
-                return Err(self.corrupt(err.message));
+                // Allow XDB dialect view and trigger definitions (e.g. `* EXCLUDE(...) REPLACE(...)`).
+                let is_view_or_trigger = self.argv[0].as_deref().is_some_and(|t| {
+                    t.eq_ignore_ascii_case("view") || t.eq_ignore_ascii_case("trigger")
+                });
+                if is_view_or_trigger {
+                    let xdb_opts = ParseOptions {
+                        dialect: Dialect::Xdb,
+                        schema: true,
+                        ..ParseOptions::default()
+                    };
+                    match parse_statement_at_metered(
+                        sql,
+                        0,
+                        &xdb_opts,
+                        self.bt.pager().meter().as_ref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(xerr) => {
+                            if let Some(rl) = xerr.resource_limit {
+                                return Err(SqliteError::ResourceLimit(rl));
+                            }
+                            self.header_checks_first(sql, &err)?;
+                            return Err(self.corrupt(err.message));
+                        }
+                    }
+                } else {
+                    self.header_checks_first(sql, &err)?;
+                    return Err(self.corrupt(err.message));
+                }
             }
         };
         let Some(stmt) = parsed.statement else {
@@ -561,6 +588,9 @@ impl<'a> SchemaLoader<'a> {
         else {
             return Ok(());
         };
+        if !z_name.eq_ignore_ascii_case("sqlite_master") && self.new_tnum < 2 {
+            return Err(self.corrupt("corrupt database"));
+        }
         if stmt.as_select.is_some() {
             return Err(self.corrupt(""));
         }
@@ -709,6 +739,17 @@ impl<'a> SchemaLoader<'a> {
         let z_name = stmt.name.name.clone();
         let t_z_name = self.table_arena[table_id].z_name.clone();
         self.check_object_name(&z_name, "index", &t_z_name)?;
+        if self.new_tnum < 2 {
+            return Err(self.corrupt("corrupt database"));
+        }
+        if let Some(existing_id) = self.find_table(&z_name) {
+            let kind_word = if self.table_arena[existing_id].kind == TableKind::View {
+                "view"
+            } else {
+                "table"
+            };
+            return Err(self.corrupt(format!("there is already a {kind_word} named {z_name}")));
+        }
         if self.indexes_by_name.contains_key(&ascii_fold(&z_name)) {
             let msg = if stmt.if_not_exists {
                 String::new()

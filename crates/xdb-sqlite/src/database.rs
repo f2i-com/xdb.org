@@ -1338,16 +1338,18 @@ impl RowCursor {
                         } else {
                             false
                         };
+                        let mut emitted_rid = Some(rid);
                         if !inline_decoded {
                             tc.set_leaf_cell_index(ci);
                             let r_rid = tc.rowid().map_err(map_err)?;
+                            emitted_rid = Some(r_rid);
                             let rec = tc.record().map_err(map_err)?;
                             for (j, &cid) in cids.iter().enumerate() {
                                 buf[cid] =
                                     decode_value(&self.plan, j, rec, r_rid).map_err(map_err)?;
                             }
                         }
-                        if !visit(Some(rid), buf)? {
+                        if !visit(emitted_rid, buf)? {
                             return Ok(());
                         }
                     }

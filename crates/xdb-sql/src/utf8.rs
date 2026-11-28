@@ -207,6 +207,8 @@ pub struct ByteAccum<'m> {
     pub limit: usize,
     /// True for `StrAccum` (`printf`, `quote`, `group_concat`) which reserves 1 byte for NUL.
     pub str_accum: bool,
+    /// True once any append/write has touched this accumulator (even empty `%s`).
+    pub touched: bool,
     meter: Option<&'m dyn Meter>,
     charged: usize,
     step_pending: usize,
@@ -218,6 +220,7 @@ impl<'m> ByteAccum<'m> {
             buf: Vec::new(),
             limit,
             str_accum,
+            touched: false,
             meter,
             charged: 0,
             step_pending: 0,
@@ -300,6 +303,7 @@ impl<'m> ByteAccum<'m> {
 
     #[inline]
     pub fn push(&mut self, b: u8) -> SqlResult<()> {
+        self.touched = true;
         self.reserve_extra(1)?;
         self.buf.push(b);
         Ok(())
@@ -307,6 +311,7 @@ impl<'m> ByteAccum<'m> {
 
     #[inline]
     pub fn push_bytes(&mut self, src: &[u8]) -> SqlResult<()> {
+        self.touched = true;
         if src.is_empty() {
             return Ok(());
         }
@@ -321,6 +326,7 @@ impl<'m> ByteAccum<'m> {
     }
 
     pub fn push_repeat(&mut self, byte: u8, count: usize) -> SqlResult<()> {
+        self.touched = true;
         if count == 0 {
             return Ok(());
         }
@@ -330,6 +336,7 @@ impl<'m> ByteAccum<'m> {
     }
 
     pub fn push_utf8(&mut self, cp: u32) -> SqlResult<()> {
+        self.touched = true;
         let need = if cp < 0x80 {
             1
         } else if cp < 0x800 {

@@ -21,6 +21,11 @@ pub enum SqlError {
     Unsupported(String),
     /// Deterministic sandbox resource limit reached (steps, memory, or page reads).
     ResourceLimit(ResourceLimitError),
+    /// Trigger `RAISE(IGNORE | ROLLBACK | ABORT | FAIL [, message])` signal.
+    Raise {
+        action: xdb_parser::RaiseAction,
+        message: Option<String>,
+    },
 }
 
 impl SqlError {
@@ -54,6 +59,13 @@ impl fmt::Display for SqlError {
             | SqlError::Storage(msg)
             | SqlError::Unsupported(msg) => f.write_str(msg),
             SqlError::ResourceLimit(e) => write!(f, "{e}"),
+            SqlError::Raise { action, message } => match message {
+                Some(m) => f.write_str(m),
+                None => match action {
+                    xdb_parser::RaiseAction::Ignore => f.write_str("RAISE(IGNORE)"),
+                    _ => f.write_str("constraint failed"),
+                },
+            },
         }
     }
 }

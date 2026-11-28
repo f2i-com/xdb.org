@@ -570,7 +570,7 @@ impl WritePager {
         clear_hot_journal: bool,
         clear_wal: bool,
         require_wal_present: bool,
-        expected_disk: &(u64, [u8; 100]),
+        expected_disk: &DiskRecoveryFingerprint,
     ) -> SqliteResult<bool> {
         let Some(ref backing) = self.backing else {
             return Ok(true);
@@ -586,20 +586,27 @@ impl WritePager {
         }
 
         let write_res: SqliteResult<bool> = (|| {
-            // Re-verify on-disk main DB fingerprint & companion files under Exclusive lock so
-            // we never overwrite commits or recovery performed concurrently before our lock.
+            // Re-verify on-disk main DB, `-wal`, and `-journal` fingerprints under Exclusive lock
+            // so we never overwrite commits or recovery performed concurrently before our lock.
             let cur_size = main_file.size()?;
             let mut cur_hdr = [0u8; 100];
             if cur_size >= 100 {
                 main_file.read(&mut cur_hdr, 0)?;
             }
-            if (cur_size, cur_hdr) != *expected_disk {
+            let cur_wal = read_companion_fingerprint(vfs.as_ref(), &main_path, "-wal", FileKind::Wal)?;
+            let cur_journal =
+                read_companion_fingerprint(vfs.as_ref(), &main_path, "-journal", FileKind::MainJournal)?;
+            if cur_size != expected_disk.main_size
+                || cur_hdr != expected_disk.main_hdr
+                || cur_wal != expected_disk.wal
+                || cur_journal != expected_disk.journal
+            {
                 return Ok(false);
             }
-            if clear_hot_journal && !vfs.exists(&format!("{main_path}-journal"))? {
+            if clear_hot_journal && cur_journal.is_none() {
                 return Ok(false);
             }
-            if require_wal_present && !vfs.exists(&format!("{main_path}-wal"))? {
+            if require_wal_present && cur_wal.is_none() {
                 return Ok(false);
             }
 
@@ -694,8 +701,8 @@ impl WritePager {
     }
 
     pub fn set_page_size(&mut self, new_size: u32) -> SqliteResult<()> {
-        if !is_valid_page_size(new_size) {
-            return Ok(()); // SQLite silently ignores invalid PRAGMA page_size
+        if !is_valid_page_size(new_size) || u32::from(self.reserved_bytes) + 480 > new_size {
+            return Ok(()); // SQLite silently ignores invalid or reserved-incompatible PRAGMA page_size
         }
         if self.page_count > 0 {
             self.pending_page_size = Some(new_size);
@@ -719,6 +726,18 @@ impl WritePager {
     }
 
     #[inline]
+    pub fn reserved_bytes(&self) -> u8 {
+        self.reserved_bytes
+    }
+
+    pub fn set_reserved_bytes(&mut self, reserved: u8) {
+        if self.page_count == 0 && u32::from(reserved) + 480 <= self.page_size {
+            self.reserved_bytes = reserved;
+            self.limits = payload_limits(self.page_size - u32::from(reserved));
+        }
+    }
+
+    #[inline]
     pub fn usable_size(&self) -> u32 {
         self.page_size - u32::from(self.reserved_bytes)
     }
@@ -734,6 +753,14 @@ impl WritePager {
 
     pub fn encoding(&self) -> TextEncoding {
         self.encoding
+    }
+
+    pub fn is_vfs_backed(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    pub fn vfs_handle(&self) -> Option<Arc<dyn Vfs>> {
+        self.backing.as_ref().map(|b| Arc::clone(&b.vfs))
     }
 
     pub fn set_encoding(&mut self, enc: TextEncoding) {
@@ -801,7 +828,11 @@ impl WritePager {
 
     pub fn db_info(&self) -> DatabaseInfo {
         if self.page_count == 0 {
-            return empty_database_info(self.page_size);
+            let mut info = empty_database_info(self.page_size);
+            info.usable_size = self.usable_size();
+            info.text_encoding = self.encoding;
+            info.limits = self.limits;
+            return info;
         }
         let p1 = self.pages.get(1).expect("page 1 exists");
         validate_database_header(p1, self.page_count, self.page_size, Some(self.page_count))
@@ -844,7 +875,7 @@ impl WritePager {
         p1[32..36].copy_from_slice(&0u32.to_be_bytes()); // first freelist trunk
         p1[36..40].copy_from_slice(&0u32.to_be_bytes()); // freelist count
         p1[40..44].copy_from_slice(&0u32.to_be_bytes()); // schema cookie
-        p1[44..48].copy_from_slice(&4u32.to_be_bytes()); // schema format = 4
+        p1[44..48].copy_from_slice(&self.schema_format.to_be_bytes()); // schema format
         p1[48..52].copy_from_slice(&0u32.to_be_bytes()); // default cache size
         p1[52..56].copy_from_slice(&0u32.to_be_bytes()); // largest root btree (0 = no autovacuum)
         let enc_u32: u32 = match self.encoding {
@@ -884,9 +915,27 @@ impl WritePager {
 
     /// Obtain mutable access to page `pgno`, recording undo & dirty state automatically.
     /// Mutates strictly in place with zero 4 KiB memcpy whenever uniquely owned.
+    #[inline]
     pub fn write_page_mut(&mut self, pgno: u32) -> SqliteResult<&mut [u8]> {
         if !self.noop_meter {
             self.meter.charge_steps(1)?;
+        }
+        // Single-lookup hot path: in-memory DB whose page is already recorded in top undo frame
+        // (or no undo frame active) skips redundant existence & undo map probes.
+        if self.backing.is_none()
+            && self.undo_stack.last().is_none_or(|f| f.is_saved(pgno))
+        {
+            if !self.pages.contains_key(pgno) {
+                return Err(SqliteError::corrupt(format!(
+                    "write to unallocated page {pgno}"
+                )));
+            }
+            self.dirty_in_memory = true;
+            self.mut_gen = self.mut_gen.wrapping_add(1);
+            let entry = Arc::make_mut(&mut self.pages)
+                .get_mut(pgno)
+                .expect("page exists");
+            return Ok(arc_bytes_make_mut(entry));
         }
         if !self.pages.contains_key(pgno) {
             return Err(SqliteError::corrupt(format!(
@@ -1141,6 +1190,7 @@ impl WritePager {
         let ft = self.freelist_trunk;
         let fc = self.freelist_count;
         let sc = self.schema_cookie;
+        let sf = self.schema_format;
         let uv = self.user_version;
         let aid = self.application_id;
         let cc = self.change_counter;
@@ -1151,6 +1201,7 @@ impl WritePager {
         p1[32..36].copy_from_slice(&ft.to_be_bytes());
         p1[36..40].copy_from_slice(&fc.to_be_bytes());
         p1[40..44].copy_from_slice(&sc.to_be_bytes());
+        p1[44..48].copy_from_slice(&sf.to_be_bytes());
         p1[60..64].copy_from_slice(&uv.to_be_bytes());
         p1[68..72].copy_from_slice(&aid.to_be_bytes());
         p1[92..96].copy_from_slice(&cc.to_be_bytes());
@@ -1319,6 +1370,21 @@ impl WritePager {
         self.apply_undo_frame(target);
         self.undo_stack.push(self.make_undo_frame(kept_name));
         Ok(())
+    }
+
+    /// Returns `true` if `RELEASE <name>` would commit the outermost implicit savepoint transaction.
+    pub fn will_release_commit(&self, name: &str) -> bool {
+        if self.in_explicit_tx {
+            return false;
+        }
+        self.undo_stack
+            .iter()
+            .rposition(|f| {
+                f.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            == Some(0)
     }
 
     /// `RELEASE [SAVEPOINT] name`: merges matching savepoint (and nested ones) upward.
@@ -1947,9 +2013,64 @@ impl WritePager {
     }
 }
 
-/// Read the current on-disk `(file_size, header[0..100])` fingerprint under Shared lock so
+type CompanionFingerprint = (u64, u64, u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskRecoveryFingerprint {
+    main_size: u64,
+    main_hdr: [u8; 100],
+    wal: Option<CompanionFingerprint>,
+    journal: Option<CompanionFingerprint>,
+}
+
+/// Compute a full-content `(size, hash1, hash2)` fingerprint over a companion log file (`-wal` or
+/// `-journal`) so mid-file overwrites (e.g. post-checkpoint WAL frames) are always detected.
+fn read_companion_fingerprint(
+    vfs: &dyn Vfs,
+    main_path: &str,
+    suffix: &str,
+    kind: FileKind,
+) -> SqliteResult<Option<CompanionFingerprint>> {
+    let comp_path = format!("{main_path}{suffix}");
+    if !vfs.exists(&comp_path)? {
+        return Ok(None);
+    }
+    let mut cf = match vfs.open(&comp_path, OpenFlags::readonly(kind)) {
+        Ok(f) => f,
+        Err(e) if e.code == IoErrorCode::CantOpen => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let res = (|| -> SqliteResult<CompanionFingerprint> {
+        let sz = cf.size()?;
+        let mut h1: u64 = 0xcbf2_9ce4_8422_2325u64 ^ sz;
+        let mut h2: u64 = 0x9e37_79b9_7f4a_7c15u64.wrapping_add(sz);
+        let mut buf = [0u8; 8192];
+        let mut off = 0u64;
+        while off < sz {
+            let chunk = ((sz - off) as usize).min(buf.len());
+            cf.read(&mut buf[..chunk], off)?;
+            for &b in &buf[..chunk] {
+                h1 ^= u64::from(b);
+                h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+                h2 = h2
+                    .wrapping_mul(0x517c_c1b7_2722_0a95)
+                    .wrapping_add(u64::from(b).wrapping_add(1));
+                h2 ^= h2 >> 33;
+            }
+            off += chunk as u64;
+        }
+        Ok((sz, h1, h2))
+    })();
+    let _ = cf.close();
+    res.map(Some)
+}
+
+/// Read the current on-disk main DB, `-wal`, and `-journal` fingerprint under Shared lock so
 /// recovery can verify no concurrent writer committed or recovered before our Exclusive lock.
-fn read_disk_header_fingerprint(vfs: &dyn Vfs, path: &str) -> SqliteResult<(u64, [u8; 100])> {
+fn read_disk_header_fingerprint(
+    vfs: &dyn Vfs,
+    path: &str,
+) -> SqliteResult<DiskRecoveryFingerprint> {
     let mut f = vfs.open(path, OpenFlags::readonly(FileKind::MainDb))?;
     let res = (|| {
         if !f.lock(LockLevel::Shared)? {
@@ -1965,7 +2086,14 @@ fn read_disk_header_fingerprint(vfs: &dyn Vfs, path: &str) -> SqliteResult<(u64,
         if sz >= 100 {
             f.read(&mut hdr, 0)?;
         }
-        Ok((sz, hdr))
+        let wal = read_companion_fingerprint(vfs, path, "-wal", FileKind::Wal)?;
+        let journal = read_companion_fingerprint(vfs, path, "-journal", FileKind::MainJournal)?;
+        Ok(DiskRecoveryFingerprint {
+            main_size: sz,
+            main_hdr: hdr,
+            wal,
+            journal,
+        })
     })();
     let _ = f.unlock(LockLevel::None);
     let _ = f.close();

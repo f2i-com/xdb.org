@@ -162,8 +162,15 @@ fn free_overflow_chain_tracked(
     mut pgno: u32,
     seen: &mut HashSet<u32>,
 ) -> SqliteResult<()> {
+    let page_count = pager.page_count();
+    let lbp = lock_byte_page(pager.page_size());
     let mut to_free = Vec::new();
     while pgno != 0 {
+        if pgno < 2 || pgno > page_count || pgno == lbp {
+            return Err(SqliteError::corrupt(format!(
+                "invalid overflow page {pgno}"
+            )));
+        }
         if !seen.insert(pgno) {
             return Err(SqliteError::corrupt(format!(
                 "overflow page cycle or shared overflow page {pgno}"
@@ -192,7 +199,9 @@ fn read_full_payload(
         return Ok(local[..total_size].to_vec());
     }
     let chunk_cap = (pager.usable_size() as usize).saturating_sub(4);
-    let max_record = (pager.page_size() as u64).saturating_mul(pager.page_count() as u64);
+    let page_count = pager.page_count();
+    let lbp = lock_byte_page(pager.page_size());
+    let max_record = (pager.page_size() as u64).saturating_mul(page_count as u64);
     if total_size as u64 > max_record {
         return Err(SqliteError::corrupt("payload size exceeds database size"));
     }
@@ -212,11 +221,16 @@ fn read_full_payload(
     let _guard = PayloadRelease(meter, if metered { total_size as u64 } else { 0 });
     let mut out = Vec::with_capacity(total_size);
     out.extend_from_slice(local);
-    let max_steps = pager.page_count() as usize + 1;
+    let max_steps = page_count as usize + 1;
     let mut steps = 0usize;
     while out.len() < total_size {
         if ovfl_pgno == 0 {
             return Err(SqliteError::corrupt("truncated overflow chain"));
+        }
+        if ovfl_pgno < 2 || ovfl_pgno > page_count || ovfl_pgno == lbp {
+            return Err(SqliteError::corrupt(format!(
+                "invalid overflow page {ovfl_pgno}"
+            )));
         }
         steps += 1;
         if steps > max_steps {
@@ -1276,8 +1290,39 @@ pub fn table_get_record_fields(
     }
 }
 
+/// Stack-allocated visited-page bitmap for cycle detection in direct B-tree scans.
+/// Covers pages `0..8192` (32 MiB at 4 KiB pages) strictly on the stack with zero heap
+/// allocations, falling back transparently to a `HashSet<u32>` for larger databases.
+struct VisitedPages {
+    bits: [u64; 128],
+    overflow: Option<HashSet<u32>>,
+}
+
+impl VisitedPages {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            bits: [0u64; 128],
+            overflow: None,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, pgno: u32) -> bool {
+        if pgno < 8192 {
+            let w = (pgno as usize) >> 6;
+            let bit = 1u64 << (pgno & 63);
+            let was = (self.bits[w] & bit) != 0;
+            self.bits[w] |= bit;
+            !was
+        } else {
+            self.overflow.get_or_insert_with(HashSet::new).insert(pgno)
+        }
+    }
+}
+
 /// Count all rows in a rowid table B-tree in O(pages) time directly on `WritePager`
-/// (sums leaf `n_cell` without building a `SqliteDatabase` or `TableCursor`).
+/// with zero heap allocations (sums leaf `n_cell` directly on stack cursor + bitmap).
 pub fn table_count_rows(pager: &WritePager, root_pgno: u32) -> SqliteResult<u64> {
     let page_count = pager.page_count();
     if root_pgno == 1 && page_count == 0 {
@@ -1286,60 +1331,117 @@ pub fn table_count_rows(pager: &WritePager, root_pgno: u32) -> SqliteResult<u64>
     let metered = !pager.is_noop_meter();
     let mut total = 0u64;
     let usable = pager.usable_size();
-    let mut visited = 0u32;
-    let mut visited_pages = std::collections::HashSet::<u32>::new();
-    let mut stack: Vec<(u32, usize)> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
-    stack.push((root_pgno, 0));
-    while let Some((pgno, depth)) = stack.pop() {
-        visited = visited.saturating_add(1);
-        if visited > page_count || !visited_pages.insert(pgno) {
+    let mut visited = 1u32;
+    let mut visited_pages = VisitedPages::new();
+    // Lazy interior cursor stack: at most `BTREE_MAX_DEPTH` entries (one per level).
+    let mut stack = [(0u32, 0usize); BTREE_MAX_DEPTH];
+    let mut sp: usize;
+
+    // Inspect root page directly first.
+    visited_pages.insert(root_pgno);
+    if metered {
+        pager.meter().charge_steps(1)?;
+    }
+    let root_data = pager.read_page(root_pgno)?;
+    let root_bound = (usable as usize).min(root_data.len());
+    let root_hdr = if root_pgno == 1 { HEADER_SIZE } else { 0 };
+    if root_hdr + 8 > root_bound {
+        return Err(SqliteError::corrupt(format!("page {root_pgno}: truncated header")));
+    }
+    match BtreePageType::from_byte(root_data[root_hdr]) {
+        Some(BtreePageType::TableLeaf) => {
+            let n_cell = usize::from(read_u16_be(root_data, root_hdr + 3));
+            if root_hdr + 8 + 2 * n_cell > root_bound {
+                return Err(SqliteError::corrupt(format!(
+                    "page {root_pgno}: leaf cell pointers out of bounds"
+                )));
+            }
+            return Ok(n_cell as u64);
+        }
+        Some(BtreePageType::TableInterior) => {
+            stack[0] = (root_pgno, 0);
+            sp = 1;
+        }
+        _ => {
             return Err(SqliteError::corrupt(format!(
-                "table B-tree {root_pgno} contains a cycle"
+                "table_count_rows: invalid page type on page {root_pgno}"
             )));
         }
-        if metered {
-            pager.meter().charge_steps(1)?;
-        }
+    }
+
+    while sp > 0 {
+        let (pgno, next_ci) = stack[sp - 1];
         let data = pager.read_page(pgno)?;
         let bound = (usable as usize).min(data.len());
         let hdr = if pgno == 1 { HEADER_SIZE } else { 0 };
-        if hdr + 8 > bound {
-            return Err(SqliteError::corrupt(format!("page {pgno}: truncated header")));
-        }
         let n_cell = usize::from(read_u16_be(data, hdr + 3));
-        match BtreePageType::from_byte(data[hdr]) {
-            Some(BtreePageType::TableLeaf) => {
-                total = total.saturating_add(n_cell as u64);
-            }
-            Some(BtreePageType::TableInterior) => {
-                if depth + 1 >= BTREE_MAX_DEPTH {
+        if hdr + 12 + 2 * n_cell > bound {
+            return Err(SqliteError::corrupt(format!(
+                "page {pgno}: truncated interior header"
+            )));
+        }
+        let ptr_off = hdr + 12;
+        let mut ci = next_ci;
+        let mut descended = false;
+        while ci <= n_cell {
+            let child = if ci < n_cell {
+                let pc = usize::from(read_u16_be(data, ptr_off + 2 * ci));
+                if pc + 4 > bound {
                     return Err(SqliteError::corrupt(format!(
-                        "table B-tree {root_pgno} exceeds max depth"
+                        "page {pgno}: interior cell {ci} out of bounds"
                     )));
                 }
-                if hdr + 12 + 2 * n_cell > bound {
-                    return Err(SqliteError::corrupt(format!(
-                        "page {pgno}: truncated interior header"
-                    )));
-                }
-                let rc = read_u32_be(data, hdr + 8);
-                stack.push((rc, depth + 1));
-                let ptr_off = hdr + 12;
-                for i in 0..n_cell {
-                    let pc = usize::from(read_u16_be(data, ptr_off + 2 * i));
-                    if pc + 4 > bound {
-                        return Err(SqliteError::corrupt(format!(
-                            "page {pgno}: interior cell {i} out of bounds"
-                        )));
-                    }
-                    stack.push((read_u32_be(data, pc), depth + 1));
-                }
-            }
-            _ => {
+                read_u32_be(data, pc)
+            } else {
+                read_u32_be(data, hdr + 8)
+            };
+            ci += 1;
+            visited = visited.saturating_add(1);
+            if visited > page_count || !visited_pages.insert(child) {
                 return Err(SqliteError::corrupt(format!(
-                    "table_count_rows: invalid page type on page {pgno}"
+                    "table B-tree {root_pgno} contains a cycle"
                 )));
             }
+            if metered {
+                pager.meter().charge_steps(1)?;
+            }
+            let cdata = pager.read_page(child)?;
+            let cbound = (usable as usize).min(cdata.len());
+            let chdr = if child == 1 { HEADER_SIZE } else { 0 };
+            if chdr + 8 > cbound {
+                return Err(SqliteError::corrupt(format!("page {child}: truncated header")));
+            }
+            match BtreePageType::from_byte(cdata[chdr]) {
+                Some(BtreePageType::TableLeaf) => {
+                    let cn = usize::from(read_u16_be(cdata, chdr + 3));
+                    if chdr + 8 + 2 * cn > cbound {
+                        return Err(SqliteError::corrupt(format!(
+                            "page {child}: leaf cell pointers out of bounds"
+                        )));
+                    }
+                    total = total.saturating_add(cn as u64);
+                }
+                Some(BtreePageType::TableInterior) => {
+                    if sp >= BTREE_MAX_DEPTH {
+                        return Err(SqliteError::corrupt(format!(
+                            "table B-tree {root_pgno} exceeds max depth"
+                        )));
+                    }
+                    stack[sp - 1].1 = ci;
+                    stack[sp] = (child, 0);
+                    sp += 1;
+                    descended = true;
+                    break;
+                }
+                _ => {
+                    return Err(SqliteError::corrupt(format!(
+                        "table_count_rows: invalid page type on page {child}"
+                    )));
+                }
+            }
+        }
+        if !descended {
+            sp -= 1;
         }
     }
     Ok(total)
@@ -3062,9 +3164,7 @@ pub fn table_scan_single_stored_col_direct(
     let mut ints: Vec<(i64, i64)> = Vec::new();
     let mut mixed: Option<Vec<(SqlValue, i64)>> = None;
     let mut visited_count = 0u32;
-    let bit_words = ((page_count.min(65_536) as usize) >> 6) + 1;
-    let mut visited_bits: Vec<u64> = vec![0u64; bit_words];
-    let mut visited_hi: Option<std::collections::HashSet<u32>> = None;
+    let mut visited = VisitedPages::new();
     let mut stack: Vec<(u32, usize)> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
     stack.push((root_pgno, 0));
 
@@ -3089,22 +3189,7 @@ pub fn table_scan_single_stored_col_direct(
 
     while let Some((pgno, depth)) = stack.pop() {
         visited_count = visited_count.saturating_add(1);
-        let fresh = if pgno <= 65_536 {
-            let w = (pgno as usize) >> 6;
-            let bit = 1u64 << (pgno & 63);
-            if w < visited_bits.len() {
-                let was = (visited_bits[w] & bit) != 0;
-                visited_bits[w] |= bit;
-                !was
-            } else {
-                false
-            }
-        } else {
-            visited_hi
-                .get_or_insert_with(std::collections::HashSet::new)
-                .insert(pgno)
-        };
-        if visited_count > page_count || !fresh {
+        if visited_count > page_count || !visited.insert(pgno) {
             return Err(SqliteError::corrupt(format!(
                 "table B-tree {root_pgno} contains a cycle"
             )));
@@ -6318,6 +6403,15 @@ pub fn check_integrity_metered(
     root_pages: &[u32],
     max_errors: usize,
 ) -> SqliteResult<Vec<String>> {
+    check_integrity_metered_scoped(pager, root_pages, max_errors, true)
+}
+
+pub(crate) fn check_integrity_metered_scoped(
+    pager: &WritePager,
+    root_pages: &[u32],
+    max_errors: usize,
+    check_whole_db: bool,
+) -> SqliteResult<Vec<String>> {
     if pager.page_count() == 0 {
         return Ok(vec!["ok".to_string()]);
     }
@@ -6348,13 +6442,14 @@ pub fn check_integrity_metered(
         }
         let mut expected_leaf_depth: Option<usize> = None;
         let mut expected_is_table: Option<bool> = None;
-        // Stack entries: (pgno, is_root, depth)
-        let mut stack = vec![(root, true, 0usize)];
-        while let Some((pgno, is_root, depth)) = stack.pop() {
+        type CheckFrame = (u32, bool, usize, Option<i64>, Option<i64>);
+        // Stack entries: (pgno, is_root, depth, lo_excl, hi_incl)
+        let mut stack: Vec<CheckFrame> = vec![(root, true, 0usize, None, None)];
+        while let Some((pgno, is_root, depth, lo_excl, hi_incl)) = stack.pop() {
             if metered {
                 meter.charge_steps(1)?;
             }
-            if pgno < 1 || pgno > page_count {
+            if pgno < 1 || pgno > page_count || (!is_root && pgno == 1) {
                 record_err!(format!("page {pgno} out of range 1..={page_count}"));
                 continue;
             }
@@ -6430,7 +6525,9 @@ pub fn check_integrity_metered(
             if frag > 60 {
                 record_err!(format!("page {pgno}: fragmented_bytes {frag} > 60"));
             }
-            // Validate freeblock chain (strictly ascending offsets inside content_start..bound).
+            // Validate freeblock chain (strictly ascending offsets inside content_start..bound,
+            // with minimum 4-byte gap between freeblocks per SQLite fileformat2 §1.6).
+            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n_cell + 4);
             let mut fb = usize::from(read_u16_be(data, hdr + 1));
             let mut prev_fb_end = 0usize;
             let mut fb_hops = 0usize;
@@ -6447,9 +6544,10 @@ pub fn check_integrity_metered(
                     record_err!(format!("page {pgno}: freeblock {fb} out of bounds"));
                     break;
                 }
-                if prev_fb_end > 0 && fb <= prev_fb_end {
+                if prev_fb_end > 0 && fb < prev_fb_end + 4 {
                     record_err!(format!(
-                        "page {pgno}: freeblocks out of order or adjacent ({fb} <= {prev_fb_end})"
+                        "page {pgno}: freeblocks out of order or gap < 4 ({fb} < {})",
+                        prev_fb_end + 4
                     ));
                     break;
                 }
@@ -6461,12 +6559,9 @@ pub fn check_integrity_metered(
                     ));
                     break;
                 }
+                ranges.push((fb, fb + fb_size));
                 prev_fb_end = fb + fb_size;
                 fb = next_fb;
-            }
-            if !is_leaf {
-                let rc = read_u32_be(data, hdr + 8);
-                stack.push((rc, false, depth + 1));
             }
             let (max_l, min_l) = if is_table && is_leaf {
                 (limits.max_leaf, limits.min_leaf)
@@ -6486,12 +6581,13 @@ pub fn check_integrity_metered(
                     continue;
                 }
                 let mut pos = pc;
+                let mut cell_child: Option<u32> = None;
                 if !is_leaf {
                     if pos + 4 > bound {
                         record_err!(format!("page {pgno}: cell {i} runs past page end"));
                         continue;
                     }
-                    stack.push((read_u32_be(data, pos), false, depth + 1));
+                    cell_child = Some(read_u32_be(data, pos));
                     pos += 4;
                 }
                 if is_table && !is_leaf {
@@ -6500,13 +6596,34 @@ pub fn check_integrity_metered(
                         record_err!(format!("page {pgno}: cell {i} key runs past page end"));
                         continue;
                     }
+                    if let Some(lo) = lo_excl {
+                        if rk <= lo {
+                            record_err!(format!(
+                                "page {pgno}: interior key {rk} <= parent lower bound {lo}"
+                            ));
+                        }
+                    }
+                    if let Some(hi) = hi_incl {
+                        if rk > hi {
+                            record_err!(format!(
+                                "page {pgno}: interior key {rk} > parent upper bound {hi}"
+                            ));
+                        }
+                    }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
                             record_err!(format!("page {pgno}: unsorted table interior keys"));
                         }
                     }
+                    if let Some(ch) = cell_child {
+                        stack.push((ch, false, depth + 1, prev_rowid.or(lo_excl), Some(rk)));
+                    }
+                    ranges.push((pc, (pos + klen).max(pc + 4)));
                     prev_rowid = Some(rk);
                     continue;
+                }
+                if let Some(ch) = cell_child {
+                    stack.push((ch, false, depth + 1, None, None));
                 }
                 let (psize_u32, n1) = get_payload_size_varint(data, pos);
                 pos += n1;
@@ -6515,6 +6632,20 @@ pub fn check_integrity_metered(
                     if pos + n2 > bound {
                         record_err!(format!("page {pgno}: cell {i} rowid runs past page end"));
                         continue;
+                    }
+                    if let Some(lo) = lo_excl {
+                        if rk <= lo {
+                            record_err!(format!(
+                                "page {pgno}: leaf rowid {rk} <= parent lower bound {lo}"
+                            ));
+                        }
+                    }
+                    if let Some(hi) = hi_incl {
+                        if rk > hi {
+                            record_err!(format!(
+                                "page {pgno}: leaf rowid {rk} > parent upper bound {hi}"
+                            ));
+                        }
                     }
                     if let Some(prev) = prev_rowid {
                         if rk <= prev {
@@ -6530,6 +6661,7 @@ pub fn check_integrity_metered(
                     record_err!(format!("page {pgno}: cell {i} payload runs past page end"));
                     continue;
                 }
+                ranges.push((pc, expected_end.max(pc + 4)));
                 if psize_u32 > local as u32 {
                     let expected_ovfl = overflow_page_count(psize_u32, local, usable);
                     let mut actual_ovfl = 0u32;
@@ -6565,80 +6697,102 @@ pub fn check_integrity_metered(
                     }
                 }
             }
+            if !is_leaf {
+                let rc = read_u32_be(data, hdr + 8);
+                if is_table {
+                    stack.push((rc, false, depth + 1, prev_rowid.or(lo_excl), hi_incl));
+                } else {
+                    stack.push((rc, false, depth + 1, None, None));
+                }
+            }
+            if ranges.len() > 1 {
+                ranges.sort_unstable_by_key(|r| r.0);
+                for pair in ranges.windows(2) {
+                    if pair[1].0 < pair[0].1 {
+                        record_err!(format!(
+                            "page {pgno}: overlapping cell/freeblock regions ({}..{} and {}..{})",
+                            pair[0].0, pair[0].1, pair[1].0, pair[1].1
+                        ));
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    // 2. Walk freelist
-    let max_leaves = ((usable as usize).saturating_sub(8)) / 4;
-    let mut trunk = pager.freelist_trunk();
-    let mut free_seen = 0u32;
-    while trunk != 0 {
-        if metered {
-            meter.charge_steps(1)?;
-        }
-        if trunk < 2 || trunk > page_count || trunk == lbp {
-            record_err!(format!("freelist trunk {trunk} out of range"));
-            break;
-        }
-        if !visited.insert(trunk) {
-            record_err!(format!("freelist trunk {trunk} referenced more than once"));
-            break;
-        }
-        free_seen += 1;
-        let tpage = match pager.read_page(trunk) {
-            Ok(p) => p,
-            Err(SqliteError::ResourceLimit(rl)) => return Err(SqliteError::ResourceLimit(rl)),
-            Err(_) => {
-                record_err!(format!("cannot read freelist trunk {trunk}"));
-                break;
-            }
-        };
-        if tpage.len() < 8 {
-            record_err!(format!("freelist trunk {trunk} truncated"));
-            break;
-        }
-        let next_trunk = read_u32_be(tpage, 0);
-        let cnt = read_u32_be(tpage, 4) as usize;
-        if cnt > max_leaves {
-            record_err!(format!(
-                "freelist trunk {trunk}: leaf count {cnt} exceeds max {max_leaves}"
-            ));
-            break;
-        }
-        for i in 0..cnt {
-            if metered && (i & 31) == 0 {
+    if check_whole_db {
+        // 2. Walk freelist
+        let max_leaves = ((usable as usize).saturating_sub(8)) / 4;
+        let mut trunk = pager.freelist_trunk();
+        let mut free_seen = 0u32;
+        while trunk != 0 {
+            if metered {
                 meter.charge_steps(1)?;
             }
-            let off = 8 + i * 4;
-            let leaf = read_u32_be(tpage, off);
-            if leaf < 2 || leaf > page_count || leaf == lbp {
-                record_err!(format!("freelist leaf {leaf} out of range"));
-                continue;
+            if trunk < 2 || trunk > page_count || trunk == lbp {
+                record_err!(format!("freelist trunk {trunk} out of range"));
+                break;
             }
-            if !visited.insert(leaf) {
-                record_err!(format!("freelist leaf {leaf} referenced more than once"));
+            if !visited.insert(trunk) {
+                record_err!(format!("freelist trunk {trunk} referenced more than once"));
+                break;
             }
             free_seen += 1;
+            let tpage = match pager.read_page(trunk) {
+                Ok(p) => p,
+                Err(SqliteError::ResourceLimit(rl)) => return Err(SqliteError::ResourceLimit(rl)),
+                Err(_) => {
+                    record_err!(format!("cannot read freelist trunk {trunk}"));
+                    break;
+                }
+            };
+            if tpage.len() < 8 {
+                record_err!(format!("freelist trunk {trunk} truncated"));
+                break;
+            }
+            let next_trunk = read_u32_be(tpage, 0);
+            let cnt = read_u32_be(tpage, 4) as usize;
+            if cnt > max_leaves {
+                record_err!(format!(
+                    "freelist trunk {trunk}: leaf count {cnt} exceeds max {max_leaves}"
+                ));
+                break;
+            }
+            for i in 0..cnt {
+                if metered && (i & 31) == 0 {
+                    meter.charge_steps(1)?;
+                }
+                let off = 8 + i * 4;
+                let leaf = read_u32_be(tpage, off);
+                if leaf < 2 || leaf > page_count || leaf == lbp {
+                    record_err!(format!("freelist leaf {leaf} out of range"));
+                    continue;
+                }
+                if !visited.insert(leaf) {
+                    record_err!(format!("freelist leaf {leaf} referenced more than once"));
+                }
+                free_seen += 1;
+            }
+            trunk = next_trunk;
         }
-        trunk = next_trunk;
-    }
-    if free_seen != pager.freelist_count() {
-        record_err!(format!(
-            "freelist count mismatch: header={}, actual={free_seen}",
-            pager.freelist_count()
-        ));
-    }
+        if free_seen != pager.freelist_count() {
+            record_err!(format!(
+                "freelist count mismatch: header={}, actual={free_seen}",
+                pager.freelist_count()
+            ));
+        }
 
-    // 3. Check for leaked / unreferenced pages
-    for pgno in 1..=page_count {
-        if metered && (pgno & 63) == 0 {
-            meter.charge_steps(1)?;
-        }
-        if pgno == lbp {
-            continue;
-        }
-        if !visited.contains(&pgno) {
-            record_err!(format!("page {pgno} is never used"));
+        // 3. Check for leaked / unreferenced pages
+        for pgno in 1..=page_count {
+            if metered && (pgno & 63) == 0 {
+                meter.charge_steps(1)?;
+            }
+            if pgno == lbp {
+                continue;
+            }
+            if !visited.contains(&pgno) {
+                record_err!(format!("page {pgno} is never used"));
+            }
         }
     }
 
@@ -6843,7 +6997,7 @@ pub fn index_order_scan_covering_direct(
     let mut mem = DirectScanMemGuard::new(metered.then_some(meter.as_ref()));
     let mut skipped = 0usize;
     let mut visited_count = 0u32;
-    let mut visited = HashSet::<u32>::new();
+    let mut visited = VisitedPages::new();
     let mut stack: Vec<IdxStep> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
     stack.push(IdxStep::Descend(idx_root, 0));
 
@@ -7248,7 +7402,7 @@ pub fn table_topk_scan_direct(
     let mut worst_int: Option<i64> = None;
     let mut seq = 0u64;
     let mut visited_count = 0u32;
-    let mut visited = HashSet::<u32>::new();
+    let mut visited = VisitedPages::new();
     let mut stack: Vec<(u32, usize)> = Vec::with_capacity(BTREE_MAX_DEPTH * 2);
     stack.push((table_root, 0));
 

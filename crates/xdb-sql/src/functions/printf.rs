@@ -1098,5 +1098,8 @@ pub fn sql_printf(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<Sql
     };
     let mut acc = ByteAccum::new(ctx.limits.max_length, true, ctx.meter);
     str_appendf(&mut acc, &fmt, args, 1)?;
+    if !acc.touched {
+        return Ok(SqlValue::Null);
+    }
     Ok(SqlValue::Text(acc.into_boxed_bytes()))
 }

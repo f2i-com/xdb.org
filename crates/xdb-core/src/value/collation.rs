@@ -306,6 +306,18 @@ impl CollationRegistry {
         self.encoding
     }
 
+    /// Return a copy of this registry using `encoding` for built-in collations while preserving
+    /// all registered custom collations.
+    pub fn with_encoding(&self, encoding: TextEncoding) -> Self {
+        Self {
+            encoding,
+            binary: Collation::builtin(BuiltinCollation::Binary, encoding),
+            nocase: Collation::builtin(BuiltinCollation::Nocase, encoding),
+            rtrim: Collation::builtin(BuiltinCollation::Rtrim, encoding),
+            custom: self.custom.clone(),
+        }
+    }
+
     pub fn register(&mut self, name: impl Into<String>, func: CustomCollationFn) -> Collation {
         let name = name.into();
         let key = name.to_ascii_uppercase();
@@ -321,6 +333,22 @@ impl CollationRegistry {
         self.custom
             .as_mut()
             .is_some_and(|m| m.remove(&key).is_some())
+    }
+
+    /// Return the names of all registered custom collations (excluding built-ins).
+    pub fn custom_names(&self) -> Vec<String> {
+        let Some(ref custom) = self.custom else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = custom
+            .values()
+            .filter_map(|c| match c {
+                Collation::Custom { name, .. } => Some(name.clone()),
+                Collation::Builtin { .. } => None,
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     #[inline]

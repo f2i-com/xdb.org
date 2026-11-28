@@ -3,9 +3,12 @@
 
 pub mod btree;
 pub mod connection;
+pub(crate) mod fast_scans;
+pub(crate) mod fk;
 pub mod pager;
 pub mod record;
 pub mod seed;
+pub(crate) mod trigger;
 
 pub use btree::{
     check_integrity, check_integrity_metered, create_btree, drop_btree, index_delete, index_insert,

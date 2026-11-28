@@ -172,9 +172,9 @@ impl BtreePage {
         };
         let cell_ptr_offset = hdr + 8 + child_ptr_size;
         let cell_first = cell_ptr_offset + 2 * n_cell;
-        if cell_first > page_size {
+        if cell_first > usable_size {
             return Err(SqliteError::corrupt(format!(
-                "page {pgno}: cell pointer array runs past page end"
+                "page {pgno}: cell pointer array runs past usable page end"
             )));
         }
         let cell_last = usable_size - 4 - usize::from(!is_leaf);
@@ -235,7 +235,7 @@ impl BtreePage {
             return Ok(self.right_child);
         }
         let pc = self.cell_offset(i);
-        if pc + 4 > self.page_size {
+        if pc + 4 > self.usable_size {
             return Err(self.past_buffer(i));
         }
         Ok(read_u32_be(&self.data, pc))
@@ -261,7 +261,7 @@ impl BtreePage {
 
     fn parse_at(&self, pc: usize, i: usize) -> SqliteResult<CellInfo> {
         let data = &self.data;
-        let end = self.page_size;
+        let end = self.usable_size;
         let mut out = CellInfo {
             pc,
             ..CellInfo::default()
@@ -339,7 +339,7 @@ impl BtreePage {
     /// Rowid of cell `i` of a table page (`sqlite3BtreeTableMoveto:5922`).
     pub fn rowid_at(&self, i: usize) -> SqliteResult<i64> {
         let data = &self.data;
-        let end = self.page_size;
+        let end = self.usable_size;
         let mut p = if self.is_leaf {
             let mut pos = self.cell_offset(i);
             let mut steps = 0usize;

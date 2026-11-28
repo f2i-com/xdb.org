@@ -135,27 +135,32 @@ where
             }
         }
         "ntile" => {
+            if n == 0 {
+                return Ok(out);
+            }
+            if args_per_row[0].len() != 1 {
+                return Err(SqlError::runtime(
+                    "wrong number of arguments to function ntile()",
+                ));
+            }
+            // Per SQLite (`window.c:ntileStepFunc`): bucket count is evaluated once on the
+            // first row of the partition and applied to every row in that partition.
+            let arg = &args_per_row[0][0];
+            if arg.is_null() {
+                return Err(SqlError::runtime(
+                    "argument of ntile must be a positive integer",
+                ));
+            }
+            let buckets = int_value(arg);
+            if buckets <= 0 {
+                return Err(SqlError::runtime(
+                    "argument of ntile must be a positive integer",
+                ));
+            }
+            let b = usize::try_from(buckets).unwrap_or(usize::MAX);
+            let base = n / b;
+            let rem = n % b;
             for (i, slot) in out.iter_mut().enumerate() {
-                if args_per_row[i].len() != 1 {
-                    return Err(SqlError::runtime(
-                        "wrong number of arguments to function ntile()",
-                    ));
-                }
-                let arg = &args_per_row[i][0];
-                if arg.is_null() {
-                    return Err(SqlError::runtime(
-                        "argument of ntile must be a positive integer",
-                    ));
-                }
-                let buckets = int_value(arg);
-                if buckets <= 0 {
-                    return Err(SqlError::runtime(
-                        "argument of ntile must be a positive integer",
-                    ));
-                }
-                let b = usize::try_from(buckets).unwrap_or(usize::MAX);
-                let base = n / b;
-                let rem = n % b;
                 let bucket = if i < rem.saturating_mul(base + 1) {
                     i / (base + 1) + 1
                 } else {
@@ -187,12 +192,12 @@ where
                             };
                             v
                         }
-                        SqlValue::Text(b) => {
+                        SqlValue::Text(b) | SqlValue::Blob(b) => {
                             let a = xdb_core::value::atof(b);
-                            if a.rc <= 0 {
+                            if a.rc == 0 {
                                 0
                             } else if let Some(v) = xdb_core::value::real_to_exact_i64(a.value) {
-                                if a.rc == 1 {
+                                if (a.rc & 0x0f) == 1 {
                                     int_value(&args[1])
                                 } else {
                                     v
@@ -202,7 +207,6 @@ where
                                 continue;
                             }
                         }
-                        SqlValue::Blob(_) => int_value(&args[1]),
                     }
                 } else {
                     1

@@ -48,6 +48,8 @@ pub struct IndexMeta {
     pub key_desc: Vec<bool>,
     /// True if this is a partial index (`WHERE ...`) — planner skips pushdown unless matched.
     pub partial: bool,
+    /// Optional partial-index `WHERE` predicate AST (for `INDEXED BY` validation and pushdown).
+    pub where_clause: Option<xdb_parser::Expr>,
 }
 
 /// Table metadata exposed by a [`SqlCatalog`].
@@ -155,6 +157,18 @@ pub trait SqlCatalog {
     fn get_view(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<ViewMeta>> {
         let _ = (schema, name);
         Ok(None)
+    }
+
+    /// Optional `WITHOUT ROWID` primary-key index metadata (used by `EXPLAIN QUERY PLAN`).
+    fn get_without_rowid_pk(&self, schema: Option<&str>, name: &str) -> SqlResult<Option<IndexMeta>> {
+        let _ = (schema, name);
+        Ok(None)
+    }
+
+    /// Returns true if `name` is a catalog-provided table-valued function (e.g. `pragma_*`).
+    fn has_table_valued_function(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     /// Scan rows of a table. `needed_columns` is `None` for all columns or a list of column
@@ -303,6 +317,8 @@ pub struct QueryOptions {
     pub changes: i64,
     pub total_changes: i64,
     pub last_insert_rowid: i64,
+    /// True when executing expressions/queries inside a `CREATE TRIGGER` program (enables `RAISE()`).
+    pub in_trigger: bool,
 }
 
 impl Default for QueryOptions {
@@ -321,6 +337,7 @@ impl Default for QueryOptions {
             changes: 0,
             total_changes: 0,
             last_insert_rowid: 0,
+            in_trigger: false,
         }
     }
 }

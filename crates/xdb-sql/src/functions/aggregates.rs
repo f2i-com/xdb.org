@@ -226,7 +226,7 @@ impl SumAcc {
     }
 
     #[inline]
-    pub(crate) fn step_value(&mut self, v: &SqlValue) {
+    pub(crate) fn step_value(&mut self, v: &SqlValue, encoding: xdb_core::TextEncoding) {
         match v {
             SqlValue::Null => {}
             SqlValue::Int(iv) => {
@@ -268,13 +268,13 @@ impl SumAcc {
                 self.cnt += 1;
                 self.real_cnt += 1;
                 self.approx = true;
-                self.kbn_step(real_value(v));
+                self.kbn_step(xdb_core::value::real_value_enc(v, encoding));
             }
         }
     }
 
     #[inline]
-    pub(crate) fn inverse_value(&mut self, v: &SqlValue) {
+    pub(crate) fn inverse_value(&mut self, v: &SqlValue, encoding: xdb_core::TextEncoding) {
         match v {
             SqlValue::Null => {}
             SqlValue::Int(iv) => {
@@ -326,7 +326,7 @@ impl SumAcc {
             SqlValue::Blob(_) => {
                 self.cnt -= 1;
                 self.real_cnt -= 1;
-                self.kbn_step(-real_value(v));
+                self.kbn_step(-xdb_core::value::real_value_enc(v, encoding));
                 if self.real_cnt == 0 {
                     self.r_sum = 0.0;
                     self.r_err = 0.0;
@@ -442,8 +442,8 @@ impl SumAcc {
 }
 
 impl AggregateAcc for SumAcc {
-    fn step(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        self.step_value(&args[0]);
+    fn step(&mut self, args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<()> {
+        self.step_value(&args[0], ctx.encoding);
         Ok(())
     }
 
@@ -451,8 +451,8 @@ impl AggregateAcc for SumAcc {
         true
     }
 
-    fn inverse(&mut self, args: &[SqlValue], _ctx: &FunctionContext<'_>) -> SqlResult<()> {
-        self.inverse_value(&args[0]);
+    fn inverse(&mut self, args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<()> {
+        self.inverse_value(&args[0], ctx.encoding);
         Ok(())
     }
 

@@ -28,10 +28,11 @@
 //!    inferred from the seed rows.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use xdb_core::{SqlValue, TextEncoding};
+use xdb_core::{Meter, SqlValue, TextEncoding};
 use xdb_parser::ConflictAction;
-use xdb_sql::functions::json::{parse_json_metered_with, JsonVal};
+use xdb_sql::functions::json::{parse_json_metered_with, render_json_compact_metered, JsonVal};
 use xdb_sql::QueryParams;
 
 use crate::errors::{SqliteError, SqliteResult};
@@ -96,6 +97,7 @@ impl SqliteConnection {
     /// normal metered engine so sandbox resource limits are strictly enforced.
     pub fn seed_json(&mut self, seed_json: &str) -> SqliteResult<SeedReport> {
         self.check_open()?;
+        self.check_writable()?;
         let trimmed = seed_json.trim();
         if trimmed.is_empty() {
             return Ok(SeedReport::default());
@@ -112,6 +114,10 @@ impl SqliteConnection {
                 other => SqliteError::Misuse(format!("invalid seed JSON: {other}")),
             },
         )?;
+        // `parse_json_metered_with` releases its parser reservation on return; re-reserve the
+        // retained `JsonVal` AST for the duration of `apply_seed_entries`!
+        let mut ast_mem = SeedMemGuard::new(Arc::clone(&meter_arc));
+        ast_mem.reserve(estimate_json_val_bytes(&root))?;
         let entries = match root {
             JsonVal::Object(entries) => entries,
             _ => {
@@ -489,7 +495,8 @@ impl SqliteConnection {
                                         }
                                     }
                                     "params" => {
-                                        params = json_val_to_query_params(v)?;
+                                        let m = self.meter().clone();
+                                        params = json_val_to_query_params(v, Some(m.as_ref()))?;
                                     }
                                     _ => {}
                                 }
@@ -527,7 +534,10 @@ impl SqliteConnection {
     }
 
     fn table_exists(&mut self, table_name: &str) -> SqliteResult<bool> {
-        Ok(self.schema_arc()?.table(table_name).is_some())
+        let cat = self.schema_arc()?;
+        Ok(cat.table(table_name).is_some()
+            || cat.view(table_name).is_some()
+            || cat.virtual_table(table_name).is_some())
     }
 
     fn seed_table_rows(
@@ -626,13 +636,22 @@ impl SqliteConnection {
                 }
 
                 // Fallback SQL path for exotic tables (GENERATED/CHECK/STRICT/WITHOUT ROWID):
+                let meter_arc = self.meter().clone();
+                let mut batch_mem = SeedMemGuard::new(Arc::clone(&meter_arc));
                 let mut batch_rows = Vec::with_capacity(batch_end - i);
                 for row_item in &mut rows[i..batch_end] {
                     if let JsonVal::Object(f) = std::mem::replace(row_item, JsonVal::Null) {
                         let mut r = Vec::with_capacity(ncols);
+                        let mut row_bytes = 24u64.saturating_add((ncols as u64).saturating_mul(32));
                         for (_, val) in f {
-                            r.push(seed_json_to_sql_value_owned(val));
+                            let sv = seed_json_to_sql_value_owned_metered(
+                                val,
+                                Some(meter_arc.as_ref()),
+                            )?;
+                            row_bytes = row_bytes.saturating_add(sql_val_heap_bytes(&sv));
+                            r.push(sv);
                         }
+                        batch_mem.reserve(row_bytes)?;
                         batch_rows.push(r);
                     }
                 }
@@ -731,13 +750,22 @@ impl SqliteConnection {
                     i = batch_end;
                     continue;
                 }
+                let meter_arc = self.meter().clone();
+                let mut batch_mem = SeedMemGuard::new(Arc::clone(&meter_arc));
                 let mut batch_rows = Vec::with_capacity(batch_end - i);
                 for row_item in &mut rows[i..batch_end] {
                     if let JsonVal::Array(cells) = std::mem::replace(row_item, JsonVal::Null) {
                         let mut r = Vec::with_capacity(ncols);
+                        let mut row_bytes = 24u64.saturating_add((ncols as u64).saturating_mul(32));
                         for cell in cells {
-                            r.push(seed_json_to_sql_value_owned(cell));
+                            let sv = seed_json_to_sql_value_owned_metered(
+                                cell,
+                                Some(meter_arc.as_ref()),
+                            )?;
+                            row_bytes = row_bytes.saturating_add(sql_val_heap_bytes(&sv));
+                            r.push(sv);
                         }
+                        batch_mem.reserve(row_bytes)?;
                         batch_rows.push(r);
                     }
                 }
@@ -1144,20 +1172,33 @@ impl InferredType {
     }
 }
 
+fn is_valid_blob_object(entries: &[(String, JsonVal)]) -> bool {
+    if entries.len() != 1 {
+        return false;
+    }
+    if entries[0].0 == "__blob" {
+        if let JsonVal::Array(items) = &entries[0].1 {
+            return items
+                .iter()
+                .all(|it| matches!(it, JsonVal::Int(n) if (0..=255).contains(n)));
+        }
+    } else if entries[0].0 == "hex" {
+        if let JsonVal::Str(hex) = &entries[0].1 {
+            let raw = hex.as_bytes();
+            return raw.len().is_multiple_of(2)
+                && raw.iter().all(|b| b.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
 fn infer_value_type(v: &JsonVal) -> InferredType {
     match v {
         JsonVal::Null => InferredType::Unknown,
         JsonVal::Bool(_) | JsonVal::Int(_) => InferredType::Integer,
         JsonVal::Real(_) => InferredType::Real,
         JsonVal::Str(_) | JsonVal::Array(_) => InferredType::Text,
-        JsonVal::Object(entries) if entries.len() == 1 => {
-            if (entries[0].0 == "__blob" || entries[0].0 == "hex")
-                && matches!(seed_json_to_sql_value(v), SqlValue::Blob(_))
-            {
-                return InferredType::Blob;
-            }
-            InferredType::Text
-        }
+        JsonVal::Object(entries) if is_valid_blob_object(entries) => InferredType::Blob,
         JsonVal::Object(_) => InferredType::Text,
     }
 }
@@ -1312,16 +1353,85 @@ fn quote_ident(ident: &str) -> String {
     out
 }
 
-fn json_val_to_query_params(val: JsonVal) -> SqliteResult<QueryParams> {
+struct SeedMemGuard {
+    meter: Arc<dyn Meter>,
+    reserved: u64,
+}
+
+impl SeedMemGuard {
+    fn new(meter: Arc<dyn Meter>) -> Self {
+        Self { meter, reserved: 0 }
+    }
+
+    fn reserve(&mut self, bytes: u64) -> SqliteResult<()> {
+        if bytes > 0 {
+            self.meter.reserve_memory(bytes)?;
+            self.reserved = self.reserved.saturating_add(bytes);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SeedMemGuard {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            self.meter.release_memory(self.reserved);
+        }
+    }
+}
+
+#[inline]
+fn sql_val_heap_bytes(v: &SqlValue) -> u64 {
+    match v {
+        SqlValue::Text(b) | SqlValue::Blob(b) => b.len() as u64,
+        _ => 0,
+    }
+}
+
+fn estimate_json_val_bytes(v: &JsonVal) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![v];
+    while let Some(cur) = stack.pop() {
+        total = total.saturating_add(32);
+        match cur {
+            JsonVal::Str(s) => total = total.saturating_add(s.len() as u64),
+            JsonVal::Array(items) => {
+                total = total.saturating_add((items.len() as u64).saturating_mul(32));
+                for it in items {
+                    stack.push(it);
+                }
+            }
+            JsonVal::Object(entries) => {
+                total = total.saturating_add((entries.len() as u64).saturating_mul(56));
+                for (k, val) in entries {
+                    total = total.saturating_add(k.len() as u64);
+                    stack.push(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+fn json_val_to_query_params(
+    val: JsonVal,
+    meter: Option<&dyn Meter>,
+) -> SqliteResult<QueryParams> {
     match val {
         JsonVal::Null => Ok(QueryParams::empty()),
-        JsonVal::Array(items) => Ok(QueryParams::positional(
-            items.iter().map(seed_json_to_sql_value).collect::<Vec<_>>(),
-        )),
+        JsonVal::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                out.push(seed_json_to_sql_value_metered(item, meter)?);
+            }
+            Ok(QueryParams::positional(out))
+        }
         JsonVal::Object(entries) => {
             let mut p = QueryParams::empty();
             for (k, v) in entries {
-                p = p.with_named(k, seed_json_to_sql_value(&v));
+                let sv = seed_json_to_sql_value_metered(&v, meter)?;
+                p = p.with_named(k, sv);
             }
             Ok(p)
         }
@@ -1331,18 +1441,81 @@ fn json_val_to_query_params(val: JsonVal) -> SqliteResult<QueryParams> {
     }
 }
 
-pub(crate) fn seed_json_to_sql_value_owned(v: JsonVal) -> SqlValue {
+pub(crate) fn seed_json_to_sql_value_owned_metered(
+    v: JsonVal,
+    meter: Option<&dyn Meter>,
+) -> SqliteResult<SqlValue> {
     match v {
-        JsonVal::Null => SqlValue::Null,
-        JsonVal::Bool(b) => SqlValue::Int(i64::from(b)),
-        JsonVal::Int(i) => SqlValue::Int(i),
-        JsonVal::Real(r) => SqlValue::real(r),
-        JsonVal::Str(s) => SqlValue::Text(s.into_bytes().into_boxed_slice()),
-        other => seed_json_to_sql_value(&other),
+        JsonVal::Null => Ok(SqlValue::Null),
+        JsonVal::Bool(b) => Ok(SqlValue::Int(i64::from(b))),
+        JsonVal::Int(i) => Ok(SqlValue::Int(i)),
+        JsonVal::Real(r) => Ok(SqlValue::real(r)),
+        JsonVal::Str(s) => Ok(SqlValue::Text(s.into_bytes().into_boxed_slice())),
+        other => seed_json_to_sql_value_metered(&other, meter),
     }
 }
 
-/// Convert a parsed [`JsonVal`] into a [`SqlValue`] (supporting `{ "__blob": [...] }` and
+pub(crate) fn seed_json_to_sql_value_metered(
+    v: &JsonVal,
+    meter: Option<&dyn Meter>,
+) -> SqliteResult<SqlValue> {
+    match v {
+        JsonVal::Null => Ok(SqlValue::Null),
+        JsonVal::Bool(b) => Ok(SqlValue::Int(i64::from(*b))),
+        JsonVal::Int(i) => Ok(SqlValue::Int(*i)),
+        JsonVal::Real(r) => Ok(SqlValue::real(*r)),
+        JsonVal::Str(s) => Ok(SqlValue::text(s.as_str())),
+        JsonVal::Object(entries) if entries.len() == 1 => {
+            if entries[0].0 == "__blob" {
+                if let JsonVal::Array(items) = &entries[0].1 {
+                    if items
+                        .iter()
+                        .all(|it| matches!(it, JsonVal::Int(n) if (0..=255).contains(n)))
+                    {
+                        if let Some(m) = meter {
+                            m.charge_steps((items.len() as u64 / 16).max(1))?;
+                            m.reserve_memory(items.len() as u64)?;
+                            m.release_memory(items.len() as u64);
+                        }
+                        let mut bytes = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let JsonVal::Int(n) = item {
+                                bytes.push(*n as u8);
+                            }
+                        }
+                        return Ok(SqlValue::Blob(bytes.into_boxed_slice()));
+                    }
+                }
+            } else if entries[0].0 == "hex" {
+                if let JsonVal::Str(hex) = &entries[0].1 {
+                    let out_len = hex.len() / 2;
+                    if let Some(m) = meter {
+                        m.charge_steps((out_len as u64 / 16).max(1))?;
+                        m.reserve_memory(out_len as u64)?;
+                        m.release_memory(out_len as u64);
+                    }
+                    if let Some(bytes) = decode_hex(hex) {
+                        return Ok(SqlValue::Blob(bytes.into_boxed_slice()));
+                    }
+                }
+            }
+            let rendered = render_json_compact_metered(v, meter).map_err(|e| match e {
+                xdb_sql::SqlError::ResourceLimit(r) => SqliteError::ResourceLimit(r),
+                other => SqliteError::Sql(other.to_string()),
+            })?;
+            Ok(SqlValue::text(rendered))
+        }
+        other => {
+            let rendered = render_json_compact_metered(other, meter).map_err(|e| match e {
+                xdb_sql::SqlError::ResourceLimit(r) => SqliteError::ResourceLimit(r),
+                other => SqliteError::Sql(other.to_string()),
+            })?;
+            Ok(SqlValue::text(rendered))
+        }
+    }
+}
+
+/// Convert a parsed [`JsonVal`] into a [`SqlValue`] (supporting `{ "__blob": [0..255, ...] }` and
 /// `{ "hex": "..." }` blob encodings, booleans as 0/1, and nested objects/arrays as JSON text).
 pub fn seed_json_to_sql_value(v: &JsonVal) -> SqlValue {
     match v {
@@ -1354,19 +1527,16 @@ pub fn seed_json_to_sql_value(v: &JsonVal) -> SqlValue {
         JsonVal::Object(entries) if entries.len() == 1 => {
             if entries[0].0 == "__blob" {
                 if let JsonVal::Array(items) = &entries[0].1 {
-                    let mut bytes = Vec::with_capacity(items.len());
-                    let mut ok = true;
-                    for item in items {
-                        match item {
-                            JsonVal::Int(n) => bytes.push((*n & 0xff) as u8),
-                            JsonVal::Real(f) => bytes.push(((f.trunc() as i64) & 0xff) as u8),
-                            _ => {
-                                ok = false;
-                                break;
+                    if items
+                        .iter()
+                        .all(|it| matches!(it, JsonVal::Int(n) if (0..=255).contains(n)))
+                    {
+                        let mut bytes = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let JsonVal::Int(n) = item {
+                                bytes.push(*n as u8);
                             }
                         }
-                    }
-                    if ok {
                         return SqlValue::Blob(bytes.into_boxed_slice());
                     }
                 }

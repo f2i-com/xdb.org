@@ -1,5 +1,6 @@
 //! SQLite 3.54.1 core scalar functions (`func.c`).
 
+use xdb_core::value::utf::utf8_to_utf16_bytes;
 use xdb_core::value::{int_value, is_sql_xdigit, mem_compare, real_value, SqlValue};
 
 use crate::errors::{SqlError, SqlResult};
@@ -102,7 +103,7 @@ pub fn call_core_scalar(
             let mut res = SqlValue::Null;
             let mut i = 0;
             while i + 1 < args.len() {
-                if xdb_core::value::boolean_value(&args[i], false) {
+                if xdb_core::value::boolean_value_enc(&args[i], false, ctx.encoding) {
                     res = args[i + 1].clone();
                     i = args.len(); // found
                     break;
@@ -139,10 +140,24 @@ pub fn call_core_scalar(
             }
             match &args[0] {
                 SqlValue::Null => SqlValue::Null,
-                SqlValue::Blob(b) | SqlValue::Text(b) => SqlValue::Int(b.len() as i64),
-                SqlValue::Int(_) | SqlValue::Real(_) => SqlValue::Int(
-                    xdb_core::value::number_to_text(&args[0]).map_or(0, |s| s.len() as i64),
-                ),
+                SqlValue::Blob(b) => SqlValue::Int(b.len() as i64),
+                SqlValue::Text(b) => {
+                    if ctx.encoding == xdb_core::TextEncoding::Utf8 {
+                        SqlValue::Int(b.len() as i64)
+                    } else {
+                        let enc_bytes = utf8_to_utf16_bytes(b, ctx.encoding);
+                        SqlValue::Int(enc_bytes.len() as i64)
+                    }
+                }
+                SqlValue::Int(_) | SqlValue::Real(_) => {
+                    let s = xdb_core::value::number_to_text(&args[0]).unwrap_or_default();
+                    let len = if ctx.encoding == xdb_core::TextEncoding::Utf8 {
+                        s.len()
+                    } else {
+                        utf8_to_utf16_bytes(s.as_bytes(), ctx.encoding).len()
+                    };
+                    SqlValue::Int(len as i64)
+                }
             }
         }
         "char" => char_fn(args, ctx)?,
@@ -447,8 +462,27 @@ fn char_fn(args: &[SqlValue], ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> 
 
 fn hex_fn(v: &SqlValue, ctx: &FunctionContext<'_>) -> SqlResult<SqlValue> {
     const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-    let Some(bytes) = text_bytes_of(v) else {
-        return Ok(SqlValue::text(""));
+    let owned_enc: Vec<u8>;
+    let bytes: &[u8] = match v {
+        SqlValue::Null => return Ok(SqlValue::text("")),
+        SqlValue::Blob(b) => b,
+        SqlValue::Text(b) => {
+            if ctx.encoding == xdb_core::TextEncoding::Utf8 {
+                b
+            } else {
+                owned_enc = utf8_to_utf16_bytes(b, ctx.encoding);
+                &owned_enc
+            }
+        }
+        SqlValue::Int(_) | SqlValue::Real(_) => {
+            let s = xdb_core::value::number_to_text(v).unwrap_or_default();
+            if ctx.encoding == xdb_core::TextEncoding::Utf8 {
+                owned_enc = s.into_bytes();
+            } else {
+                owned_enc = utf8_to_utf16_bytes(s.as_bytes(), ctx.encoding);
+            }
+            &owned_enc
+        }
     };
     let out_len = bytes.len().checked_mul(2).ok_or_else(SqlError::too_big)?;
     if out_len > ctx.limits.max_length {
@@ -878,13 +912,13 @@ fn instr_fn(hay: &SqlValue, needle: &SqlValue, ctx: &FunctionContext<'_>) -> Sql
         return Ok(SqlValue::Int((match_off + 1) as i64));
     }
     let mut char_pos: i64 = 1;
-    let mut p = 0usize;
-    while p < match_off {
+    for (p, &b) in h[..match_off].iter().enumerate() {
         if (p & 255) == 0 {
             ctx.charge_steps(1)?;
         }
-        p = skip_utf8(&h, p);
-        char_pos += 1;
+        if (b & 0xc0) != 0x80 {
+            char_pos += 1;
+        }
     }
     Ok(SqlValue::Int(char_pos))
 }

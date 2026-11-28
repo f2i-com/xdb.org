@@ -69,6 +69,8 @@ pub struct FunctionContext<'a> {
     pub arg_json_extra: Option<&'a [bool]>,
     /// True when `PRAGMA case_sensitive_like = ON` (applies to both `LIKE` op and `like()` fn).
     pub case_sensitive_like: bool,
+    /// Active database text encoding (affects `octet_length()`, `hex()`, and boolean coercion).
+    pub encoding: xdb_core::TextEncoding,
 }
 
 static RNG_SEED_COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
@@ -98,6 +100,7 @@ impl<'a> FunctionContext<'a> {
             arg_json_mask: 0,
             arg_json_extra: None,
             case_sensitive_like: false,
+            encoding: xdb_core::TextEncoding::Utf8,
         }
     }
 
@@ -185,6 +188,7 @@ impl<'a> FunctionContext<'a> {
             arg_json_mask,
             arg_json_extra,
             case_sensitive_like: self.case_sensitive_like,
+            encoding: self.encoding,
         }
     }
 }
@@ -251,6 +255,16 @@ impl FunctionRegistry {
         }
         let lower = name.to_ascii_lowercase();
         map.contains_key(&(lower.clone(), Some(arity))) || map.contains_key(&(lower, None))
+    }
+
+    /// Return `(name, arity)` pairs for all registered custom scalar functions.
+    pub fn custom_scalars(&self) -> Vec<(String, Option<usize>)> {
+        let Some(ref map) = self.scalars else {
+            return Vec::new();
+        };
+        let mut list: Vec<(String, Option<usize>)> = map.keys().cloned().collect();
+        list.sort();
+        list
     }
 
     /// Invoke a scalar function (custom overrides built-in).
@@ -326,6 +340,146 @@ impl FunctionRegistry {
         };
         aggregates::make_builtin_aggregate(lower, arity, star)?
             .ok_or_else(|| SqlError::runtime(format!("no such aggregate function: {name}")))
+    }
+
+    /// Validate that `(name, arity, star, is_window)` refers to an existing function with valid
+    /// arity, without invoking custom scalar callbacks or mutating PRNG state.
+    pub fn validate_function_call(
+        &self,
+        name: &str,
+        arity: usize,
+        star: bool,
+        is_window: bool,
+    ) -> SqlResult<()> {
+        let mut stack_buf = [0u8; 40];
+        let owned;
+        let lower: &str = if let Some(s) = ascii_lower_stack(name, &mut stack_buf) {
+            s
+        } else {
+            owned = name.to_ascii_lowercase();
+            &owned
+        };
+        if is_window {
+            if is_builtin_window_only(lower) {
+                let ok = match lower {
+                    "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+                        arity == 0 && !star
+                    }
+                    "ntile" | "first_value" | "last_value" => arity == 1 && !star,
+                    "nth_value" => arity == 2 && !star,
+                    "lag" | "lead" => (1..=3).contains(&arity) && !star,
+                    _ => true,
+                };
+                if !ok {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            if self.is_aggregate(name, arity, star) {
+                return Ok(());
+            }
+            return Err(SqlError::runtime(format!(
+                "{name}() may not be used as a window function"
+            )));
+        }
+        if self.is_aggregate(name, arity, star) {
+            return Ok(());
+        }
+        if is_builtin_window_only(lower) {
+            return Err(SqlError::runtime(format!(
+                "misuse of window function {name}()"
+            )));
+        }
+        if star {
+            if aggregates::is_builtin_aggregate(lower, 1, false)
+                || aggregates::is_builtin_aggregate(lower, 0, true)
+                || self.has_custom_scalar(name, arity)
+            {
+                return Err(SqlError::runtime(format!(
+                    "wrong number of arguments to function {name}()"
+                )));
+            }
+            return Err(SqlError::runtime(format!("no such function: {name}")));
+        }
+        if self.has_custom_scalar(name, arity) {
+            return Ok(());
+        }
+        match lower {
+            "coalesce" => {
+                if arity < 2 {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            "ifnull" | "likelihood" => {
+                if arity != 2 {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            "iif" | "if" => {
+                if arity < 2 {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            "random" => {
+                if arity != 0 {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            "randomblob" => {
+                if arity != 1 {
+                    return Err(SqlError::runtime(format!(
+                        "wrong number of arguments to function {name}()"
+                    )));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let dummy_args = vec![SqlValue::Null; arity];
+        let dummy_ctx = FunctionContext::new(None, 0);
+        fn check<T>(res: SqlResult<Option<T>>) -> SqlResult<bool> {
+            match res {
+                Ok(Some(_)) => Ok(true),
+                Ok(None) => Ok(false),
+                Err(SqlError::Runtime(msg))
+                    if msg.starts_with("wrong number of arguments")
+                        || msg.starts_with("no such function:") =>
+                {
+                    Err(SqlError::Runtime(msg))
+                }
+                Err(_) => Ok(true),
+            }
+        }
+        if check(core::call_core_scalar(lower, &dummy_args, &dummy_ctx))?
+            || check(math::call_math(lower, &dummy_args))?
+            || check(date::call_date(lower, &dummy_args, &dummy_ctx))?
+            || check(json::call_json_scalar(lower, &dummy_args, &dummy_ctx))?
+        {
+            return Ok(());
+        }
+        if aggregates::is_builtin_aggregate(lower, 1, false)
+            || aggregates::is_builtin_aggregate(lower, 2, false)
+            || aggregates::is_builtin_aggregate(lower, 0, true)
+        {
+            return Err(SqlError::runtime(format!(
+                "wrong number of arguments to function {name}()"
+            )));
+        }
+        Err(SqlError::runtime(format!("no such function: {name}")))
     }
 }
 

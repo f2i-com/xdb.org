@@ -112,7 +112,7 @@ pub struct Parser<'a> {
     pub(crate) limit: usize,
     tables: &'static LalrTables,
     scanner: Scanner<'a>,
-    probe: Scanner<'a>,
+    probe: Option<Scanner<'a>>,
     meter: Option<&'a dyn Meter>,
 
     // Parser stack (pooled 32-slot heap vectors reused via thread-local cache)
@@ -202,7 +202,6 @@ impl<'a> Parser<'a> {
             Dialect::Xdb => &XDB_GRAMMAR,
         };
         let scanner = Scanner::new_lazy(sql, options.dialect);
-        let probe = Scanner::new_lazy(sql, options.dialect);
         let limit = scanner.limit;
         let stacks = PARSER_STACK_POOL
             .try_with(|pool| pool.take())
@@ -227,7 +226,7 @@ impl<'a> Parser<'a> {
             limit,
             tables,
             scanner,
-            probe,
+            probe: None,
             meter,
             state: stacks.state,
             v: stacks.v,
@@ -403,8 +402,11 @@ impl<'a> Parser<'a> {
                 if !self.flush_steps() {
                     return Err(self.err.take().expect("limit error"));
                 }
+                let probe = self
+                    .probe
+                    .get_or_insert_with(|| Scanner::new_lazy(self.sql, self.dialect));
                 kind = classify_context_keyword_metered(
-                    &mut self.probe,
+                    probe,
                     kind,
                     end,
                     last,
@@ -419,7 +421,10 @@ impl<'a> Parser<'a> {
                 if !self.flush_steps() {
                     return Err(self.err.take().expect("limit error"));
                 }
-                kind = classify_ilike_metered(&mut self.probe, end, self.meter)
+                let probe = self
+                    .probe
+                    .get_or_insert_with(|| Scanner::new_lazy(self.sql, self.dialect));
+                kind = classify_ilike_metered(probe, end, self.meter)
                     .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
                 let tok_len = end.saturating_sub(i);
@@ -498,8 +503,11 @@ impl<'a> Parser<'a> {
                 if !self.flush_steps() {
                     return Err(self.err.take().expect("limit error"));
                 }
+                let probe = self
+                    .probe
+                    .get_or_insert_with(|| Scanner::new_lazy(self.sql, self.dialect));
                 kind = classify_context_keyword_metered(
-                    &mut self.probe,
+                    probe,
                     kind,
                     end,
                     last,
@@ -514,7 +522,10 @@ impl<'a> Parser<'a> {
                 if !self.flush_steps() {
                     return Err(self.err.take().expect("limit error"));
                 }
-                kind = classify_ilike_metered(&mut self.probe, end, self.meter)
+                let probe = self
+                    .probe
+                    .get_or_insert_with(|| Scanner::new_lazy(self.sql, self.dialect));
+                kind = classify_ilike_metered(probe, end, self.meter)
                     .map_err(SqlParseError::from_limit)?;
             } else if kind == tk::ILLEGAL {
                 let tok_len = end.saturating_sub(i);
@@ -582,6 +593,8 @@ impl<'a> Parser<'a> {
     }
 
     fn reset_stack(&mut self) {
+        self.n_err = 0;
+        self.err = None;
         if !self.dirty {
             self.state[0] = 0;
             self.st[0] = -1;
@@ -847,6 +860,9 @@ impl<'a> Parser<'a> {
             self.v[b] = SemVal::Empty;
             self.h[b] = 0;
             self.f[b] = 0;
+        } else if self.st[b] >= 0 && self.st[self.top] >= 0 {
+            rs = self.st[b];
+            re = self.en[self.top];
         } else {
             for k in b..=self.top {
                 if self.st[k] >= 0 {
