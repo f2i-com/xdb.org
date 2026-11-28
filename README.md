@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     conn.execute(
-        "INSERT INTO tasks (title, done) VALUES ('Ship XDB 0.1.3', 1), ('Run in browser WASM', 0);",
+        "INSERT INTO tasks (title, done) VALUES ('Ship XDB 0.1.4', 1), ('Run in browser WASM', 0);",
     )?;
 
     let res = conn.execute_with_params(
@@ -76,10 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Download `xdb-<version>-wasm.wasm` (or `.wasm.br`) and `xdb-<version>-wasm.js` from the [GitHub Releases](https://github.com/f2i-com/xdb.org/releases) page, or build them locally from `crates/xdb-wasm`.
 
 ```js
-import initXdb, { WasmConnection, WasmDatabase } from './xdb-0.1.3-wasm.js';
+import initXdb, { WasmConnection, WasmDatabase } from './xdb-0.1.4-wasm.js';
 
-// In a browser, resolves sibling `xdb-0.1.3-wasm.wasm` automatically.
-// In Node.js, pass the bytes: `await initXdb({ module_or_path: fs.readFileSync('./xdb-0.1.3-wasm.wasm') })`.
+// In a browser, resolves sibling `xdb-0.1.4-wasm.wasm` automatically.
+// In Node.js, pass the bytes: `await initXdb({ module_or_path: fs.readFileSync('./xdb-0.1.4-wasm.wasm') })`.
 await initXdb();
 
 // Open an in-memory read-write SQLite database with explicit sandbox ceilings:
